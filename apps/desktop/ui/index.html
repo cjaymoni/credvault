@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>credvault</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Sign in / create account -->
+<section id="auth" class="auth" aria-labelledby="auth-title">
+  <div class="auth-card">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="4" y="11" width="16" height="10" rx="2"/></svg>
+      </span>
+      <span class="brand-name">credvault</span>
+    </div>
+    <h1 id="auth-title" class="auth-title">Welcome back</h1>
+    <p class="auth-lead">Your secrets are encrypted on this device. The server only ever stores ciphertext.</p>
+
+    <div class="segmented" role="group" aria-label="Sign in or create an account">
+      <button type="button" id="tab-login" aria-pressed="true">Log in</button>
+      <button type="button" id="tab-register" aria-pressed="false">Create account</button>
+    </div>
+
+    <form id="auth-form" novalidate>
+      <div class="field">
+        <label for="server">Server URL</label>
+        <input id="server" type="url" autocomplete="off" spellcheck="false" inputmode="url">
+        <p class="hint">Use https:// for any server that is not on this machine.</p>
+      </div>
+      <div class="field">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="username" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="password">Account password</label>
+        <div class="input-row">
+          <input id="password" type="password" autocomplete="current-password">
+          <button type="button" class="icon-btn bordered" id="btn-auth-toggle-pw" aria-label="Show password" aria-pressed="false" title="Show password">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <p class="hint hidden" id="password-hint">At least 8 characters. There is no password reset.</p>
+      </div>
+      <button type="button" class="link-btn hidden" id="btn-show-token" aria-expanded="false" aria-controls="token-field">Does the server require a registration token?</button>
+      <div class="field hidden" id="token-field">
+        <label for="registration-token">Registration token</label>
+        <input id="registration-token" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="error" id="auth-error" role="alert"></div>
+      <button type="submit" class="btn primary block" id="btn-auth">Log in</button>
+    </form>
+  </div>
+  <div class="auth-foot"><span>End-to-end encrypted · Self-hosted · Open source</span>
+    <div class="theme-switch" id="theme-switch-auth" role="group" aria-label="Appearance">
+      <button type="button" data-theme-choice="system" aria-pressed="true" title="Match the system" aria-label="Match the system">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      </button>
+      <button type="button" data-theme-choice="light" aria-pressed="false" title="Light" aria-label="Light">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      </button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false" title="Dark" aria-label="Dark">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </div>
+  </div>
+</section>
+
+<!-- Vault -->
+<section id="app" class="app hidden" aria-labelledby="app-title" data-screen="list">
+  <h1 id="app-title" class="sr-only">Vault</h1>
+  <header class="topbar">
+    <button type="button" class="icon-btn mobile-only" id="btn-back" aria-label="Back to vault">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+    </button>
+    <div class="brand compact">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="4" y="11" width="16" height="10" rx="2"/></svg>
+      </span>
+      <span class="brand-name">credvault</span>
+    </div>
+
+    <span class="mobile-title mobile-only" id="mobile-title"></span>
+    <div class="spacer"></div>
+
+    <button type="button" class="account-btn mobile-only" id="btn-account" aria-label="Account and settings" aria-expanded="false" aria-controls="account-tools">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+    </button>
+    <div class="backdrop" id="account-backdrop"></div>
+    <div class="account-tools" id="account-tools">
+    <div class="sheet-handle mobile-only" aria-hidden="true"></div>
+    <div class="identity" aria-label="Signed in as">
+      <span class="identity-email" id="who-email"></span>
+      <span class="identity-server" id="who-server"></span>
+    </div>
+
+    <button type="button" class="chip" id="btn-fingerprint"
+      title="Your key fingerprint. People who share with you compare this to what their app shows. Click to copy.">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>
+      <span class="chip-label">Your key</span>
+      <code class="fp" id="fingerprint"></code>
+    </button>
+
+    <div class="theme-switch" id="theme-switch-app" role="group" aria-label="Appearance">
+      <button type="button" data-theme-choice="system" aria-pressed="true" title="Match the system" aria-label="Match the system">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      </button>
+      <button type="button" data-theme-choice="light" aria-pressed="false" title="Light" aria-label="Light">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      </button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false" title="Dark" aria-label="Dark">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </div>
+
+    <button type="button" class="icon-btn" id="btn-refresh" aria-label="Refresh" title="Refresh">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      <span class="btn-label">Refresh</span>
+    </button>
+    <button type="button" class="icon-btn" id="btn-logout" aria-label="Log out" title="Log out">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
+      <span class="btn-label">Log out</span>
+    </button>
+    </div>
+  </header>
+
+  <aside class="sidebar" aria-label="Secrets">
+    <div class="sidebar-tools">
+      <div class="search">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="filter" type="search" placeholder="Search" aria-label="Search secrets" autocomplete="off" spellcheck="false" title="Search (⌘K / Ctrl+K)">
+      </div>
+      <button type="button" class="btn primary" id="btn-new" title="New secret (⌘N / Ctrl+N)">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        <span class="btn-text">New</span>
+      </button>
+    </div>
+    <div id="invites-banner" class="mobile-only"></div>
+    <div class="sidebar-count" id="count" aria-live="polite"></div>
+    <div id="list" class="list" role="listbox" aria-label="Secrets"></div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="main-inner">
+      <div id="invites"></div>
+      <div id="detail"></div>
+      <div class="error" id="main-error" role="alert"></div>
+    </div>
+  </main>
+</section>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

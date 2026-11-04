@@ -1,0 +1,6 @@
+target/
+*.db
+*.db-*
+.DS_Store
+# regenerated on every tauri build
+apps/desktop/gen/schemas/

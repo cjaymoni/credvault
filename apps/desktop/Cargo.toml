@@ -1,0 +1,32 @@
+[package]
+name = "credvault-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "credvault desktop app (macOS, Windows, Linux)"
+
+[lib]
+name = "credvault_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+credvault-core.workspace = true
+tauri = { version = "2", features = [] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+tauri-plugin-clipboard-manager = "2"
+thiserror.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

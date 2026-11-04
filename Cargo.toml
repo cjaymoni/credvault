@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/server", "apps/desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+credvault-core = { path = "crates/core" }
+aes-gcm = "0.10"
+argon2 = { version = "0.5", features = ["std"] }
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+zeroize = { version = "1", features = ["derive", "serde"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+strip = true
+lto = "thin"

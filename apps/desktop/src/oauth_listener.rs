@@ -23,13 +23,20 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Nothing legitimate sends a request line longer than this; a client that
 /// does is dropped rather than read indefinitely.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
-/// How long one connection may take to send its request line, and so how long
-/// any connection can occupy one of the slots below.
+/// How long one connection may take to send its request line and headers.
 ///
 /// A browser on loopback writes before the accept has even returned, so a
-/// second is enormously generous for the real thing. It is kept short because
-/// it is also what a hostile connection costs, and so how fast slots come back
-/// while one is being held open.
+/// second is enormously generous for the real thing — a redirect carrying a
+/// 6 KB query string was served in under 5ms. It is kept short because it is
+/// also what a hostile connection costs, and so how fast slots come back while
+/// one is being held open.
+///
+/// Worst-case slot occupancy is this *plus* `RESPOND_TIMEOUT`, because the two
+/// deadlines run in series. A peer that stalls its read does not reach the
+/// second one in practice — the response is about a kilobyte and fits any
+/// receive buffer a peer can ask for, measured at 2.4ms with `SO_RCVBUF`
+/// forced to 1 — but that is a property of the page size, not of this code.
+/// Growing those pages would triple the worst case.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// How many connections may be in flight at once.
 ///
@@ -44,13 +51,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// * A handful of silent or malformed connections cost the sign-in nothing.
 ///   Every connection, hostile or not, gives its slot back within
 ///   `READ_TIMEOUT`, so a few of them delay a redirect by at most that.
-///
-/// A first-byte deadline shorter than `READ_TIMEOUT` was tried here and
-/// removed. It released wholly silent sockets sooner, but a connection that
-/// sent a single byte still held its slot for the full read deadline, so it
-/// raised the cost of the laziest flood and nothing else — while adding a path
-/// that could drop a real redirect whose first byte was late, silently, and
-/// leave the user waiting out `WAIT_TIMEOUT` for a code that had arrived.
 /// * A flood ends when it ends. Nothing is left wedged, no slot leaks, and the
 ///   next redirect is served.
 /// * The rest of the app is never taken down with it: descriptors are capped
@@ -62,6 +62,15 @@ const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// changes that -- the queue is finite and the browser tries once. What the
 /// deadline buys is that the sockets must be *held*, continuously, and that
 /// the denial stops when they are released.
+///
+/// A first-byte deadline shorter than `READ_TIMEOUT` was tried here and
+/// removed, so that it is not reintroduced. It released wholly silent sockets
+/// sooner, but a connection that sent a single byte still held its slot for
+/// the full read deadline — and the one-byte shape was always available, so it
+/// raised the cost of the laziest flood and nothing else. Against that it
+/// added a path that could drop a real redirect whose first byte was late,
+/// with no response and no log line, leaving the user to wait out
+/// `WAIT_TIMEOUT` for a code that had already arrived.
 const MAX_IN_FLIGHT: usize = 128;
 /// How long writing the response page may take before the slot is reclaimed.
 /// The code has already been handed over by then; this only stops a peer that

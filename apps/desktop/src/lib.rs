@@ -869,18 +869,23 @@ async fn change_password(
 /// those apart, so this keeps asking rather than sampling twice and guessing.
 ///
 /// A ceiling on the sleeping, not on the whole loop: each probe carries the
-/// client's own timeout, so a server that hangs rather than refuses can push
-/// the total past this. That direction is safe — a hung probe reads as
-/// `Unreachable`, breaks the run, and ends in `Unknown` rather than in a
-/// confident wrong answer.
+/// client's own timeout, so slow answers push the total to roughly this plus
+/// one client timeout. Measured at 41s against a 30s budget with a server
+/// answering after 19s.
+///
+/// Safe in both directions, which is why the loop is not bounded harder. A
+/// probe that hangs reads as `Unreachable`, breaks the run and ends in
+/// `Unknown`. A probe that is merely slow still answers `Alive`, and two of
+/// those far apart are stronger evidence that nothing committed than two close
+/// together, not weaker.
 const PROBE_BUDGET: Duration = Duration::from_secs(30);
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// What a probe could establish about a change whose answer never arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChangeOutcome {
-    /// The session was still alive on the last two probes in a row: the change
-    /// did not commit.
+    /// The session was still alive on the last `STABLE_READINGS` probes in a
+    /// row: the change did not commit.
     NotApplied,
     /// The session is gone, which only the committing transaction does.
     Applied,
@@ -927,12 +932,6 @@ async fn resolve_lost_answer(state: &AppState, api: &ApiClient, reason: String) 
     }
 }
 
-/// Watch whether this session is still alive, until the answer is conclusive
-/// or the budget runs out.
-///
-/// A session that disappears is conclusive the moment it happens, because only
-/// the committing transaction deletes it. A session that is still there is
-/// never conclusive on its own — it only becomes an answer by staying there.
 /// What one reading of the session told us.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reading {
@@ -973,6 +972,12 @@ fn settle(alive_in_a_row: u32) -> ChangeOutcome {
     }
 }
 
+/// Watch whether this session is still alive, until the answer is conclusive
+/// or the budget runs out.
+///
+/// A session that disappears is conclusive the moment it happens, because only
+/// the committing transaction deletes it. A session that is still there is
+/// never conclusive on its own — it only becomes an answer by staying there.
 async fn probe_change(api: &ApiClient) -> ChangeOutcome {
     // `tokio::time`, not `std::time`, so a test can drive this with a paused
     // clock instead of waiting out the real budget.

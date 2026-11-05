@@ -758,6 +758,41 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
 .fp-box.bad { border-color: var(--danger-border); }
 .fp-box.good { border-color: var(--accent); }
 
+/* Typing a changed key's fingerprint back in, to confirm it out of band. */
+input.mono { font-family: var(--mono); letter-spacing: 0.02em; }
+input.mono.mismatch { border-color: var(--danger); }
+
+/* Extra details in the edit form: label, value, Hide, remove. */
+.field-label {
+  display: block;
+  font-size: var(--text-small);
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.custom-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.cf-hide {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-small);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.cf-hide input { width: auto; min-height: 0; margin: 0; }
+@media (max-width: 720px) {
+  /* Two rows on a phone: the label full width, then the value sharing a line
+     with Hide and Remove. */
+  .custom-field { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .custom-field .cf-label { grid-column: 1 / -1; }
+}
+
 .people { list-style: none; margin: 0; padding: 0; }
 .people li {
   display: flex;
@@ -981,3 +1016,8 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
   .auth-title { font-size: var(--text-hero); }
   .auth-foot { flex-direction: column; gap: 12px; margin-top: 8px; }
 }
+
+/* A startup warning stays until dismissed; the error slot below it is wiped
+   by the next keystroke, and this is the only notice that pins were lost. */
+.startup-warning { margin-bottom: 12px; align-items: center; }
+.startup-warning .btn { margin-left: auto; flex: none; }

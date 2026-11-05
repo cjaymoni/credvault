@@ -1,0 +1,44 @@
+{
+  "created": {
+    "name": "Email",
+    "username": "jude@example.com",
+    "password": "brand-new-password",
+    "url": "",
+    "notes": "",
+    "fields": [
+      {
+        "id": null,
+        "label": "Account number",
+        "value": "99887766",
+        "secret": false
+      },
+      {
+        "id": null,
+        "label": "PIN",
+        "value": "4321",
+        "secret": true
+      }
+    ]
+  },
+  "edited": {
+    "name": "Bank",
+    "username": "jude",
+    "password": null,
+    "url": "https://bank.example.com",
+    "notes": "",
+    "fields": [
+      {
+        "id": "aa01",
+        "label": "Account number",
+        "value": "",
+        "secret": false
+      },
+      {
+        "id": "cc03",
+        "label": "Recovery code",
+        "value": null,
+        "secret": true
+      }
+    ]
+  }
+}

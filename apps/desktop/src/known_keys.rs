@@ -7,20 +7,17 @@
 //! for the same person, that is surfaced as a change rather than silently
 //! accepted.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
 use credvault_core::PublicKey;
 use serde::{Deserialize, Serialize};
 
-/// Keys pinned so far, keyed by server URL and then by email, plus which
-/// servers have had every owner key copy upgraded to the self-wrapped form.
+/// Keys pinned so far, keyed by server URL and then by email.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct KnownKeys {
     servers: HashMap<String, HashMap<String, String>>,
-    #[serde(default)]
-    owner_keys_upgraded: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,19 +62,16 @@ impl KnownKeys {
         KeyStatus::Changed { pinned_fingerprint }
     }
 
+    /// The key pinned for `email` on `server`, if one was pinned and still
+    /// parses. Used to ask the server about someone we have shared with
+    /// before without making the user read their fingerprint out again.
+    pub fn pinned_key(&self, server: &str, email: &str) -> Option<PublicKey> {
+        let pinned = self.servers.get(server)?.get(email)?;
+        PublicKey::from_base64(pinned).ok()
+    }
+
     pub fn pin(&mut self, server: &str, email: &str, key: &PublicKey) {
         self.servers.entry(server.to_string()).or_default().insert(email.to_string(), key.to_base64());
-    }
-
-    /// Once true, a sealed-box copy of one of our own secret keys from this
-    /// server is refused: every legitimate one has been upgraded, so a new one
-    /// could only come from the server.
-    pub fn is_owner_keys_upgraded(&self, server: &str) -> bool {
-        self.owner_keys_upgraded.contains(server)
-    }
-
-    pub fn mark_owner_keys_upgraded(&mut self, server: &str) {
-        self.owner_keys_upgraded.insert(server.to_string());
     }
 }
 
@@ -115,6 +109,12 @@ mod tests {
             keys.check(SERVER, "bob@example.com", bob_again.public_key()),
             KeyStatus::Changed { pinned_fingerprint: bob.public_key().fingerprint() }
         );
+        // The pinned key can be read back, to look Bob up again without
+        // making the user read his fingerprint out a second time.
+        assert_eq!(keys.pinned_key(SERVER, "bob@example.com").as_ref(), Some(bob.public_key()));
+        assert_eq!(keys.pinned_key(SERVER, "nobody@example.com"), None);
+        assert_eq!(keys.pinned_key("https://other.example.com", "bob@example.com"), None);
+
         // Pins are per server.
         assert_eq!(keys.check("https://other.example.com", "bob@example.com", bob.public_key()), KeyStatus::New);
         // Re-pinning replaces.
@@ -142,22 +142,6 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
-    }
-
-    #[test]
-    fn owner_key_upgrade_flag_is_per_server_and_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("known_keys.json");
-        let mut keys = KnownKeys::default();
-        assert!(!keys.is_owner_keys_upgraded(SERVER));
-        keys.mark_owner_keys_upgraded(SERVER);
-        keys.save(&path).unwrap();
-        let loaded = KnownKeys::load(&path).unwrap();
-        assert!(loaded.is_owner_keys_upgraded(SERVER));
-        assert!(!loaded.is_owner_keys_upgraded("https://other.example.com"));
-        // A file written before the flag existed still loads.
-        std::fs::write(&path, br#"{"servers":{}}"#).unwrap();
-        assert!(!KnownKeys::load(&path).unwrap().is_owner_keys_upgraded(SERVER));
     }
 
     #[test]

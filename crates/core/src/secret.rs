@@ -11,6 +11,21 @@ use crate::{CryptoError, Result};
 
 pub const MAX_FIELD_LEN: usize = 4096;
 pub const MAX_NAME_LEN: usize = 200;
+/// How many extra details one secret may carry. Enough for the recovery
+/// codes, PINs and account numbers people keep alongside a login, bounded so
+/// one secret cannot grow without limit.
+pub const MAX_CUSTOM_FIELDS: usize = 20;
+pub const MAX_LABEL_LEN: usize = 100;
+/// Field ids are generated as 16 hex characters; this leaves a little room.
+pub const MAX_FIELD_ID_LEN: usize = 64;
+/// Largest serialised payload that will be encrypted. Kept under the server's
+/// blob limit with room to spare for the AEAD tag, so a payload accepted here
+/// is never rejected after encryption, where the error would be far less clear.
+pub const MAX_PLAINTEXT_BYTES: usize = 48 * 1024;
+
+/// Anything that encrypts has to fit the blob the server will accept. Checked
+/// when this crate is built, so the two limits cannot drift apart unnoticed.
+const _: () = assert!(MAX_PLAINTEXT_BYTES + 64 <= crate::api::MAX_BLOB_BYTES);
 
 const SELF_WRAP_AAD: &[u8] = b"credvault/self-wrap/v1";
 
@@ -19,11 +34,11 @@ const SELF_WRAP_AAD: &[u8] = b"credvault/self-wrap/v1";
 /// owner can derive the self-wrap key, so an `Owner` copy proves the owner
 /// made it and the server cannot swap in a key it knows.
 ///
-/// Serialised without a tag so copies stored before this type existed (plain
-/// sealed boxes) still parse: a sealed box has `ephemeral_public`, an owner
-/// copy does not.
+/// Tagged, so which form a copy takes is stated rather than inferred from
+/// which fields happen to be present. A copy of the wrong form is then a
+/// parse failure, not something that quietly reads as the other one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "wrap", content = "key", rename_all = "snake_case")]
 pub enum WrappedKey {
     /// Sealed to a member's X25519 public key.
     Shared(SealedBox),
@@ -40,6 +55,41 @@ impl WrappedKey {
     }
 }
 
+/// One extra detail stored alongside a credential: a recovery code, a PIN, an
+/// account number, a security answer. `secret` marks a value that should be
+/// masked and revealed deliberately, the way the password is.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct CustomField {
+    /// Stable identity, assigned once when the field is created.
+    ///
+    /// An edit says "keep the value I was not shown" by naming the field it
+    /// means. A label cannot name it, because several fields may share one; a
+    /// position cannot either, because another device may have reordered or
+    /// deleted rows since this form was rendered, and a position that still
+    /// holds a same-named field would pass a check it should fail. An id is
+    /// the only thing that still means the same field afterwards.
+    pub id: String,
+    pub label: String,
+    pub value: String,
+    #[serde(default)]
+    pub secret: bool,
+}
+
+/// A fresh field id. Random rather than sequential so two devices adding a
+/// field at the same time cannot produce the same one.
+pub fn new_field_id() -> String {
+    aead::random_bytes::<8>().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Print a masked value only when it was marked secret; a label is not
+/// sensitive and is what makes the output worth reading at all.
+impl fmt::Debug for CustomField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value: &dyn fmt::Debug = if self.secret { &"<redacted>" } else { &self.value };
+        f.debug_struct("CustomField").field("label", &self.label).field("value", value).finish()
+    }
+}
+
 /// The sensitive fields of a credential. Encrypted as one JSON blob so the
 /// server cannot tell which fields are present.
 #[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -50,6 +100,12 @@ pub struct SecretPayload {
     pub url: String,
     #[serde(default)]
     pub notes: String,
+    /// Extra details the fixed fields do not cover. `default` so a payload
+    /// without the key still decrypts. This release requires a fresh database
+    /// (see the README), so no such payload exists in practice; the default
+    /// costs nothing and keeps the next field addition from being a break.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<CustomField>,
 }
 
 /// Never print the password or notes, even in debug output.
@@ -60,6 +116,7 @@ impl fmt::Debug for SecretPayload {
             .field("password", &"<redacted>")
             .field("url", &self.url)
             .field("notes", &"<redacted>")
+            .field("fields", &self.fields)
             .finish()
     }
 }
@@ -76,8 +133,59 @@ impl SecretPayload {
                 return Err(CryptoError::InvalidInput(format!("{label} is longer than {MAX_FIELD_LEN} bytes")));
             }
         }
+        if self.fields.len() > MAX_CUSTOM_FIELDS {
+            return Err(CryptoError::InvalidInput(format!(
+                "a secret may have at most {MAX_CUSTOM_FIELDS} extra fields"
+            )));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.fields.len());
+        for field in &self.fields {
+            validate_label(&field.label)?;
+            // Bounded like every other stored string: ids are generated as
+            // 16 hex characters, and nothing else should be storing one.
+            if field.id.is_empty()
+                || field.id.len() > MAX_FIELD_ID_LEN
+                || !field.id.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Err(CryptoError::InvalidInput("an extra field has an invalid id".into()));
+            }
+            // The desktop client catches this earlier, with a better message.
+            // This one guards anything else calling the crate directly.
+            if !seen.insert(field.id.as_str()) {
+                return Err(CryptoError::InvalidInput("two extra fields share an id".into()));
+            }
+            // Characters, like the label, so the limit matches the one the
+            // input box appears to enforce. `MAX_PLAINTEXT_BYTES` still
+            // backstops the real encoded size.
+            if field.value.chars().count() > MAX_FIELD_LEN {
+                return Err(CryptoError::InvalidInput(format!(
+                    "the value of \"{}\" is longer than {MAX_FIELD_LEN} characters",
+                    field.label.trim()
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// Validate the label of one custom field, returning it trimmed.
+///
+/// `SecretPayload::validate` takes `&self` and so can only use this to
+/// reject, never to normalise. The desktop client trims on the way in, via
+/// `resolve_fields`; a direct caller of this crate that does not will have
+/// its untrimmed label stored as given. A blank label is refused rather than
+/// stored, because an edit names the field it could not keep a value for.
+pub fn validate_label(label: &str) -> Result<String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Err(CryptoError::InvalidInput("every extra field needs a label".into()));
+    }
+    // Counted in characters, not bytes, so the limit matches the one the
+    // input box appears to enforce and a non-ASCII label is not cut short.
+    if trimmed.chars().count() > MAX_LABEL_LEN {
+        return Err(CryptoError::InvalidInput(format!("a field label is longer than {MAX_LABEL_LEN} characters")));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Validate the plaintext display name stored alongside the ciphertext.
@@ -110,6 +218,15 @@ impl SecretKey {
         // The serialised plaintext is wiped as soon as it has been encrypted.
         let json =
             zeroize::Zeroizing::new(serde_json::to_vec(payload).map_err(|e| CryptoError::Encoding(e.to_string()))?);
+        // Per-field limits cannot catch every combination that adds up to too
+        // much, so the total is checked once here, where the real size is known.
+        if json.len() > MAX_PLAINTEXT_BYTES {
+            return Err(CryptoError::InvalidInput(format!(
+                "this secret's details come to {} bytes, over the {MAX_PLAINTEXT_BYTES} byte limit; shorten the \
+                 notes or remove an extra field",
+                json.len()
+            )));
+        }
         Ok(aead::encrypt(&self.0, &json, name.as_bytes()))
     }
 
@@ -162,6 +279,7 @@ mod tests {
             password: "pässwörd🔐".into(),
             url: "https://example.com".into(),
             notes: "".into(),
+            fields: Vec::new(),
         }
     }
 
@@ -207,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_key_json_distinguishes_the_two_forms_and_reads_legacy_boxes() {
+    fn wrapped_key_json_states_which_form_it_is() {
         let key = SecretKey::generate();
         let me = Identity::generate();
         let shared = WrappedKey::Shared(key.wrap_for(me.public_key()).unwrap());
@@ -216,11 +334,29 @@ mod tests {
             let json = serde_json::to_string(original).unwrap();
             assert_eq!(&serde_json::from_str::<WrappedKey>(&json).unwrap(), original);
         }
-        // A sealed box stored before `WrappedKey` existed carries no tag.
-        let legacy = serde_json::to_string(&key.wrap_for(me.public_key()).unwrap()).unwrap();
-        assert!(matches!(serde_json::from_str::<WrappedKey>(&legacy).unwrap(), WrappedKey::Shared(_)));
-        let owner_json = serde_json::to_string(&owner).unwrap();
-        assert!(owner_json.contains("\"nonce\"") && !owner_json.contains("ephemeral_public"));
+        // The form is named, not guessed at from the fields present. Note
+        // the guarantee is one-way: `Sealed` cannot use `deny_unknown_fields`
+        // alongside `SealedBox`'s `flatten`, so a sealed box labelled as an
+        // owner copy parses, dropping `ephemeral_public`. Nothing is exposed
+        // by that — unwrapping it is an AES-GCM open that fails — but it
+        // surfaces as a decrypt error rather than an explicit refusal.
+        assert!(serde_json::to_string(&owner).unwrap().contains(r#""wrap":"owner""#));
+        assert!(serde_json::to_string(&shared).unwrap().contains(r#""wrap":"shared""#));
+        // An untagged sealed box is no longer a wrapped key of either form.
+        let untagged = serde_json::to_string(&key.wrap_for(me.public_key()).unwrap()).unwrap();
+        assert!(serde_json::from_str::<WrappedKey>(&untagged).is_err());
+        // The other direction is not a parse failure: a sealed box labelled
+        // as an owner copy reads as one, with `ephemeral_public` ignored.
+        // Pinned here so the asymmetry is recorded rather than assumed away.
+        let mislabelled = format!(r#"{{"wrap":"owner","key":{untagged}}}"#);
+        let parsed = serde_json::from_str::<WrappedKey>(&mislabelled).unwrap();
+        assert!(matches!(parsed, WrappedKey::Owner(_)));
+        // It opens nothing: unwrapping is an authenticated decrypt that fails.
+        let WrappedKey::Owner(sealed) = parsed else { unreachable!() };
+        assert!(SecretKey::unwrap_owner(&aead::random_bytes::<KEY_LEN>(), &sealed).is_err());
+        // Nor is an owner copy wearing the other form's tag.
+        let mistagged = serde_json::to_string(&owner).unwrap().replace("owner", "shared");
+        assert!(serde_json::from_str::<WrappedKey>(&mistagged).is_err());
     }
 
     #[test]
@@ -241,6 +377,104 @@ mod tests {
         let mut big = payload();
         big.notes = "n".repeat(MAX_FIELD_LEN + 1);
         assert!(key.encrypt(NAME, &big).is_err());
+    }
+
+    #[test]
+    fn custom_fields_round_trip_and_keep_their_order() {
+        let key = SecretKey::generate();
+        let mut with_extras = payload();
+        with_extras.fields = vec![
+            CustomField { id: new_field_id(), label: "Account number".into(), value: "12345678".into(), secret: false },
+            CustomField { id: new_field_id(), label: "Recovery code".into(), value: "aaaa-bbbb".into(), secret: true },
+            // Two fields may share a label; people really do keep several
+            // recovery codes, and they are told apart by id.
+            CustomField { id: new_field_id(), label: "Recovery code".into(), value: "cccc-dddd".into(), secret: true },
+        ];
+        let sealed = key.encrypt(NAME, &with_extras).unwrap();
+        let back = key.decrypt(NAME, &sealed).unwrap();
+        assert_eq!(back, with_extras);
+        assert_eq!(back.fields[2].value, "cccc-dddd");
+        assert!(back.fields[1].secret && !back.fields[0].secret);
+    }
+
+    /// Characterises the `default` / `skip_serializing_if` pair: a payload
+    /// without the key decrypts as one with no extra fields, and one with no
+    /// extra fields is written without the key. This release requires a fresh
+    /// database, so it is not a claim about anything already stored — it is
+    /// what keeps the *next* field addition from being a breaking change.
+    #[test]
+    fn an_absent_field_list_reads_and_writes_as_no_extra_fields() {
+        let older = r#"{"username":"jude","password":"hunter2","url":"","notes":"note"}"#;
+        let restored: SecretPayload = serde_json::from_str(older).unwrap();
+        assert_eq!(restored.username, "jude");
+        assert_eq!(restored.notes, "note");
+        assert!(restored.fields.is_empty(), "a missing list must read as no extra fields, not fail");
+
+        // And a payload with no extras serialises without the key at all, so
+        // nothing already stored changes shape when it is next written.
+        let json = serde_json::to_string(&restored).unwrap();
+        assert!(!json.contains("fields"), "{json}");
+    }
+
+    #[test]
+    fn custom_fields_are_validated() {
+        let key = SecretKey::generate();
+        let with_fields = |fields: Vec<CustomField>| {
+            let mut p = payload();
+            p.fields = fields;
+            p
+        };
+        let field = |label: &str, value: &str| CustomField {
+            id: new_field_id(),
+            label: label.into(),
+            value: value.into(),
+            secret: false,
+        };
+
+        // Labels are required and are stored trimmed.
+        assert!(key.encrypt(NAME, &with_fields(vec![field("   ", "x")])).is_err());
+        assert_eq!(validate_label("  PIN  ").unwrap(), "PIN");
+        assert!(validate_label(&"l".repeat(MAX_LABEL_LEN + 1)).is_err());
+
+        // Too many fields, and an oversized value, are both refused.
+        let many = (0..=MAX_CUSTOM_FIELDS).map(|i| field(&format!("f{i}"), "v")).collect();
+        assert!(key.encrypt(NAME, &with_fields(many)).is_err());
+        assert!(key.encrypt(NAME, &with_fields(vec![field("PIN", &"v".repeat(MAX_FIELD_LEN + 1))])).is_err());
+
+        // A value may be empty: the label alone is still worth keeping.
+        assert!(key.encrypt(NAME, &with_fields(vec![field("PIN", "")])).is_ok());
+    }
+
+    #[test]
+    fn a_payload_that_is_too_big_overall_is_refused_before_encryption() {
+        let key = SecretKey::generate();
+        let mut big = payload();
+        // Each field is within its own limit; together they are not.
+        big.fields = (0..MAX_CUSTOM_FIELDS)
+            .map(|i| CustomField {
+                id: new_field_id(),
+                label: format!("f{i}"),
+                value: "v".repeat(MAX_FIELD_LEN),
+                secret: false,
+            })
+            .collect();
+        assert!(big.validate().is_ok(), "every field is individually legal");
+        let error = key.encrypt(NAME, &big).unwrap_err();
+        assert!(error.to_string().contains("over the"), "{error}");
+    }
+
+    #[test]
+    fn debug_redacts_secret_field_values_but_not_labels() {
+        let mut p = payload();
+        p.fields = vec![
+            CustomField { id: new_field_id(), label: "Recovery code".into(), value: "top-secret".into(), secret: true },
+            CustomField { id: new_field_id(), label: "Account number".into(), value: "12345678".into(), secret: false },
+        ];
+        let text = format!("{p:?}");
+        assert!(text.contains("Recovery code"), "{text}");
+        assert!(!text.contains("top-secret"), "{text}");
+        // A value the user did not mark sensitive is shown, like the username.
+        assert!(text.contains("12345678"), "{text}");
     }
 
     #[test]

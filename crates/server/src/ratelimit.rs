@@ -1,7 +1,11 @@
-//! In-process per-client token buckets for the unauthenticated endpoints, so a
-//! default deployment is safe without a reverse proxy in front of it.
+//! In-process token buckets, so a default deployment is safe without a reverse
+//! proxy in front of it. The unauthenticated endpoints are limited by client
+//! address; the authenticated ones that reveal something about other accounts
+//! are limited by caller id, which an attacker cannot rotate the way they can
+//! rotate addresses.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,11 +29,12 @@ struct Bucket {
 }
 
 /// A token bucket per client: `capacity` requests may burst, then one more is
-/// allowed every `refill_every`.
-pub struct RateLimiter {
+/// allowed every `refill_every`. `K` identifies the client: an address for the
+/// unauthenticated endpoints, a user id for the authenticated ones.
+pub struct RateLimiter<K = IpAddr> {
     capacity: u32,
     refill_every: Duration,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    buckets: Mutex<HashMap<K, Bucket>>,
 }
 
 /// The unit that is limited. An IPv6 subscriber usually controls an entire
@@ -48,15 +53,10 @@ pub fn limiter_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-impl RateLimiter {
+impl<K: Copy + Eq + Hash + Ord> RateLimiter<K> {
     pub fn new(capacity: u32, refill_every: Duration) -> Self {
         assert!(capacity > 0, "rate limiter capacity must be positive");
         Self { capacity, refill_every, buckets: Mutex::new(HashMap::new()) }
-    }
-
-    /// Take one token for `ip`, or return how long until one is available.
-    pub fn try_acquire(&self, ip: IpAddr) -> Result<(), Duration> {
-        self.try_acquire_at(ip, Instant::now())
     }
 
     /// Number of clients currently tracked (for tests and metrics).
@@ -64,8 +64,17 @@ impl RateLimiter {
         self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
     }
 
-    fn try_acquire_at(&self, ip: IpAddr, now: Instant) -> Result<(), Duration> {
-        let key = limiter_key(ip);
+    /// Take one token for `key`, or return how long until one is available.
+    ///
+    /// Crate-visible: on a `RateLimiter<IpAddr>` this would skip `limiter_key`,
+    /// and with it the /64 folding that stops one IPv6 client spreading its
+    /// budget over billions of addresses. Address-keyed callers use
+    /// `try_acquire`.
+    pub(crate) fn try_acquire_keyed(&self, key: K) -> Result<(), Duration> {
+        self.try_acquire_keyed_at(key, Instant::now())
+    }
+
+    fn try_acquire_keyed_at(&self, key: K, now: Instant) -> Result<(), Duration> {
         let capacity = f64::from(self.capacity);
         let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if buckets.len() >= MAX_TRACKED_CLIENTS && !buckets.contains_key(&key) {
@@ -83,13 +92,31 @@ impl RateLimiter {
     }
 }
 
+impl RateLimiter<IpAddr> {
+    /// Take one token for `ip`, or return how long until one is available.
+    /// Addresses are folded with `limiter_key` first, so one IPv6 subscriber
+    /// cannot spread their budget over a whole /64.
+    pub fn try_acquire(&self, ip: IpAddr) -> Result<(), Duration> {
+        self.try_acquire_at(ip, Instant::now())
+    }
+
+    fn try_acquire_at(&self, ip: IpAddr, now: Instant) -> Result<(), Duration> {
+        self.try_acquire_keyed_at(limiter_key(ip), now)
+    }
+}
+
 /// Drop idle (full) buckets; if none are idle, drop the oldest `EVICT_BATCH`.
-fn make_room(buckets: &mut HashMap<IpAddr, Bucket>, now: Instant, capacity: f64, refill_every: Duration) {
+fn make_room<K: Copy + Eq + Hash + Ord>(
+    buckets: &mut HashMap<K, Bucket>,
+    now: Instant,
+    capacity: f64,
+    refill_every: Duration,
+) {
     buckets.retain(|_, bucket| refilled(bucket, now, capacity, refill_every) < capacity);
     if buckets.len() < MAX_TRACKED_CLIENTS {
         return;
     }
-    let mut by_age: Vec<(Instant, IpAddr)> = buckets.iter().map(|(key, bucket)| (bucket.last_refill, *key)).collect();
+    let mut by_age: Vec<(Instant, K)> = buckets.iter().map(|(key, bucket)| (bucket.last_refill, *key)).collect();
     let cutoff = EVICT_BATCH.min(by_age.len()) - 1;
     by_age.select_nth_unstable(cutoff);
     for (_, key) in &by_age[..=cutoff] {
@@ -232,6 +259,21 @@ mod tests {
         let buckets = limiter.buckets.lock().unwrap();
         assert!(!buckets.contains_key(&early));
         assert!(buckets.contains_key(&late));
+    }
+
+    #[test]
+    fn buckets_can_be_keyed_by_something_other_than_an_address() {
+        // The lookup limiter is keyed by user id, so one account gets one
+        // budget however many addresses it is driven from.
+        let limiter: RateLimiter<i64> = RateLimiter::new(2, Duration::from_secs(60));
+        let start = Instant::now();
+        assert!(limiter.try_acquire_keyed_at(7, start).is_ok());
+        assert!(limiter.try_acquire_keyed_at(7, start).is_ok());
+        assert!(limiter.try_acquire_keyed_at(7, start).is_err());
+        // A different account is untouched, and refills on its own schedule.
+        assert!(limiter.try_acquire_keyed_at(8, start).is_ok());
+        assert_eq!(limiter.tracked(), 2);
+        assert!(limiter.try_acquire_keyed_at(7, start + Duration::from_secs(60)).is_ok());
     }
 
     #[test]

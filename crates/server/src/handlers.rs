@@ -7,8 +7,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use credvault_core::identity::normalize_fingerprint;
 use credvault_core::kdf::{normalize_email, validate_auth_hash};
-use credvault_core::{secret, PublicKey, Sealed, SealedBox, WrappedKey};
+use credvault_core::{secret, PublicKey, Sealed, WrappedKey};
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteExecutor, SqlitePool, Transaction};
 use subtle::ConstantTimeEq;
@@ -49,11 +50,6 @@ fn check_blob_size(label: &str, len: usize) -> ApiResult<()> {
 fn encode_sealed(label: &str, sealed: &Sealed) -> ApiResult<String> {
     check_blob_size(label, sealed.ciphertext.len())?;
     Ok(serde_json::to_string(sealed)?)
-}
-
-fn encode_box(label: &str, boxed: &SealedBox) -> ApiResult<String> {
-    check_blob_size(label, boxed.sealed.ciphertext.len())?;
-    Ok(serde_json::to_string(boxed)?)
 }
 
 fn encode_wrapped(label: &str, wrapped: &WrappedKey) -> ApiResult<String> {
@@ -252,19 +248,114 @@ pub async fn me(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json
     Ok(Json(load_profile(&state.pool, user.id).await?))
 }
 
+/// Stand-in used when no account exists. A real public key, so the absent
+/// case runs the same decode and the same SHA-256 as a present one rather
+/// than comparing against a constant: the two branches should differ in
+/// their answer, not in how much work they do. The same trick as the dummy
+/// hash on the login path.
+const ABSENT_PUBLIC_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+/// Its fingerprint, derived on every call. Deliberately not memoised: the
+/// point is to spend the decode and the hash that the present branch spends,
+/// and a cached value would skip exactly the work being matched.
+///
+/// Infallible by construction, and it must stay that way: propagating an
+/// error here would make a mistyped constant answer 500 on the no-account
+/// branch while the wrong-fingerprint branch still answered 404, which is
+/// the oracle this whole helper exists to avoid.
+fn absent_fingerprint() -> String {
+    PublicKey::from_base64(ABSENT_PUBLIC_KEY)
+        .map(|key| key.fingerprint())
+        .unwrap_or_else(|_| "0".repeat(credvault_core::identity::FINGERPRINT_HEX_LEN))
+}
+
+/// One answer for every way a lookup can fail. It must never say which, or it
+/// would be the oracle this endpoint exists to avoid being.
+const LOOKUP_FAILED_MESSAGE: &str =
+    "no account matches that email and fingerprint; check the fingerprint with them directly";
+
+/// Resolve an email to the public key to share with, but only for a caller who
+/// already knows that key's fingerprint. Someone who has confirmed a
+/// fingerprint out of band learns nothing new; someone guessing at addresses
+/// learns nothing at all, because a wrong fingerprint, a wrong address and an
+/// address with no account are the same 404.
+///
+/// The budget on top is per account rather than per address, which a caller
+/// can change at will, and bounds guessing at fingerprints as well.
 pub async fn lookup_user(
     State(state): State<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     Query(query): Query<LookupQuery>,
 ) -> ApiResult<Json<PublicUser>> {
-    let email = validate_email(&query.email)?;
+    let found = resolve_by_fingerprint(&state, &state.pool, user.id, &query.email, &query.fingerprint).await?;
+    Ok(Json(PublicUser { id: found.id, email: found.email, public_key: found.public_key }))
+}
+
+/// An account the caller proved they already knew the fingerprint of.
+struct ResolvedUser {
+    id: i64,
+    email: String,
+    public_key: PublicKey,
+}
+
+/// Resolve an email to an account, but only for a caller who already knows
+/// that account's fingerprint. Every way this can fail gives one answer, so
+/// no endpoint built on it can be asked whether an address has an account.
+///
+/// Both endpoints that take an email go through here, because an oracle is
+/// only closed if it is closed everywhere: an invite that answered "no such
+/// account" would hand back exactly what the lookup refuses to say. For the
+/// same reason the caller's budget is spent here rather than at the call
+/// sites, so an endpoint added later cannot be built on this unthrottled.
+async fn resolve_by_fingerprint<'e>(
+    state: &AppState,
+    executor: impl SqliteExecutor<'e>,
+    caller: i64,
+    email: &str,
+    fingerprint: &str,
+) -> ApiResult<ResolvedUser> {
+    if let Err(wait) = state.lookup_limiter.try_acquire_keyed(caller) {
+        tracing::warn!(user_id = caller, "directory lookup rate limited");
+        return Err(ApiError::TooManyRequests { retry_after_secs: wait.as_secs().max(1) });
+    }
+    if fingerprint.len() > MAX_FINGERPRINT_INPUT_LEN {
+        return Err(ApiError::BadRequest("fingerprint is too long".into()));
+    }
+    let email = validate_email(email)?;
     let row: Option<(i64, String, String)> = sqlx::query_as("SELECT id, email, public_key FROM users WHERE email = ?")
         .bind(&email)
-        .fetch_optional(&state.pool)
+        .fetch_optional(executor)
         .await?;
-    let (id, email, public_key) =
-        row.ok_or_else(|| ApiError::NotFound("no account with that email; ask them to sign up first".into()))?;
-    Ok(Json(PublicUser { id, email, public_key: decode_stored_public_key(&public_key)? }))
+
+    // The comparison runs exactly once either way, against the real
+    // fingerprint or the stand-in, so the two cases are indistinguishable.
+    let found = match row {
+        Some((id, email, stored)) => Some(ResolvedUser { id, email, public_key: decode_stored_public_key(&stored)? }),
+        None => None,
+    };
+    // Both branches decode a key and fingerprint it before the single
+    // comparison, so the crypto is symmetric. The database work is not — a
+    // hit returns a row and allocates, a miss does not — so what actually
+    // bounds what an attacker can measure is the per-account budget above,
+    // along with the identical status and body on every failure.
+    let expected = match &found {
+        Some(found) => found.public_key.fingerprint(),
+        None => absent_fingerprint(),
+    };
+    let matched = fingerprint_matches(&expected, fingerprint);
+    match found {
+        Some(found) if matched => Ok(found),
+        _ => Err(ApiError::NotFound(LOOKUP_FAILED_MESSAGE.into())),
+    }
+}
+
+/// Compare two fingerprints in constant time, ignoring how they were typed.
+/// Hashing both sides equalises the length as well as the content, so a near
+/// miss cannot be told from a wild one by how long the answer took.
+fn fingerprint_matches(expected: &str, supplied: &str) -> bool {
+    let expected = Sha256::digest(normalize_fingerprint(expected).as_bytes());
+    let supplied = Sha256::digest(normalize_fingerprint(supplied).as_bytes());
+    expected.ct_eq(&supplied).into()
 }
 
 // ----- secrets --------------------------------------------------------------
@@ -347,29 +438,6 @@ pub async fn create_secret(
     tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(Created { id: secret_id })))
-}
-
-/// Replace the owner's own wrapped copy. Clients call this once per secret
-/// whose owner copy predates self-wrapping; the version check keeps it from
-/// racing a rotation.
-pub async fn upgrade_owner_key(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path(secret_id): Path<i64>,
-    ApiJson(body): ApiJson<UpgradeOwnerKeyRequest>,
-) -> ApiResult<StatusCode> {
-    check_wrapped_kind(&body.wrapped_key, true)?;
-    let wrapped_key = encode_wrapped("wrapped_key", &body.wrapped_key)?;
-    let mut tx = begin_write(&state.pool).await?;
-    require_key_version(&mut *tx, secret_id, user.id, body.key_version).await?;
-    sqlx::query("UPDATE secret_keys SET wrapped_key = ? WHERE secret_id = ? AND user_id = ?")
-        .bind(wrapped_key)
-        .bind(secret_id)
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn update_secret(
@@ -543,26 +611,40 @@ pub async fn create_invite(
     Path(secret_id): Path<i64>,
     ApiJson(body): ApiJson<InviteRequest>,
 ) -> ApiResult<(StatusCode, Json<Created>)> {
-    // A wrapped key made from a rotated-away version would never open the payload.
-    require_key_version(&state.pool, secret_id, user.id, body.key_version).await?;
+    // Everything that needs no database is checked before the write lock is taken.
     let email = validate_email(&body.email)?;
     if body.message.len() > MAX_MESSAGE_LEN {
         return Err(ApiError::BadRequest(format!("message exceeds {MAX_MESSAGE_LEN} bytes")));
     }
-    let wrapped_key = encode_box("wrapped_key", &body.wrapped_key)?;
+    // Stored in the same form `secret_keys` uses, because accepting an invite
+    // copies this value straight across. An invite can only ever carry a
+    // sealed box, which is what makes it a `Shared` copy.
+    let wrapped_key = encode_wrapped("wrapped_key", &WrappedKey::Shared(body.wrapped_key))?;
 
-    let invitee: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM users WHERE email = ?").bind(&email).fetch_optional(&state.pool).await?;
-    let (invitee_id,) = invitee.ok_or_else(|| ApiError::NotFound("no account with that email".into()))?;
-    if invitee_id == user.id {
+    // Same proof the lookup demands: knowing the fingerprint. Otherwise this
+    // endpoint answers the question the lookup refuses to. Resolved before the
+    // write lock is taken: the wrapped key was sealed to this person on the
+    // client long before the request, so re-reading their row inside the
+    // transaction would buy nothing and would hold the database's single
+    // writer lock across a hash and a decode.
+    let invitee = resolve_by_fingerprint(&state, &state.pool, user.id, &email, &body.fingerprint).await?;
+    if invitee.id == user.id {
         return Err(ApiError::BadRequest("you already own this secret".into()));
     }
+    let invitee_id = invitee.id;
+
+    // The version check and the insert share one transaction: otherwise a
+    // rotation committing in between would purge the pending invites and leave
+    // this one behind, holding a key that no longer opens the payload.
+    let mut tx = begin_write(&state.pool).await?;
+    // A wrapped key made from a rotated-away version would never open the payload.
+    require_key_version(&mut *tx, secret_id, user.id, body.key_version).await?;
 
     let already_member: Option<(i64,)> =
         sqlx::query_as("SELECT 1 FROM secret_keys WHERE secret_id = ? AND user_id = ?")
             .bind(secret_id)
             .bind(invitee_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await?;
     if already_member.is_some() {
         return Err(ApiError::Conflict("that user already has access".into()));
@@ -578,16 +660,18 @@ pub async fn create_invite(
     .bind(wrapped_key)
     .bind(body.message.trim())
     .bind(Utc::now())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
 
-    match inserted {
-        Ok(result) => Ok((StatusCode::CREATED, Json(Created { id: result.last_insert_rowid() }))),
+    let invite_id = match inserted {
+        Ok(result) => result.last_insert_rowid(),
         Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-            Err(ApiError::Conflict("that user already has a pending invite".into()))
+            return Err(ApiError::Conflict("that user already has a pending invite".into()))
         }
-        Err(other) => Err(other.into()),
-    }
+        Err(other) => return Err(other.into()),
+    };
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(Created { id: invite_id })))
 }
 
 pub async fn cancel_invite(
@@ -705,6 +789,19 @@ mod tests {
         assert!(matches!(check_registration_policy(&policy, None), Err(ApiError::Forbidden(_))));
         let long = "x".repeat(MAX_REGISTRATION_TOKEN_LEN + 1);
         assert!(matches!(check_registration_policy(&policy, Some(&long)), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn fingerprint_comparison_ignores_formatting_and_rejects_near_misses() {
+        let real = "3f1a-9c0e-77b2-d4a5-1b2c-3d4e";
+        assert!(fingerprint_matches(real, real));
+        assert!(fingerprint_matches(real, "3F1A9C0E77B2D4A51B2C3D4E"));
+        assert!(fingerprint_matches(real, "  3f1a 9c0e 77b2 d4a5 1b2c 3d4e  "));
+        // One digit out, a truncation, and an empty guess all fail.
+        assert!(!fingerprint_matches(real, "3f1a-9c0e-77b2-d4a5-1b2c-3d4f"));
+        assert!(!fingerprint_matches(real, "3f1a-9c0e-77b2"));
+        assert!(!fingerprint_matches(real, ""));
+        assert!(!fingerprint_matches(real, &absent_fingerprint()));
     }
 
     #[test]

@@ -9,14 +9,14 @@ const REVEAL_HIDE_AFTER_MS = 30_000;
 const TOAST_MS = 2200;
 const MASKED = "••••••••••••";
 // Limits owned by the Rust crates; `ui_constants` overwrites these defaults at startup.
-const UI = { minPasswordLength: 8, maxMessageLength: 1000, generatedPasswordLength: 20 };
+const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLength: 20, maxCustomFields: 20, maxLabelLength: 100, maxFieldLength: 4096 };
 const THEME_KEY = "theme";
 const THEME_CHOICES = ["system", "light", "dark"];
 
-const state = { secrets: [], selected: null, editing: false, authMode: "login", inviteCount: 0 };
+const state = { secrets: [], selected: null, editing: false, authMode: "login", inviteCount: 0, formFields: [] };
 const MOBILE_QUERY = window.matchMedia("(max-width: 720px)");
 const isMobile = () => MOBILE_QUERY.matches;
-const timers = { toast: null, reveal: null, revealTick: null };
+const timers = { toast: null };
 
 // ----- helpers ---------------------------------------------------------------
 
@@ -63,6 +63,24 @@ function setError(id, error) {
   const text = error?.message ?? error;
   if (el) el.textContent = text ? String(text) : "";
 }
+/// A warning that must not be cleared by the next keystroke: it stays until
+/// the user dismisses it.
+function showStartupWarning(text) {
+  const host = $("auth-error")?.parentElement;
+  if (!host) return;
+  const banner = document.createElement("div");
+  banner.className = "notice danger startup-warning";
+  banner.setAttribute("role", "alert");
+  banner.innerHTML = `${icon("alert")}<div>${esc(text)}</div>`;
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.className = "btn";
+  dismiss.textContent = "Dismiss";
+  dismiss.onclick = () => banner.remove();
+  banner.append(dismiss);
+  host.insertBefore(banner, $("auth-error"));
+}
+
 function remember(key, value) {
   try { localStorage.setItem(key, value); } catch (_) { /* storage may be unavailable */ }
 }
@@ -259,7 +277,7 @@ async function authenticate(event) {
     showApp(user);
   } catch (error) {
     setError("auth-error", error);
-    if (isRegister && /token/i.test(String(error))) showTokenField(true);
+    if (isRegister && /token/i.test(String(error?.message ?? error))) showTokenField(true);
   } finally {
     setBusy($("btn-auth"), false);
   }
@@ -281,7 +299,7 @@ function showApp(user) {
 
 async function logout() {
   await invoke("logout");
-  clearReveal();
+  clearReveals();
   state.secrets = []; state.selected = null; state.editing = false;
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
   closeAccountSheet({ restoreFocus: false });
@@ -503,11 +521,23 @@ function kvRow(iconName, label, value, { mono = false, copyLabel = null } = {}) 
   const actions = hasValue && copyLabel
     ? `<div class="kv-actions"><button type="button" class="icon-btn" data-copy="${esc(value)}" data-copy-label="${esc(copyLabel)}" aria-label="Copy ${esc(copyLabel.toLowerCase())}" title="Copy">${icon("copy")}</button></div>`
     : "";
-  return `<div class="kv-row"><dt>${icon(iconName)} ${label}</dt><dd>${valueHtml}${actions}</dd></div>`;
+  return `<div class="kv-row"><dt>${icon(iconName)} ${esc(label)}</dt><dd>${valueHtml}${actions}</dd></div>`;
+}
+
+/// Extra details, in the order they were saved. A value the user marked as
+/// hidden is masked and fetched one field at a time, like the password; the
+/// rest are shown outright, like the username.
+function customFieldRows(secret) {
+  return (secret.fields ?? [])
+    .map((field, index) =>
+      field.secret
+        ? secretRow("lock", field.label, `f${index}`)
+        : kvRow("note", field.label, field.value, { copyLabel: field.label }))
+    .join("");
 }
 
 function renderDetail() {
-  clearReveal();
+  clearReveals();
   updateMobileTitle();
   const s = state.secrets.find((x) => x.id === state.selected);
   $("main").classList.toggle("has-selection", Boolean(s));
@@ -542,19 +572,10 @@ function renderDetail() {
       <div id="confirm-delete"></div>
       <dl class="kv">
         ${kvRow("user", "Username", s.username, { mono: true, copyLabel: "Username" })}
-        <div class="kv-row">
-          <dt>${icon("key")} Password</dt>
-          <dd>
-            <code class="value mono" id="pw" data-shown="0">${MASKED}</code>
-            <span class="pw-timer hidden" id="pw-timer" aria-live="off"></span>
-            <div class="kv-actions">
-              <button type="button" class="icon-btn" id="btn-reveal" aria-label="Show password" aria-pressed="false" title="Show">${icon("eye")}</button>
-              <button type="button" class="icon-btn" id="btn-copy" aria-label="Copy password" title="Copy">${icon("copy")}</button>
-            </div>
-          </dd>
-        </div>
+        ${secretRow("key", "Password", "pw")}
         ${s.url ? kvRow("globe", "URL", s.url, { copyLabel: "URL" }) : ""}
         ${s.notes ? kvRow("note", "Notes", s.notes) : ""}
+        ${customFieldRows(s)}
       </dl>
     </article>
     ${s.is_owner ? `
@@ -566,26 +587,26 @@ function renderDetail() {
   for (const el of $("detail").querySelectorAll("[data-copy]")) {
     el.onclick = () => copyText(el.dataset.copy, el.dataset.copyLabel);
   }
-  $("btn-reveal").onclick = async () => {
-    if ($("pw").dataset.shown === "1") { hidePassword(); return; }
-    setError("main-error", "");
-    try {
-      const password = await invoke("reveal_password", { id: s.id });
-      const pw = $("pw");
-      if (!pw || state.selected !== s.id) return; // the view changed while we waited
-      pw.textContent = password;
-      pw.dataset.shown = "1";
-      setRevealButton(true);
-      startRevealCountdown();
-    } catch (error) { setError("main-error", error); }
-  };
-  $("btn-copy").onclick = async () => {
-    setError("main-error", "");
-    try {
-      const seconds = await invoke("copy_password", { id: s.id });
-      toast(`Password copied · clipboard clears in ${seconds}s`);
-    } catch (error) { setError("main-error", error); }
-  };
+  const stillShowing = () => state.selected === s.id;
+  wireSecretRow(
+    "pw",
+    () => invoke("reveal_password", { id: s.id }),
+    () => invoke("copy_password", { id: s.id }),
+    stillShowing,
+    "Password",
+  );
+  // Each hidden custom field is fetched by its own id, so showing one does
+  // not bring the others back to the UI with it.
+  (s.fields ?? []).forEach((field, index) => {
+    if (!field.secret) return;
+    wireSecretRow(
+      `f${index}`,
+      () => invoke("reveal_field", { id: s.id, fieldId: field.id }),
+      () => invoke("copy_field", { id: s.id, fieldId: field.id }),
+      stillShowing,
+      field.label,
+    );
+  });
   $("btn-delete").onclick = () => renderDeleteConfirm(s);
   if (s.is_owner) {
     $("btn-edit").onclick = () => renderForm(s);
@@ -593,43 +614,127 @@ function renderDetail() {
   }
 }
 
-/// Reveal state: the password is masked again after REVEAL_HIDE_AFTER_MS, and
-/// whenever the detail pane re-renders.
-function clearReveal() {
-  clearTimeout(timers.reveal);
-  clearInterval(timers.revealTick);
-  timers.reveal = timers.revealTick = null;
-  const timer = $("pw-timer");
-  if (timer) { timer.textContent = ""; timer.classList.add("hidden"); }
+/// Reveal state, one entry per masked value on screen: the password and each
+/// sensitive custom field count down and hide themselves independently. Every
+/// value is masked again after REVEAL_HIDE_AFTER_MS, and whenever the detail
+/// pane re-renders.
+const reveals = new Map();
+
+function clearReveals() {
+  for (const { hide, tick } of reveals.values()) { clearTimeout(hide); clearInterval(tick); }
+  reveals.clear();
 }
-function hidePassword() {
-  clearReveal();
-  const pw = $("pw");
-  if (!pw) return;
-  pw.textContent = MASKED;
-  pw.dataset.shown = "0";
-  setRevealButton(false);
+
+/// The three elements making up one masked value, by the key in its ids.
+function revealSlot(key) {
+  return { value: $(`val-${key}`), timer: $(`timer-${key}`), button: $(`btn-reveal-${key}`) };
 }
-function setRevealButton(shown) {
-  const button = $("btn-reveal");
+
+function setRevealButton(button, shown) {
   if (!button) return;
   button.innerHTML = icon(shown ? "eyeOff" : "eye");
   button.setAttribute("aria-pressed", String(shown));
-  button.setAttribute("aria-label", shown ? "Hide password" : "Show password");
+  button.setAttribute("aria-label", shown ? "Hide" : "Show");
   button.title = shown ? "Hide" : "Show";
 }
-function startRevealCountdown() {
+
+function hideValue(key, slots) {
+  const timers = reveals.get(key);
+  if (timers) { clearTimeout(timers.hide); clearInterval(timers.tick); reveals.delete(key); }
+  const { value, timer, button } = slots ?? revealSlot(key);
+  if (!value) return;
+  value.textContent = MASKED;
+  value.dataset.shown = "0";
+  if (timer) { timer.textContent = ""; timer.classList.add("hidden"); }
+  setRevealButton(button, false);
+}
+
+function showValue(key, slots, text) {
+  // Whatever is already counting down under this key is replaced, not left
+  // running: an orphaned interval keeps writing into a countdown beside a
+  // value that has since been masked, and its timeout hides the next reveal
+  // early.
+  const existing = reveals.get(key);
+  if (existing) { clearTimeout(existing.hide); clearInterval(existing.tick); }
+  const { value, timer, button } = slots;
+  if (!value) return;
+  value.textContent = text;
+  value.dataset.shown = "1";
+  setRevealButton(button, true);
   const until = Date.now() + REVEAL_HIDE_AFTER_MS;
   const tick = () => {
-    const timer = $("pw-timer");
     if (!timer) return;
-    const left = Math.max(0, Math.ceil((until - Date.now()) / 1000));
-    timer.textContent = `Hides in ${left}s`;
+    timer.textContent = `Hides in ${Math.max(0, Math.ceil((until - Date.now()) / 1000))}s`;
     timer.classList.remove("hidden");
   };
   tick();
-  timers.revealTick = setInterval(tick, 1000);
-  timers.reveal = setTimeout(hidePassword, REVEAL_HIDE_AFTER_MS);
+  reveals.set(key, {
+    hide: setTimeout(() => hideValue(key, slots), REVEAL_HIDE_AFTER_MS),
+    tick: setInterval(tick, 1000),
+  });
+}
+
+/// A masked value with Show and Copy buttons. `key` makes its element ids.
+function secretRow(iconName, label, key) {
+  const lower = esc(label.toLowerCase());
+  return `
+    <div class="kv-row">
+      <dt>${icon(iconName)} ${esc(label)}</dt>
+      <dd>
+        <code class="value mono" id="val-${key}" data-shown="0">${MASKED}</code>
+        <span class="pw-timer hidden" id="timer-${key}" aria-live="off"></span>
+        <div class="kv-actions">
+          <button type="button" class="icon-btn" id="btn-reveal-${key}" aria-label="Show ${lower}" aria-pressed="false" title="Show">${icon("eye")}</button>
+          <button type="button" class="icon-btn" id="btn-copy-${key}" aria-label="Copy ${lower}" title="Copy">${icon("copy")}</button>
+        </div>
+      </dd>
+    </div>`;
+}
+
+/// Wire Show and Copy for one masked value. Both go through Rust, which holds
+/// the plaintext for as little time as it can and clears the clipboard after.
+/// `stillShowing` guards against the view changing while the call is in flight.
+function wireSecretRow(key, fetchValue, copyValue, stillShowing, subject = "Value") {
+  const reveal = $(`btn-reveal-${key}`);
+  const copy = $(`btn-copy-${key}`);
+  // Captured now, not looked up again when the value arrives. The key is
+  // positional, so if the pane re-renders while the fetch is in flight —
+  // a refresh picking up a field another device added above this one —
+  // the same key would name a different field's row, and the plaintext
+  // would be written under the wrong label.
+  const slots = revealSlot(key);
+  const slot = slots.value;
+  // A reveal is a network round trip, so the button stays clickable for as
+  // long as it takes. A second click must not become a second reveal: the
+  // first would land after the user had hidden the value again and put it
+  // back on screen for another thirty seconds, unasked.
+  let inFlight = false;
+  if (reveal) reveal.onclick = async () => {
+    if (inFlight) return;
+    if (slot?.dataset.shown === "1") { hideValue(key, slots); return; }
+    setError("main-error", "");
+    inFlight = true;
+    reveal.disabled = true;
+    try {
+      const text = await fetchValue();
+      // A re-render detaches this node, which is how we know the row we
+      // were wired to is gone rather than merely scrolled away.
+      if (!stillShowing() || !slot?.isConnected) return;
+      showValue(key, slots, text);
+    } catch (error) {
+      setError("main-error", error);
+    } finally {
+      inFlight = false;
+      if (reveal.isConnected) reveal.disabled = false;
+    }
+  };
+  if (copy) copy.onclick = async () => {
+    setError("main-error", "");
+    try {
+      const seconds = await copyValue();
+      toast(`${subject} copied · clipboard clears in ${seconds}s`);
+    } catch (error) { setError("main-error", error); }
+  };
 }
 
 /// Inline confirmation instead of window.confirm(), which the webview may not show.
@@ -718,6 +823,12 @@ async function loadSharing(id) {
           <label for="invite-email">Email</label>
           <input id="invite-email" type="email" placeholder="friend@example.com" autocomplete="off" spellcheck="false">
         </div>
+        <div class="field">
+          <label for="invite-fingerprint">Their key fingerprint</label>
+          <input id="invite-fingerprint" class="mono" placeholder="0000-0000-0000-0000-0000-0000"
+            autocomplete="off" spellcheck="false">
+          <p class="hint">Ask them to read it from the top of their credvault window. Leave blank for someone you have already shared with.</p>
+        </div>
         <div class="field wide">
           <label for="invite-message">Message <span class="label-note">(optional)</span></label>
           <input id="invite-message" placeholder="e.g. The shared Wi-Fi password" maxlength="${UI.maxMessageLength}">
@@ -736,10 +847,16 @@ async function loadSharing(id) {
       setError("main-error", "");
       setBusy($("btn-invite"), true);
       try {
-        const info = await invoke("lookup_invitee", { email });
+        // Blank means "use the key I pinned for them"; the command says so if
+        // there is no pin to fall back on.
+        const fingerprint = $("invite-fingerprint").value.trim() || null;
+        const info = await invoke("lookup_invitee", { email, fingerprint });
         renderInviteConfirm(id, info);
       } catch (error) {
         setError("main-error", error);
+        // Both of these are answered by typing the fingerprint in, so send the
+        // user straight there instead of leaving them on the email field.
+        if (error?.code === "fingerprint_required" || error?.code === "lookup_failed") $("invite-fingerprint").focus();
       } finally {
         setBusy($("btn-invite"), false);
       }
@@ -751,8 +868,50 @@ async function loadSharing(id) {
       if (await act("cancel_invite", { id, inviteId: Number(el.dataset.cancel) }, "Invite cancelled", el)) loadSharing(id);
     };
   } catch (error) {
-    if (box.isConnected) box.innerHTML = `<h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3><div class="error">${esc(error)}</div>`;
+    if (box.isConnected) box.innerHTML = `<h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3><div class="error">${esc(error?.message ?? error)}</div>`;
   }
+}
+
+/// Fingerprints are compared by eye, so accept any spacing or case: only the
+/// hex digits carry meaning.
+function normalizeFingerprint(text) {
+  return String(text ?? "").toLowerCase().replace(/[^0-9a-f]/g, "");
+}
+
+/// A key that differs from one already confirmed is the one case where the
+/// server is provably not telling the truth, so clicking through is not
+/// enough: the new fingerprint has to be typed in from the other person's
+/// window. A key never seen before carries no such evidence and only needs the
+/// usual out-of-band check.
+function changedKeyChallenge(members) {
+  return members
+    .filter((m) => m.status === "changed")
+    .map((m) => `
+      <div class="field">
+        <label for="fp-${m.user_id}">Type ${esc(m.email)}'s new fingerprint to continue</label>
+        <input id="fp-${m.user_id}" class="mono" data-expect="${esc(m.fingerprint)}" autocomplete="off"
+          spellcheck="false" placeholder="0000-0000-0000-0000-0000-0000">
+      </div>`)
+    .join("");
+}
+
+/// Wire the typed-fingerprint inputs to the confirm button: it stays disabled
+/// until every challenge matches the key the server is serving now.
+function armChangedKeyChallenge(container, confirmButton) {
+  const inputs = [...container.querySelectorAll("input[data-expect]")];
+  if (!inputs.length) return;
+  const check = () => {
+    const allMatch = inputs.every((i) => normalizeFingerprint(i.value) === normalizeFingerprint(i.dataset.expect));
+    confirmButton.disabled = !allMatch;
+    for (const input of inputs) {
+      const typed = normalizeFingerprint(input.value);
+      const expected = normalizeFingerprint(input.dataset.expect);
+      input.classList.toggle("mismatch", typed.length > 0 && !expected.startsWith(typed));
+    }
+  };
+  for (const input of inputs) input.oninput = check;
+  check();
+  inputs[0].focus();
 }
 
 /// Revoking rotates the key, so every remaining member's key must be one this
@@ -787,8 +946,9 @@ function renderRevokeConfirm(id, userId, members) {
     <div class="card" style="margin-top:14px" role="region" aria-label="Confirm who keeps access">
       <h3 class="card-title">${icon("key")} Confirm who keeps access</h3>
       <p class="card-lead">Revoking re-encrypts this secret for everyone who keeps access, and this device has not confirmed these keys yet. Ask each person to read the <strong>Your key</strong> fingerprint from their credvault window and continue only if every one matches.</p>
-      ${changed ? `<div class="notice danger">${icon("alert")}<div>A key marked <strong>Changed</strong> differs from one you confirmed before. Either they re-created their account, or the server is lying.</div></div>` : ""}
+      ${changed ? `<div class="notice danger">${icon("alert")}<div>A key marked <strong>Changed</strong> differs from one you confirmed before. Either they re-created their account, or the server is lying. Do not continue unless they read the new fingerprint to you directly.</div></div>` : ""}
       <ul class="people">${rows}</ul>
+      ${changedKeyChallenge(members)}
       <div class="actions" style="margin-top:12px">
         <button type="button" class="btn ${changed ? "danger solid" : "primary"}" id="btn-revoke-confirm">${icon("check")} Fingerprints match, revoke</button>
         <button type="button" class="btn" id="btn-revoke-cancel">Cancel</button>
@@ -799,7 +959,8 @@ function renderRevokeConfirm(id, userId, members) {
     const confirmed = members.map((m) => ({ user_id: m.user_id, public_key: m.public_key }));
     revokeMember(id, userId, $("btn-revoke-confirm"), confirmed);
   };
-  (changed ? $("btn-revoke-cancel") : $("btn-revoke-confirm")).focus();
+  armChangedKeyChallenge(box, $("btn-revoke-confirm"));
+  if (!changed) $("btn-revoke-confirm").focus();
 }
 
 /// The server told us this person's key; the user must confirm its fingerprint
@@ -816,10 +977,10 @@ function renderInviteConfirm(id, info) {
       <div class="fp-box${known ? " good" : ""}"><div class="k">${esc(info.email)}</div><code class="fp">${esc(info.fingerprint)}</code></div>
     </div>`;
   const guidance = changed
-    ? `<div class="notice danger">${icon("alert")}<div>This key differs from the one you confirmed before. Either they re-created their account, or the server is lying. Do not continue unless they confirm the new fingerprint to you directly.</div></div>`
+    ? `<div class="notice danger">${icon("alert")}<div>This key differs from the one you confirmed before. Either they re-created their account, or the server is lying. Continue only if they read you this new fingerprint themselves.</div></div>`
     : known
       ? `<div class="notice">${icon("check")}<div>Matches the key you confirmed before.</div></div>`
-      : `<div class="notice">${icon("info")}<div>Ask them to read the <strong>Your key</strong> fingerprint from the top of their credvault window. Only invite if it matches exactly.</div></div>`;
+      : `<div class="notice">${icon("info")}<div>This key's fingerprint is the one you entered, checked on this device. Continue only if that fingerprint came from them directly rather than from anything the server told you.</div></div>`;
   $("invite-confirm").innerHTML = `
     <div class="card" style="margin-top:14px" role="region" aria-label="Confirm fingerprint">
       <h3 class="card-title">${icon("key")} Confirm ${esc(info.email)}'s key</h3>
@@ -838,14 +999,74 @@ function renderInviteConfirm(id, info) {
     const args = { id, email: info.email, message: $("invite-message").value.trim(), confirmedPublicKey: info.public_key };
     if (await act("invite", args, `Invited ${info.email}`, $("btn-invite-confirm"))) loadSharing(id);
   };
+  // The lookup already required this fingerprint, so there is nothing left to
+  // retype here; a changed key still defaults to Cancel.
   (changed ? $("btn-invite-cancel") : $("btn-invite-confirm")).focus();
 }
 
 // ----- create / edit form ----------------------------------------------------
 
+/// The form's extra fields live in `state.formFields` rather than in the DOM,
+/// so adding or removing a row never depends on reading half-filled inputs
+/// back out. `kept` marks a hidden value the list did not send us: it stays
+/// as it is unless the user types a new one.
+function renderFormFields() {
+  const box = $("custom-fields");
+  if (!box) return;
+  box.innerHTML = state.formFields.map((field, index) => `
+    <div class="custom-field" data-index="${index}">
+      <input class="cf-label" value="${esc(field.label)}" placeholder="Label" autocomplete="off"
+        maxlength="${UI.maxLabelLength}" aria-label="Label for extra field ${index + 1}">
+      <input class="cf-value" type="${field.secret ? "password" : "text"}" value="${esc(field.value)}"
+        placeholder="${field.kept ? "Unchanged" : "Value"}" autocomplete="off"
+        maxlength="${UI.maxFieldLength}" aria-label="Value for extra field ${index + 1}">
+      <label class="cf-hide"><input type="checkbox" ${field.secret ? "checked" : ""}
+        aria-label="Hide the value of extra field ${index + 1}"> Hide</label>
+      <button type="button" class="icon-btn danger" data-remove="${index}"
+        aria-label="Remove extra field ${index + 1}" title="Remove">${icon("trash")}</button>
+    </div>`).join("");
+
+  for (const row of box.querySelectorAll(".custom-field")) {
+    const index = Number(row.dataset.index);
+    const label = row.querySelector(".cf-label");
+    const value = row.querySelector(".cf-value");
+    const hide = row.querySelector(".cf-hide input");
+    label.oninput = () => { state.formFields[index].label = label.value; };
+    value.oninput = () => {
+      // Clearing the box again returns a hidden row to "unchanged", so a
+      // keystroke typed and deleted does not destroy a value nobody can see.
+      const field = (state.formFields[index] = Fields.valueEdited(state.formFields[index], value.value));
+      value.placeholder = field.kept ? "Unchanged" : "Value";
+    };
+    hide.onchange = () => {
+      state.formFields[index] = Fields.secretToggled(state.formFields[index], hide.checked);
+      renderFormFields(); // the value input swaps between text and password
+      // The re-render replaced the checkbox that was just clicked.
+      box.querySelectorAll(".custom-field")[index]?.querySelector(".cf-hide input")?.focus();
+    };
+    row.querySelector("[data-remove]").onclick = () => {
+      state.formFields.splice(index, 1);
+      renderFormFields();
+    };
+  }
+}
+
+function addFormField() {
+  if (state.formFields.length >= UI.maxCustomFields) {
+    setError("form-error", `A secret can have at most ${UI.maxCustomFields} extra fields.`);
+    return;
+  }
+  setError("form-error", "");
+  state.formFields.push(Fields.newFormField());
+  renderFormFields();
+  const rows = $("custom-fields").querySelectorAll(".custom-field");
+  rows[rows.length - 1]?.querySelector(".cf-label").focus();
+}
+
 function renderForm(existing) {
   state.editing = true;
-  clearReveal();
+  clearReveals();
+  state.formFields = Fields.formFieldsFrom(existing);
   updateMobileTitle();
   $("main").classList.add("has-selection");
   const s = existing || { name: "", username: "", url: "", notes: "" };
@@ -878,6 +1099,12 @@ function renderForm(existing) {
         <label for="f-notes">Notes <span class="label-note">(optional)</span></label>
         <textarea id="f-notes">${esc(s.notes)}</textarea>
       </div>
+      <div class="field">
+        <span class="field-label">Extra details <span class="label-note">(optional)</span></span>
+        <p class="hint">Anything else worth keeping here: a PIN, a recovery code, an account number. Tick <strong>Hide</strong> to mask a value and have it cleared from the clipboard, the same as the password.</p>
+        <div id="custom-fields"></div>
+        <button type="button" class="btn" id="btn-add-field">${icon("plus")} Add field</button>
+      </div>
       <div class="error" id="form-error" role="alert"></div>
       <div class="actions form-actions">
         <button type="submit" class="btn primary" id="btn-save">${existing ? "Save changes" : "Create secret"}</button>
@@ -897,28 +1124,56 @@ function renderForm(existing) {
     } catch (error) { setError("form-error", error); }
   };
   $("btn-cancel").onclick = cancel;
+  $("btn-add-field").onclick = addFormField;
+  renderFormFields();
   form.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); cancel(); } });
   form.onsubmit = async (event) => {
     event.preventDefault();
     setError("form-error", "");
-    const fields = {
+    const entry = {
       name: $("f-name").value.trim(),
       username: $("f-username").value,
       password: $("f-password").value,
       url: $("f-url").value.trim(),
       notes: $("f-notes").value,
+      fields: Fields.submittedFields(state.formFields),
     };
-    if (!fields.name) { setError("form-error", "Give the secret a name."); $("f-name").focus(); return; }
-    if (!existing && !fields.password) { setError("form-error", "Enter a password or generate one."); $("f-password").focus(); return; }
+    if (!entry.name) { setError("form-error", "Give the secret a name."); $("f-name").focus(); return; }
+    // A row that gave up its claim on an unseen value and has nothing typed
+    // in its place would be saved as empty, destroying it with no warning.
+    const needValues = Fields.rowsNeedingAValue(state.formFields);
+    if (needValues.length) {
+      const names = needValues.map((row) => row.label).join(", ");
+      setError(
+        "form-error",
+        `Enter a value for ${names}. Its stored value was never shown here, so saving now would erase it. ` +
+          "To leave it exactly as it was, press Esc to discard this edit. " +
+          "To get rid of the field instead, use its Remove button.",
+      );
+      const rows = $("custom-fields").querySelectorAll(".custom-field");
+      rows[needValues[0].index]?.querySelector(".cf-value")?.focus();
+      return;
+    }
+
+    // Catch a missing label here too, so the row is named and focused rather
+    // than coming back as a generic error after a round trip through
+    // encryption. A new row has no stored name to fall back on.
+    const unlabelled = state.formFields.findIndex((field) => field.label.trim() === "" && (field.kept || field.value));
+    if (unlabelled !== -1) {
+      setError("form-error", "Give every extra field a label, or remove it.");
+      $("custom-fields").querySelectorAll(".custom-field")[unlabelled]?.querySelector(".cf-label")?.focus();
+      return;
+    }
+    if (!existing && !entry.password) { setError("form-error", "Enter a password or generate one."); $("f-password").focus(); return; }
     setBusy($("btn-save"), true, "Saving…");
     try {
       if (existing) {
         // A blank password means "keep it"; the current one never passes through here.
-        if (!fields.password) fields.password = null;
-        await invoke("update_secret", { id: existing.id, ...fields });
+        if (!entry.password) entry.password = null;
+        await invoke("update_secret", { id: existing.id, form: entry });
         toast("Changes saved");
       } else {
-        state.selected = await invoke("create_secret", fields);
+        state.selected = await invoke("create_secret", { form: entry });
         toast("Secret created");
       }
       state.editing = false;
@@ -973,11 +1228,24 @@ invoke("ui_constants")
     minPasswordLength: c.min_password_length,
     maxMessageLength: c.max_message_length,
     generatedPasswordLength: c.generated_password_length,
+    maxCustomFields: c.max_custom_fields,
+    maxLabelLength: c.max_label_length,
+    maxFieldLength: c.max_field_length,
   }))
+  // Served rather than written into the markup, so the floor is stated in
+  // one place: the crate that enforces it.
+  .then(() => {
+    const hint = $("password-hint");
+    if (hint) hint.textContent = `At least ${UI.minPasswordLength} characters. There is no password reset.`;
+  })
   .catch(() => { /* the defaults above match the crates today */ });
 invoke("startup_warnings")
-  .then((warnings) => { if (warnings.length) setError("auth-error", warnings.join("\n")); })
-  .catch(() => { /* nothing to show */ });
+  // This is the only notice that the pinned-key file was corrupt and moved
+  // aside, i.e. that every key confirmed so far must be confirmed again
+  // before the next invite. It goes in its own banner rather than the error
+  // slot, which both setAuthMode and submitting the form blank.
+  .then((warnings) => { if (warnings.length) showStartupWarning(warnings.join("\n")); })
+  .catch((error) => showStartupWarning(`Could not read startup warnings: ${error?.message ?? error}`));
 invoke("session_info")
   .then((user) => { if (user) showApp(user); })
   .catch((error) => setError("auth-error", error));

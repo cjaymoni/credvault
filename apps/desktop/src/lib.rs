@@ -867,12 +867,20 @@ async fn change_password(
 /// have not been deleted yet, and "still signed in" then means *not yet*
 /// rather than *will not be*. Only watching for the answer to change tells
 /// those apart, so this keeps asking rather than sampling twice and guessing.
+///
+/// A ceiling on the sleeping, not on the whole loop: each probe carries the
+/// client's own timeout, so a server that hangs rather than refuses can push
+/// the total past this. That direction is safe — a hung probe reads as
+/// `Unreachable`, breaks the run, and ends in `Unknown` rather than in a
+/// confident wrong answer.
 const PROBE_BUDGET: Duration = Duration::from_secs(30);
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// What a probe could establish about a change whose answer never arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChangeOutcome {
-    /// The session kept working across every probe: the change did not commit.
+    /// The session was still alive on the last two probes in a row: the change
+    /// did not commit.
     NotApplied,
     /// The session is gone, which only the committing transaction does.
     Applied,
@@ -925,24 +933,69 @@ async fn resolve_lost_answer(state: &AppState, api: &ApiClient, reason: String) 
 /// A session that disappears is conclusive the moment it happens, because only
 /// the committing transaction deletes it. A session that is still there is
 /// never conclusive on its own — it only becomes an answer by staying there.
+/// What one reading of the session told us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// The session answered: nothing has committed, at least not yet.
+    Alive,
+    /// The session is gone, which only the committing transaction does.
+    Gone,
+    /// The question could not be put. Says nothing either way.
+    Unreachable,
+}
+
+/// How many consecutive `Alive` readings it takes to call a change *not*
+/// applied. One is never enough: the server can still be inside the
+/// transaction, where the session has not been deleted yet.
+const STABLE_READINGS: u32 = 2;
+
+/// Fold one reading into the verdict so far, returning the new run length and
+/// the outcome if it is already settled.
+///
+/// Kept separate from the I/O so it can be tested without a server. This rule
+/// decides which of three things a person is told about whether their vault
+/// passphrase changed, and the wrong answer is the one that loses a vault.
+fn fold_reading(alive_in_a_row: u32, reading: Reading) -> (u32, Option<ChangeOutcome>) {
+    match reading {
+        // Conclusive the moment it happens; nothing else deletes a session.
+        Reading::Gone => (0, Some(ChangeOutcome::Applied)),
+        Reading::Alive => (alive_in_a_row + 1, None),
+        Reading::Unreachable => (0, None),
+    }
+}
+
+/// The verdict when the budget runs out with no conclusive reading.
+fn settle(alive_in_a_row: u32) -> ChangeOutcome {
+    if alive_in_a_row >= STABLE_READINGS {
+        ChangeOutcome::NotApplied
+    } else {
+        ChangeOutcome::Unknown
+    }
+}
+
 async fn probe_change(api: &ApiClient) -> ChangeOutcome {
-    let deadline = std::time::Instant::now() + PROBE_BUDGET;
-    // "Still signed in" only becomes an answer by holding, so it takes two in
-    // a row. One reading after a run of failures says nothing: the session may
-    // simply not have been deleted yet.
+    // `tokio::time`, not `std::time`, so a test can drive this with a paused
+    // clock instead of waiting out the real budget.
+    let deadline = tokio::time::Instant::now() + PROBE_BUDGET;
     let mut alive_in_a_row = 0;
     loop {
-        match api.me().await {
-            // Nothing but the commit takes a session away.
-            Err(ClientError::Unauthorized) => return ChangeOutcome::Applied,
-            Ok(_) => alive_in_a_row += 1,
-            Err(_) => alive_in_a_row = 0,
+        let reading = match api.me().await {
+            Err(ClientError::Unauthorized) => Reading::Gone,
+            Ok(_) => Reading::Alive,
+            Err(_) => Reading::Unreachable,
+        };
+        let (run, settled) = fold_reading(alive_in_a_row, reading);
+        if let Some(outcome) = settled {
+            return outcome;
         }
-        // Checked before the next probe, not after: `me` carries a timeout of
-        // its own, so testing it afterwards would let this run far past the
-        // budget the constant appears to promise.
-        if std::time::Instant::now() + PROBE_INTERVAL >= deadline {
-            return if alive_in_a_row >= 2 { ChangeOutcome::NotApplied } else { ChangeOutcome::Unknown };
+        alive_in_a_row = run;
+        // Checked before sleeping rather than after `me`, which carries a
+        // timeout of its own. This bounds the sleeps, not the probes: a run of
+        // calls that each sit on that timeout can still overrun the budget,
+        // and the only thing that would bound *that* is a shorter deadline on
+        // the probe itself.
+        if tokio::time::Instant::now() + PROBE_INTERVAL >= deadline {
+            return settle(alive_in_a_row);
         }
         tokio::time::sleep(PROBE_INTERVAL).await;
     }
@@ -1631,6 +1684,43 @@ mod tests {
 
         let elsewhere = normalize_server_url("https://vault.example.org").unwrap();
         assert_ne!(master.auth_hash(&typed), master.auth_hash(&elsewhere));
+    }
+
+    /// The rule that decides which of three things a person is told about a
+    /// passphrase change whose answer was lost. Driven directly, because the
+    /// wrong verdict here is the one that loses a vault.
+    #[test]
+    fn a_lost_answer_is_only_called_settled_when_the_readings_agree() {
+        // A session that disappears is conclusive immediately: nothing but the
+        // committing transaction deletes one.
+        assert_eq!(fold_reading(0, Reading::Gone).1, Some(ChangeOutcome::Applied));
+        assert_eq!(fold_reading(5, Reading::Gone).1, Some(ChangeOutcome::Applied));
+
+        // A session that is still there is never conclusive on its own; it
+        // only becomes an answer by holding.
+        let run = |readings: &[Reading]| {
+            let mut alive = 0;
+            for reading in readings {
+                let (next, settled) = fold_reading(alive, *reading);
+                assert!(settled.is_none(), "{readings:?} should not settle early");
+                alive = next;
+            }
+            settle(alive)
+        };
+        assert_eq!(run(&[Reading::Alive]), ChangeOutcome::Unknown, "one reading is not a verdict");
+        assert_eq!(run(&[Reading::Alive, Reading::Alive]), ChangeOutcome::NotApplied);
+
+        // A failure breaks the run, so a single success after a bad patch
+        // cannot decide it. This is the case that used to return NotApplied
+        // off one observation.
+        assert_eq!(
+            run(&[Reading::Alive, Reading::Alive, Reading::Unreachable, Reading::Alive]),
+            ChangeOutcome::Unknown,
+            "one answer after a run of failures says nothing"
+        );
+        assert_eq!(run(&[Reading::Unreachable, Reading::Unreachable]), ChangeOutcome::Unknown);
+        // And recovering for long enough does settle it.
+        assert_eq!(run(&[Reading::Unreachable, Reading::Alive, Reading::Alive]), ChangeOutcome::NotApplied);
     }
 
     /// The whole point of tagging stored blobs: someone whose passphrase is

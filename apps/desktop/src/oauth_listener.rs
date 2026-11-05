@@ -23,13 +23,14 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Nothing legitimate sends a request line longer than this; a client that
 /// does is dropped rather than read indefinitely.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
-/// How long one connection may take to send its request line.
+/// How long one connection may take to send its request line, and so how long
+/// any connection can occupy one of the slots below.
 ///
-/// A browser on loopback writes before the accept has even returned, so this
-/// is enormously generous. It is kept short on purpose: it is how long a
-/// silent connection can occupy one of the slots below, and so how long a real
-/// redirect can be made to wait behind a flood of them.
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// A browser on loopback writes before the accept has even returned, so a
+/// second is enormously generous for the real thing. It is kept short because
+/// it is also what a hostile connection costs, and so how fast slots come back
+/// while one is being held open.
+const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// How many connections may be in flight at once.
 ///
 /// This bounds file descriptors. Answering connections concurrently means each
@@ -41,8 +42,15 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// earlier versions of this comment claimed more than the code delivered:
 ///
 /// * A handful of silent or malformed connections cost the sign-in nothing.
-///   Slots are given back on `FIRST_BYTE_TIMEOUT`, so they recycle in
-///   milliseconds rather than being held for a full read deadline.
+///   Every connection, hostile or not, gives its slot back within
+///   `READ_TIMEOUT`, so a few of them delay a redirect by at most that.
+///
+/// A first-byte deadline shorter than `READ_TIMEOUT` was tried here and
+/// removed. It released wholly silent sockets sooner, but a connection that
+/// sent a single byte still held its slot for the full read deadline, so it
+/// raised the cost of the laziest flood and nothing else — while adding a path
+/// that could drop a real redirect whose first byte was late, silently, and
+/// leave the user waiting out `WAIT_TIMEOUT` for a code that had arrived.
 /// * A flood ends when it ends. Nothing is left wedged, no slot leaks, and the
 ///   next redirect is served.
 /// * The rest of the app is never taken down with it: descriptors are capped
@@ -55,13 +63,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// deadline buys is that the sockets must be *held*, continuously, and that
 /// the denial stops when they are released.
 const MAX_IN_FLIGHT: usize = 128;
-/// How long a connection may stay silent before its slot is reclaimed.
-///
-/// A browser writes the request line before the accept has returned, so a
-/// connection that has said nothing after this is not a redirect. This is the
-/// cost of one hostile socket, and so what sets how hard the listener is to
-/// flood.
-const FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long writing the response page may take before the slot is reclaimed.
 /// The code has already been handed over by then; this only stops a peer that
 /// stalls its read from holding a slot.
@@ -170,21 +171,6 @@ async fn answer_one(
     sender: mpsc::Sender<Result<Zeroizing<String>, RedirectError>>,
     _permit: OwnedSemaphorePermit,
 ) {
-    // A redirect has already written by the time it is accepted; a socket that
-    // is merely open has not. Giving the slot back on that distinction is what
-    // makes a flood of silent connections expensive to sustain rather than
-    // free.
-    //
-    // Peeked rather than waited on. `readable()` reports tokio's *cached*
-    // readiness, which is set optimistically on a fresh stream and cleared
-    // only by an I/O call that returns `WouldBlock` — so it returns ready in
-    // microseconds for a socket that has sent nothing, and the gate does
-    // nothing at all. `peek` is an actual read, and it does not consume, so
-    // `read_request_target` still sees the whole request.
-    let mut first = [0u8; 1];
-    if !matches!(tokio::time::timeout(FIRST_BYTE_TIMEOUT, stream.peek(&mut first)).await, Ok(Ok(1..))) {
-        return;
-    }
     let Ok(Ok(Some(target))) = tokio::time::timeout(READ_TIMEOUT, read_request_target(&mut stream)).await else {
         return;
     };
@@ -399,15 +385,18 @@ mod tests {
         {
             let mut silent = Vec::new();
             for _ in 0..MAX_IN_FLIGHT * 2 {
-                // Some of these are refused by the kernel, which is the point
-                // being made: the queue is finite.
+                // A refusal here is the kernel's queue filling, which is
+                // allowed; what is not allowed is the listener failing to
+                // recover afterwards. Counted so this cannot quietly become a
+                // test of a flood of one.
                 if let Ok(socket) = TcpStream::connect(&address).await {
                     silent.push(socket);
                 }
             }
+            assert!(silent.len() > MAX_IN_FLIGHT, "only {} sockets were opened; this is not a flood", silent.len());
         }
         // Everything dropped. Give the slots one deadline to come back.
-        tokio::time::sleep(FIRST_BYTE_TIMEOUT * 2).await;
+        tokio::time::sleep(READ_TIMEOUT).await;
 
         let started = std::time::Instant::now();
         let done = reqwest::Client::new()
@@ -419,6 +408,47 @@ mod tests {
         assert!(done.status().is_success());
         assert_eq!(*waiting.await.unwrap().unwrap(), "recovered");
         assert!(started.elapsed() < READ_TIMEOUT, "the listener was still wedged after the flood stopped");
+    }
+
+    /// Occupancy is bounded: a connection that never finishes its request must
+    /// give its slot back on `READ_TIMEOUT`, so a full set of them delays a
+    /// redirect by about that and no longer.
+    ///
+    /// Every slot is filled, then the redirect is made *once* — a browser does
+    /// not retry. Without a deadline on the read this hangs until the sign-in
+    /// times out, so deleting that deadline must fail this test.
+    #[tokio::test]
+    async fn a_connection_that_never_finishes_gives_its_slot_back() {
+        use tokio::net::TcpStream;
+
+        let listener = RedirectListener::bind().await.unwrap();
+        let redirect = listener.redirect_uri().to_string();
+        let address = redirect.trim_start_matches("http://").trim_end_matches("/callback").to_string();
+        let waiting = tokio::spawn(async move { listener.wait_for_code("st").await });
+
+        // Exactly the slots, so the redirect queues in a backlog with room in
+        // it and the only thing it waits on is a slot coming free. Each sends
+        // a partial request line and then holds, which is the shape that costs
+        // the most: a silent socket and a one-byte socket cost the same here.
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT {
+            let mut socket = TcpStream::connect(&address).await.unwrap();
+            socket.write_all(b"GET /callb").await.unwrap();
+            held.push(socket);
+        }
+
+        let started = std::time::Instant::now();
+        let done = reqwest::Client::new()
+            .get(format!("{redirect}?code=let-through&state=st"))
+            .timeout(READ_TIMEOUT * 6)
+            .send()
+            .await
+            .expect("the redirect must be served on its first attempt");
+        let waited = started.elapsed();
+        assert!(done.status().is_success());
+        assert_eq!(*waiting.await.unwrap().unwrap(), "let-through");
+        assert!(waited < READ_TIMEOUT * 3, "waited {waited:?}; slots are not being released on the read deadline");
+        drop(held);
     }
 
     /// A few silent connections, which is what actually happens in practice,

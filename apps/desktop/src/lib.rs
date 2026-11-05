@@ -872,7 +872,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// What a probe could establish about a change whose answer never arrived.
 enum ChangeOutcome {
-    /// The session still works, twice over: the change did not commit.
+    /// The session kept working across every probe: the change did not commit.
     NotApplied,
     /// The session is gone, which only the committing transaction does.
     Applied,
@@ -884,8 +884,8 @@ enum ChangeOutcome {
 ///
 /// The server deletes every session inside the transaction that commits the
 /// change, so a token that still works means nothing has committed *yet* —
-/// which is not the same as "will not". Probing twice, with a gap, is what
-/// turns the first reading into an answer. Even then the honest outcome is
+/// which is not the same as "will not". Watching until the answer settles is
+/// what turns that reading into an answer. Even then the honest outcome is
 /// sometimes "unknown", and saying so is better than guessing: the guess that
 /// loses a vault is telling someone nothing happened when it did.
 async fn resolve_lost_answer(state: &AppState, api: &ApiClient, reason: String) -> CommandError {
@@ -927,15 +927,22 @@ async fn resolve_lost_answer(state: &AppState, api: &ApiClient, reason: String) 
 /// never conclusive on its own — it only becomes an answer by staying there.
 async fn probe_change(api: &ApiClient) -> ChangeOutcome {
     let deadline = std::time::Instant::now() + PROBE_BUDGET;
+    // "Still signed in" only becomes an answer by holding, so it takes two in
+    // a row. One reading after a run of failures says nothing: the session may
+    // simply not have been deleted yet.
+    let mut alive_in_a_row = 0;
     loop {
-        let seen = match api.me().await {
+        match api.me().await {
             // Nothing but the commit takes a session away.
             Err(ClientError::Unauthorized) => return ChangeOutcome::Applied,
-            Ok(_) => ChangeOutcome::NotApplied,
-            Err(_) => ChangeOutcome::Unknown,
-        };
-        if std::time::Instant::now() >= deadline {
-            return seen;
+            Ok(_) => alive_in_a_row += 1,
+            Err(_) => alive_in_a_row = 0,
+        }
+        // Checked before the next probe, not after: `me` carries a timeout of
+        // its own, so testing it afterwards would let this run far past the
+        // budget the constant appears to promise.
+        if std::time::Instant::now() + PROBE_INTERVAL >= deadline {
+            return if alive_in_a_row >= 2 { ChangeOutcome::NotApplied } else { ChangeOutcome::Unknown };
         }
         tokio::time::sleep(PROBE_INTERVAL).await;
     }

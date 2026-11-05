@@ -37,19 +37,23 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// process looping on connect takes the whole app past its descriptor limit --
 /// breaking the webview and the HTTP client, not just this listener.
 ///
-/// The slot is taken before accepting, so surplus connections wait in the
-/// kernel's backlog rather than being accepted and dropped, which would refuse
-/// real redirects whenever a flood held the slots. The backlog is not free,
-/// though: it is finite and clamped well below what is asked for, and once it
-/// fills the kernel refuses connections before this process sees them. What
-/// keeps it from filling is not its size but `FIRST_BYTE_TIMEOUT` -- a silent
-/// socket gives its slot back in a fraction of a second, so holding them all
-/// takes a sustained flood rather than a few hundred idle connections.
+/// What this listener does and does not promise, stated plainly, because two
+/// earlier versions of this comment claimed more than the code delivered:
 ///
-/// A local process determined to spend CPU on this can still delay a sign-in.
-/// It can also delay one by starving the machine, and neither is something a
-/// loopback listener can prevent. What this does prevent is doing it cheaply,
-/// and doing it by taking down the rest of the app.
+/// * A handful of silent or malformed connections cost the sign-in nothing.
+///   Slots are given back on `FIRST_BYTE_TIMEOUT`, so they recycle in
+///   milliseconds rather than being held for a full read deadline.
+/// * A flood ends when it ends. Nothing is left wedged, no slot leaks, and the
+///   next redirect is served.
+/// * The rest of the app is never taken down with it: descriptors are capped
+///   here, and a failed accept is not fatal.
+///
+/// It does *not* promise immunity. A local process holding more sockets than
+/// there are slots plus kernel backlog will have the browser's redirect
+/// refused for as long as it holds them, and no arrangement of this loop
+/// changes that -- the queue is finite and the browser tries once. What the
+/// deadline buys is that the sockets must be *held*, continuously, and that
+/// the denial stops when they are released.
 const MAX_IN_FLIGHT: usize = 128;
 /// How long a connection may stay silent before its slot is reclaimed.
 ///
@@ -170,7 +174,15 @@ async fn answer_one(
     // is merely open has not. Giving the slot back on that distinction is what
     // makes a flood of silent connections expensive to sustain rather than
     // free.
-    if !matches!(tokio::time::timeout(FIRST_BYTE_TIMEOUT, stream.readable()).await, Ok(Ok(()))) {
+    //
+    // Peeked rather than waited on. `readable()` reports tokio's *cached*
+    // readiness, which is set optimistically on a fresh stream and cleared
+    // only by an I/O call that returns `WouldBlock` — so it returns ready in
+    // microseconds for a socket that has sent nothing, and the gate does
+    // nothing at all. `peek` is an actual read, and it does not consume, so
+    // `read_request_target` still sees the whole request.
+    let mut first = [0u8; 1];
+    if !matches!(tokio::time::timeout(FIRST_BYTE_TIMEOUT, stream.peek(&mut first)).await, Ok(Ok(1..))) {
         return;
     }
     let Ok(Ok(Some(target))) = tokio::time::timeout(READ_TIMEOUT, read_request_target(&mut stream)).await else {
@@ -368,12 +380,15 @@ mod tests {
         assert_eq!(*waiting.await.unwrap().unwrap(), "survived");
     }
 
-    /// Sockets opened and held without sending are what used to queue behind
-    /// each other: answering them in turn made sixty of them cost five minutes,
-    /// which is the whole wait. Held open together, they must cost one read
-    /// deadline between them.
+    /// A flood that is over is over: nothing stays wedged, no slot leaks, and
+    /// the next redirect is served normally.
+    ///
+    /// This does not assert that the redirect gets through *during* a flood
+    /// larger than the slots plus the kernel backlog. It does not, the queue
+    /// is finite, and a test claiming otherwise would be the third one here to
+    /// assert something the code cannot do.
     #[tokio::test]
-    async fn many_stalled_connections_do_not_block_the_redirect() {
+    async fn the_listener_recovers_once_a_flood_stops() {
         use tokio::net::TcpStream;
 
         let listener = RedirectListener::bind().await.unwrap();
@@ -381,55 +396,29 @@ mod tests {
         let address = redirect.trim_start_matches("http://").trim_end_matches("/callback").to_string();
         let waiting = tokio::spawn(async move { listener.wait_for_code("st").await });
 
-        // Enough that, answered one at a time, they would exhaust WAIT_TIMEOUT.
-        // Far more than the slots, and more than the kernel's backlog, which
-        // is the case that used to refuse the redirect outright: silent
-        // sockets release their slot on FIRST_BYTE_TIMEOUT, so the queue keeps
-        // draining instead of filling.
-        let stalled: Vec<TcpStream> = {
-            let mut held = Vec::new();
-            for _ in 0..MAX_IN_FLIGHT * 3 {
-                match TcpStream::connect(&address).await {
-                    Ok(socket) => held.push(socket),
-                    // A refusal here is the kernel's backlog, not the app's
-                    // doing; the point of the test is what happens next.
-                    Err(_) => break,
+        {
+            let mut silent = Vec::new();
+            for _ in 0..MAX_IN_FLIGHT * 2 {
+                // Some of these are refused by the kernel, which is the point
+                // being made: the queue is finite.
+                if let Ok(socket) = TcpStream::connect(&address).await {
+                    silent.push(socket);
                 }
-            }
-            held
-        };
-
-        // More sockets than there are slots, so the redirect has to come out
-        // of the backlog behind them. It must still be served, and within one
-        // recycle of the slots rather than the whole wait.
-        let started = std::time::Instant::now();
-        // Retried briefly, because a connection can still be refused while the
-        // backlog drains. A browser does not retry, so what matters is that
-        // the window is short rather than permanent.
-        let mut attempt = Err(());
-        for _ in 0..20 {
-            match reqwest::Client::new()
-                .get(format!("{redirect}?code=not-blocked&state=st"))
-                .timeout(READ_TIMEOUT * 2)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    attempt = Ok(response);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(FIRST_BYTE_TIMEOUT).await,
             }
         }
-        let done = attempt.expect("the redirect must get through while silent sockets are held");
+        // Everything dropped. Give the slots one deadline to come back.
+        tokio::time::sleep(FIRST_BYTE_TIMEOUT * 2).await;
+
+        let started = std::time::Instant::now();
+        let done = reqwest::Client::new()
+            .get(format!("{redirect}?code=recovered&state=st"))
+            .timeout(READ_TIMEOUT * 4)
+            .send()
+            .await
+            .expect("the listener must still work after a flood");
         assert!(done.status().is_success());
-        assert_eq!(*waiting.await.unwrap().unwrap(), "not-blocked");
-        assert!(
-            started.elapsed() < READ_TIMEOUT * 4,
-            "the redirect waited {:?} behind sockets that never sent anything",
-            started.elapsed()
-        );
-        drop(stalled);
+        assert_eq!(*waiting.await.unwrap().unwrap(), "recovered");
+        assert!(started.elapsed() < READ_TIMEOUT, "the listener was still wedged after the flood stopped");
     }
 
     /// A few silent connections, which is what actually happens in practice,

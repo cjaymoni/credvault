@@ -32,13 +32,22 @@ pub const MAX_SECRETS_PER_ACCOUNT: i64 = 1_000;
 /// [`MAX_PENDING_INVITES_RECEIVED`].
 pub const MAX_PENDING_INVITES_PER_ACCOUNT: i64 = 100;
 
-/// How many unanswered invites one account may be sent.
+/// How many unanswered invites one account may be sent in total.
 ///
 /// Higher than the per-inviter cap, because being invited by many people is
-/// legitimate in a way that inviting many people at once is not. What it stops
-/// is a crowd of accounts each spending their own budget on one victim, which
-/// the per-inviter cap alone allows.
+/// legitimate in a way that inviting many people at once is not.
 pub const MAX_PENDING_INVITES_RECEIVED: i64 = 500;
+
+/// How many unanswered invites one account may have waiting for one other
+/// account.
+///
+/// This is the cap that matters for abuse. Without it the ceiling above is
+/// reachable by a handful of accounts — five, at the per-inviter cap — each
+/// staying inside its own budget, and the victim's invite list is then closed
+/// to everyone until they work through hundreds of entries by hand. With it,
+/// closing someone's list takes fifty accounts rather than five, and no single
+/// account can take more than a fiftieth of it.
+pub const MAX_PENDING_INVITES_PER_PAIR: i64 = 10;
 
 const REDACTED: &str = "<redacted>";
 
@@ -514,6 +523,10 @@ impl fmt::Debug for ChangePasswordRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SecretKeyView {
     pub id: i64,
+    /// Carried so that a refusal can name the secret it is about. The name is
+    /// plaintext on the server already, so this reveals nothing `/secrets`
+    /// does not.
+    pub name: String,
     pub key_version: i64,
     pub is_owner: bool,
     pub wrapped_key: WrappedKey,

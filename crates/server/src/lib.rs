@@ -87,9 +87,13 @@ impl Default for RateLimits {
             register_refill: Duration::from_secs(60),
             lookup_burst: 30,
             lookup_refill: Duration::from_secs(3),
-            // Changing a passphrase is a thing a person does rarely and
-            // deliberately; five in a row is already generous.
-            password_burst: 5,
+            // This rations server CPU, not guessing: producing each attempt
+            // costs the client an Argon2 pass of its own, so the guess rate is
+            // already bounded off this machine. A conflict refunds its token,
+            // because the vault moving under a caller is not their doing and
+            // the retry is expected, so what remains to spend is deliberate
+            // attempts — ten of those in a minute is already unusual.
+            password_burst: 10,
             password_refill: Duration::from_secs(60),
             link_burst: 5,
             link_refill: Duration::from_secs(60),

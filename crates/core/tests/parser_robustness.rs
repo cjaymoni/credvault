@@ -80,6 +80,7 @@ fn feed_every_wire_type(text: &str) {
     try_parse::<OAuthRegisterRequest>(text);
     try_parse::<ChangePasswordRequest>(text);
     try_parse::<RewrappedKey>(text);
+    try_parse::<SecretKeyView>(text);
     try_parse::<Health>(text);
 }
 

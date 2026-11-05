@@ -1217,7 +1217,7 @@ async function submitPassphraseChange(event) {
     // and a user who believes that throws away the passphrase that now opens
     // their vault. They get the sign-in screen and a banner that stays put.
     if (error?.code === "changed_but_unconfirmed" || error?.code === "changed_but_unknown") {
-      await signOutAfterAmbiguousChange(error.message);
+      signOutAfterAmbiguousChange(error.message);
       return;
     }
     setError("pp-error", error);
@@ -1228,9 +1228,12 @@ async function submitPassphraseChange(event) {
 }
 
 /// Drop back to the sign-in screen carrying a warning that does not vanish.
-/// The local session is already gone on the Rust side in this case, so there
-/// is nothing to log out of; this only resets what is on screen.
-async function signOutAfterAmbiguousChange(message) {
+///
+/// Both codes that reach here have already had the session dropped on the Rust
+/// side, master key included, so there is nothing left to log out of and this
+/// only resets what is on screen. A reload will land on the sign-in screen too,
+/// because `session_info` now has nothing to report.
+function signOutAfterAmbiguousChange(message) {
   clearReveals();
   state.secrets = []; state.selected = null; state.editing = false; state.user = null;
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";

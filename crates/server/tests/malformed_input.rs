@@ -107,6 +107,7 @@ fn routes() -> Vec<(Method, &'static str)> {
         (Method::POST, "/api/oauth/link"),
         (Method::GET, "/api/users/lookup"),
         (Method::GET, "/api/secrets"),
+        (Method::GET, "/api/secrets/keys"),
         (Method::POST, "/api/secrets"),
         (Method::GET, "/api/secrets/1"),
         (Method::PUT, "/api/secrets/1"),

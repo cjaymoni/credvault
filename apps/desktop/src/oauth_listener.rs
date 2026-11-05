@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
 /// Path the redirect URI points at. Anything else that connects gets a 404.
@@ -23,10 +23,30 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Nothing legitimate sends a request line longer than this; a client that
 /// does is dropped rather than read indefinitely.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
-/// How long one connection may take to send its request line. A browser on
-/// loopback sends immediately; anything slower is dropped so it cannot hold
-/// the listener while the real redirect waits behind it.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one connection may take to send its request line.
+///
+/// A browser on loopback writes before the accept has even returned, so this
+/// is enormously generous. It is kept short on purpose: it is how long a
+/// silent connection can occupy one of the slots below, and so how long a real
+/// redirect can be made to wait behind a flood of them.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// How many connections may be in flight at once.
+///
+/// This bounds file descriptors. Answering connections concurrently means each
+/// one holds a socket for up to `READ_TIMEOUT`, and without a ceiling a local
+/// process looping on connect takes the whole app past its descriptor limit --
+/// breaking the webview and the HTTP client, not just this listener.
+///
+/// The slot is taken *before* accepting, so surplus connections wait in the
+/// kernel's backlog, which costs this process nothing and loses nobody's
+/// request. Accepting first and dropping what did not fit would refuse real
+/// redirects whenever a flood held the slots, which would relocate the
+/// starvation rather than prevent it.
+const MAX_IN_FLIGHT: usize = 64;
+/// How long to wait after an accept error before trying again. Accept fails
+/// for transient reasons (no descriptors, a peer that vanished), and none of
+/// them is a reason to end the user's sign-in.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Why a sign-in did not produce a code. All of these are things to show the
 /// user, not internal failures.
@@ -38,10 +58,11 @@ pub enum RedirectError {
     Provider(String),
     /// The redirect did not carry the `state` this attempt issued, so it
     /// belongs to a different sign-in (or to no sign-in at all).
+    /// Only produced by `parse_callback`, which the listener now answers and
+    /// ignores: a redirect for a different attempt must not end this one.
+    /// Kept because the parser reports it and the tests assert on it.
     #[error("that sign-in response did not match this attempt; start again")]
     StateMismatch,
-    #[error("could not listen for the sign-in response: {0}")]
-    Io(#[from] io::Error),
 }
 
 pub struct RedirectListener {
@@ -83,12 +104,29 @@ impl RedirectListener {
         // WAIT_TIMEOUT before the real redirect is ever read — which is the
         // starvation this listener is supposed to be immune to.
         let (sender, mut answers) = mpsc::channel::<Result<Zeroizing<String>, RedirectError>>(1);
+        let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         loop {
+            // Held across the accept, so nothing is taken out of the backlog
+            // until there is somewhere to put it.
+            let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                return Err(RedirectError::TimedOut);
+            };
             tokio::select! {
                 Some(answer) = answers.recv() => return answer,
                 accepted = self.listener.accept() => {
-                    let (stream, _) = accepted?;
-                    tokio::spawn(answer_one(stream, Arc::clone(&expected), sender.clone()));
+                    let stream = match accepted {
+                        Ok((stream, _)) => stream,
+                        // Never fatal. Propagating here would let any local
+                        // process end the sign-in by exhausting descriptors,
+                        // which is the starvation this listener exists to
+                        // resist. The overall timeout is the backstop.
+                        Err(error) => {
+                            tracing::debug!(%error, "ignoring a failed accept on the sign-in listener");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                            continue;
+                        }
+                    };
+                    tokio::spawn(answer_one(stream, Arc::clone(&expected), sender.clone(), permit));
                 }
             }
         }
@@ -106,6 +144,7 @@ async fn answer_one(
     mut stream: TcpStream,
     expected_state: Arc<str>,
     sender: mpsc::Sender<Result<Zeroizing<String>, RedirectError>>,
+    _permit: OwnedSemaphorePermit,
 ) {
     let Ok(Ok(Some(target))) = tokio::time::timeout(READ_TIMEOUT, read_request_target(&mut stream)).await else {
         return;
@@ -122,15 +161,20 @@ async fn answer_one(
     let result = parse_callback(&url, &expected_state);
     if matches!(result, Err(RedirectError::StateMismatch)) {
         // Not this attempt's redirect. Tell whoever sent it, and go on waiting
-        // for the one that is.
+        // for the one that is. Logged because a genuine mismatch -- a stale
+        // tab, a resumed browser -- now ends in a timeout rather than an
+        // error, and this is the only trace of why.
+        tracing::debug!("ignoring a sign-in redirect for a different attempt");
         let _ = respond(&mut stream, "200 OK", FAILED_PAGE).await;
         return;
     }
     let page = if result.is_ok() { DONE_PAGE } else { FAILED_PAGE };
-    // The code is in hand by now; failing to draw the page is not a reason to
-    // lose it.
-    let _ = respond(&mut stream, "200 OK", page).await;
+    // Reported before the page is drawn, not after: `respond` has no deadline
+    // of its own, so a peer that stalls its read would hold this task open and
+    // the code would never arrive. Failing to draw the page is survivable;
+    // hanging before handing over the result is not.
     let _ = sender.send(result).await;
+    let _ = respond(&mut stream, "200 OK", page).await;
 }
 
 /// Pull `code` out of a redirect, once it is established that the redirect
@@ -311,24 +355,57 @@ mod tests {
         let waiting = tokio::spawn(async move { listener.wait_for_code("st").await });
 
         // Enough that, answered one at a time, they would exhaust WAIT_TIMEOUT.
+        // More than MAX_IN_FLIGHT, and far more than would have exhausted the
+        // old serial loop's five-minute wait.
         let stalled: Vec<TcpStream> = {
             let mut held = Vec::new();
-            for _ in 0..(WAIT_TIMEOUT.as_secs() / READ_TIMEOUT.as_secs()) + 10 {
+            for _ in 0..MAX_IN_FLIGHT + 16 {
                 held.push(TcpStream::connect(&address).await.unwrap());
             }
             held
         };
 
+        // More sockets than there are slots, so the redirect has to come out
+        // of the backlog behind them. It must still be served, and within one
+        // recycle of the slots rather than the whole wait.
         let started = std::time::Instant::now();
         let done = reqwest::Client::new()
             .get(format!("{redirect}?code=not-blocked&state=st"))
-            .timeout(READ_TIMEOUT * 2)
+            .timeout(READ_TIMEOUT * 4)
             .send()
             .await
-            .unwrap();
+            .expect("the redirect must be served, not refused");
         assert!(done.status().is_success());
         assert_eq!(*waiting.await.unwrap().unwrap(), "not-blocked");
-        assert!(started.elapsed() < READ_TIMEOUT, "the redirect waited on the stalled sockets");
+        assert!(
+            started.elapsed() < READ_TIMEOUT * 2,
+            "the redirect waited {:?}, which is longer than one recycle of the slots",
+            started.elapsed()
+        );
+        drop(stalled);
+    }
+
+    /// A few silent connections, which is what actually happens in practice,
+    /// must cost the redirect nothing at all.
+    #[tokio::test]
+    async fn a_few_stalled_connections_do_not_delay_the_redirect() {
+        use tokio::net::TcpStream;
+
+        let listener = RedirectListener::bind().await.unwrap();
+        let redirect = listener.redirect_uri().to_string();
+        let address = redirect.trim_start_matches("http://").trim_end_matches("/callback").to_string();
+        let waiting = tokio::spawn(async move { listener.wait_for_code("st").await });
+
+        let mut stalled = Vec::new();
+        for _ in 0..4 {
+            stalled.push(TcpStream::connect(&address).await.unwrap());
+        }
+
+        let started = std::time::Instant::now();
+        let done = reqwest::get(format!("{redirect}?code=prompt&state=st")).await.unwrap();
+        assert!(done.status().is_success());
+        assert_eq!(*waiting.await.unwrap().unwrap(), "prompt");
+        assert!(started.elapsed() < READ_TIMEOUT, "a few silent sockets delayed the redirect");
         drop(stalled);
     }
 

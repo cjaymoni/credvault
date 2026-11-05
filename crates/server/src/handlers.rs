@@ -118,11 +118,6 @@ async fn require_key_version<'e>(
     }
 }
 
-/// Refuse a write that would take an account past a quota.
-///
-/// Counted inside the caller's write transaction, never before it: two
-/// simultaneous creates that each read the count separately would both see
-/// room and both insert.
 /// Spend one token from a per-account bucket, or say how long to wait.
 ///
 /// Keyed by account rather than address: an address can be rotated at will and
@@ -138,6 +133,11 @@ fn spend_account_budget(limiter: &RateLimiter<i64>, user_id: i64, what: &str) ->
     }
 }
 
+/// Refuse a write that would take an account past a quota.
+///
+/// Counted inside the caller's write transaction, never before it: two
+/// simultaneous creates that each read the count separately would both see
+/// room and both insert.
 async fn check_quota(tx: &mut Tx, label: &str, sql: &str, user_id: i64, limit: i64) -> ApiResult<()> {
     let (used,): (i64,) = sqlx::query_as(sql).bind(user_id).fetch_one(&mut **tx).await?;
     if used >= limit {
@@ -410,9 +410,23 @@ pub async fn change_password(
     ApiJson(body): ApiJson<ChangePasswordRequest>,
 ) -> ApiResult<Json<SessionResponse>> {
     // Before anything expensive: this verifies one Argon2 hash and computes
-    // another, so an unbounded caller is both an online guess at the current
-    // passphrase and a way to starve the process.
+    // another, so an unbounded caller is a way to starve the process.
     spend_account_budget(&state.password_limiter, user.id, "password change")?;
+    let outcome = rewrite_derived_material(&state, &user, body).await;
+    // A conflict means the vault moved under the caller — another device
+    // rotated a key or added a secret — which is not their doing, and the
+    // retry it demands must not be rationed.
+    if matches!(outcome, Err(ApiError::Conflict(_))) {
+        state.password_limiter.refund(user.id);
+    }
+    outcome
+}
+
+async fn rewrite_derived_material(
+    state: &AppState,
+    user: &AuthUser,
+    body: ChangePasswordRequest,
+) -> ApiResult<Json<SessionResponse>> {
     let private_key = encode_sealed("encrypted_private_key", &body.encrypted_private_key)?;
     let mut rewrapped: HashMap<i64, (i64, String)> = HashMap::with_capacity(body.rewrapped_keys.len());
     for entry in &body.rewrapped_keys {
@@ -559,8 +573,8 @@ fn secret_view(row: SecretRow, viewer_id: i64) -> ApiResult<SecretView> {
 /// What a passphrase change needs: it re-wraps keys and never looks at a
 /// payload, so fetching them would be tens of megabytes read and discarded.
 pub async fn list_secret_keys(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<SecretKeyView>>> {
-    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
-        "SELECT s.id, s.key_version, s.owner_id, k.wrapped_key \
+    let rows: Vec<(i64, String, i64, i64, String)> = sqlx::query_as(
+        "SELECT s.id, s.name, s.key_version, s.owner_id, k.wrapped_key \
          FROM secret_keys k JOIN secrets s ON s.id = k.secret_id \
          WHERE k.user_id = ? ORDER BY s.id",
     )
@@ -568,9 +582,10 @@ pub async fn list_secret_keys(State(state): State<AppState>, user: AuthUser) -> 
     .fetch_all(&state.pool)
     .await?;
     rows.into_iter()
-        .map(|(id, key_version, owner_id, wrapped_key)| {
+        .map(|(id, name, key_version, owner_id, wrapped_key)| {
             Ok(SecretKeyView {
                 id,
+                name,
                 key_version,
                 is_owner: owner_id == user.id,
                 wrapped_key: decode_stored(&wrapped_key)?,
@@ -862,7 +877,16 @@ pub async fn create_invite(
         .bind(invitee_id)
         .fetch_one(&mut *tx)
         .await?;
-    if waiting_for_them >= MAX_PENDING_INVITES_RECEIVED {
+    // And a much tighter cap on what *this* account may have waiting for them.
+    // The ceiling above alone is reachable by five accounts inside their own
+    // budgets, which would close the person's list to everyone else.
+    let (waiting_from_us,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM invites WHERE invitee_id = ? AND inviter_id = ?")
+            .bind(invitee_id)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if waiting_for_them >= MAX_PENDING_INVITES_RECEIVED || waiting_from_us >= MAX_PENDING_INVITES_PER_PAIR {
         return Err(ApiError::Forbidden(
             "that person has too many invitations waiting; ask them to answer some first".into(),
         ));

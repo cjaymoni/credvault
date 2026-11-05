@@ -859,37 +859,86 @@ async fn change_password(
     })
 }
 
+/// How long to wait before probing a second time.
+///
+/// The first probe can land while the server is still inside the transaction,
+/// where the sessions have not been deleted yet, so one "still signed in" is
+/// evidence of nothing. Two of them, far enough apart, are.
+const PROBE_SETTLE: Duration = Duration::from_secs(5);
+
+/// What a probe could establish about a change whose answer never arrived.
+enum ChangeOutcome {
+    /// The session still works, twice over: the change did not commit.
+    NotApplied,
+    /// The session is gone, which only the committing transaction does.
+    Applied,
+    /// The probe could not be made. Nothing is known either way.
+    Unknown,
+}
+
 /// Work out whether a passphrase change landed when its answer did not.
 ///
 /// The server deletes every session inside the transaction that commits the
-/// change, so the token this client is holding is valid if and only if the
-/// change did *not* go through. That makes an unauthenticated probe a reliable
-/// answer to a question the user otherwise cannot resolve.
+/// change, so a token that still works means nothing has committed *yet* —
+/// which is not the same as "will not". Probing twice, with a gap, is what
+/// turns the first reading into an answer. Even then the honest outcome is
+/// sometimes "unknown", and saying so is better than guessing: the guess that
+/// loses a vault is telling someone nothing happened when it did.
 async fn resolve_lost_answer(state: &AppState, api: &ApiClient, reason: String) -> CommandError {
-    match api.me().await {
-        // The token still works, so nothing was committed.
-        Ok(_) => CommandError::new("network", format!("cannot reach the server: {reason}")),
-        Err(ClientError::Unauthorized) => {
-            // The token is gone, so the change landed and only the answer was
-            // lost. The local session holds key material that no longer
-            // matches the server, so it is dropped rather than left to fail
-            // later as "wrong passphrase".
-            if let Ok(mut guard) = state.session.lock() {
-                *guard = None;
-            }
-            CommandError::new(
-                "changed_but_unconfirmed",
-                "Your passphrase was changed, but the confirmation was lost on the way back. \
-                 Sign in again with the NEW passphrase — the old one no longer works.",
-            )
-        }
-        // The probe itself failed, so nothing is known. Say that, rather than
-        // guessing in either direction.
-        Err(_) => CommandError::new(
+    let outcome = probe_change(api).await;
+    if !matches!(outcome, ChangeOutcome::NotApplied) {
+        // The old key material no longer matches the server, or may not. It
+        // must not stay in memory behind a screen that says the user is signed
+        // out, and it must not quietly unlock the app again on reload.
+        clear_local_session(state);
+    }
+    match outcome {
+        ChangeOutcome::NotApplied => CommandError::new(
+            "probably_unchanged",
+            format!(
+                "The server did not answer ({reason}), and your passphrase still looks unchanged. \
+                 Keep the new one somewhere safe and try again. If the old one ever stops working, \
+                 the change did go through after all and the new one is the right one."
+            ),
+        ),
+        ChangeOutcome::Applied => CommandError::new(
+            "changed_but_unconfirmed",
+            "Your passphrase was changed, but the confirmation was lost on the way back. \
+             Sign in again with the NEW passphrase. (If someone signed this account out from \
+             another device just now, the old one may still work — try the new one first.)",
+        ),
+        ChangeOutcome::Unknown => CommandError::new(
             "changed_but_unknown",
             "The server could not be reached, and it is not clear whether the change went through. \
-             Keep the new passphrase, sign out, and try it first.",
+             Keep the new passphrase, sign in again, and try it before the old one.",
         ),
+    }
+}
+
+/// Ask twice whether this session still exists, with a gap between.
+async fn probe_change(api: &ApiClient) -> ChangeOutcome {
+    match api.me().await {
+        Err(ClientError::Unauthorized) => return ChangeOutcome::Applied,
+        Err(_) => return ChangeOutcome::Unknown,
+        Ok(_) => {}
+    }
+    tokio::time::sleep(PROBE_SETTLE).await;
+    match api.me().await {
+        Ok(_) => ChangeOutcome::NotApplied,
+        Err(ClientError::Unauthorized) => ChangeOutcome::Applied,
+        Err(_) => ChangeOutcome::Unknown,
+    }
+}
+
+/// Drop the session this process is holding, including the master-key material
+/// in it. Poisoning is reported rather than ignored, as everywhere else.
+fn clear_local_session(state: &AppState) {
+    match state.session.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => {
+            tracing::error!("session lock poisoned while clearing the session");
+            *poisoned.into_inner() = None;
+        }
     }
 }
 
@@ -904,7 +953,7 @@ fn rewrap_owned(keys: &[SecretKeyView], old: &MasterKey, new: &MasterKey) -> Com
         let WrappedKey::Owner(sealed) = &view.wrapped_key else {
             return Err(CommandError::new(
                 "untrusted_key",
-                format!("the server returned a key copy for secret {} that you could not have made", view.id),
+                format!("the server returned a key copy for \"{}\" that you could not have made", view.name),
             ));
         };
         let key = SecretKey::unwrap_owner(&old_wrap, sealed).map_err(user_facing)?;

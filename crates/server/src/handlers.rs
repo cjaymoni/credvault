@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 use crate::auth::{self, AuthUser};
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ApiJson;
+use crate::ratelimit::RateLimiter;
 use crate::{oauth, AppState, RegistrationPolicy};
 use credvault_core::api::*;
 
@@ -122,6 +123,21 @@ async fn require_key_version<'e>(
 /// Counted inside the caller's write transaction, never before it: two
 /// simultaneous creates that each read the count separately would both see
 /// room and both insert.
+/// Spend one token from a per-account bucket, or say how long to wait.
+///
+/// Keyed by account rather than address: an address can be rotated at will and
+/// an account cannot, so this is the only key that actually bounds what one
+/// caller can make the server do.
+fn spend_account_budget(limiter: &RateLimiter<i64>, user_id: i64, what: &str) -> ApiResult<()> {
+    match limiter.try_acquire_keyed(user_id) {
+        Ok(()) => Ok(()),
+        Err(wait) => {
+            tracing::warn!(user_id, operation = what, "rate limited");
+            Err(ApiError::TooManyRequests { retry_after_secs: wait.as_secs().max(1) })
+        }
+    }
+}
+
 async fn check_quota(tx: &mut Tx, label: &str, sql: &str, user_id: i64, limit: i64) -> ApiResult<()> {
     let (used,): (i64,) = sqlx::query_as(sql).bind(user_id).fetch_one(&mut **tx).await?;
     if used >= limit {
@@ -393,6 +409,10 @@ pub async fn change_password(
     user: AuthUser,
     ApiJson(body): ApiJson<ChangePasswordRequest>,
 ) -> ApiResult<Json<SessionResponse>> {
+    // Before anything expensive: this verifies one Argon2 hash and computes
+    // another, so an unbounded caller is both an online guess at the current
+    // passphrase and a way to starve the process.
+    spend_account_budget(&state.password_limiter, user.id, "password change")?;
     let private_key = encode_sealed("encrypted_private_key", &body.encrypted_private_key)?;
     let mut rewrapped: HashMap<i64, (i64, String)> = HashMap::with_capacity(body.rewrapped_keys.len());
     for entry in &body.rewrapped_keys {
@@ -532,6 +552,32 @@ fn secret_view(row: SecretRow, viewer_id: i64) -> ApiResult<SecretView> {
         updated_at,
         key_version,
     })
+}
+
+/// Every secret key this caller holds, without the payloads.
+///
+/// What a passphrase change needs: it re-wraps keys and never looks at a
+/// payload, so fetching them would be tens of megabytes read and discarded.
+pub async fn list_secret_keys(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<SecretKeyView>>> {
+    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "SELECT s.id, s.key_version, s.owner_id, k.wrapped_key \
+         FROM secret_keys k JOIN secrets s ON s.id = k.secret_id \
+         WHERE k.user_id = ? ORDER BY s.id",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    rows.into_iter()
+        .map(|(id, key_version, owner_id, wrapped_key)| {
+            Ok(SecretKeyView {
+                id,
+                key_version,
+                is_owner: owner_id == user.id,
+                wrapped_key: decode_stored(&wrapped_key)?,
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()
+        .map(Json)
 }
 
 pub async fn list_secrets(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<SecretView>>> {
@@ -804,6 +850,23 @@ pub async fn create_invite(
         MAX_PENDING_INVITES_PER_ACCOUNT,
     )
     .await?;
+    // Counted against the invitee as well. The cap above bounds one account;
+    // it does nothing about a crowd of accounts each spending their own budget
+    // on the same person, which is what would make their invite list unusable.
+    //
+    // Written out rather than going through `check_quota`, because that one
+    // reports the count it found and this count belongs to someone else. The
+    // caller learns only that the person is at the cap, which is the least that
+    // can explain the refusal.
+    let (waiting_for_them,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM invites WHERE invitee_id = ?")
+        .bind(invitee_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if waiting_for_them >= MAX_PENDING_INVITES_RECEIVED {
+        return Err(ApiError::Forbidden(
+            "that person has too many invitations waiting; ask them to answer some first".into(),
+        ));
+    }
     // A wrapped key made from a rotated-away version would never open the payload.
     require_key_version(&mut *tx, secret_id, user.id, body.key_version).await?;
 
@@ -1229,6 +1292,7 @@ pub async fn oauth_link(
     user: AuthUser,
     ApiJson(body): ApiJson<OAuthCallbackRequest>,
 ) -> ApiResult<StatusCode> {
+    spend_account_budget(&state.link_limiter, user.id, "google link")?;
     // The caller's id is part of what selects the attempt, so a link can only
     // be finished by the session that began it. Without that, any
     // authenticated caller holding a valid link state and secret could bind

@@ -34,6 +34,10 @@ async fn spawn() -> TestServer {
             register_refill: Duration::from_secs(1),
             lookup_burst: 100_000,
             lookup_refill: Duration::from_secs(1),
+            password_burst: 100_000,
+            password_refill: Duration::from_secs(1),
+            link_burst: 100_000,
+            link_refill: Duration::from_secs(1),
         },
         ..ServerConfig::default()
     };
@@ -95,6 +99,7 @@ fn routes() -> Vec<(Method, &'static str)> {
         (Method::POST, "/api/logout"),
         (Method::DELETE, "/api/sessions"),
         (Method::GET, "/api/me"),
+        (Method::POST, "/api/password"),
         (Method::GET, "/api/capabilities"),
         (Method::POST, "/api/oauth/start"),
         (Method::POST, "/api/oauth/callback"),

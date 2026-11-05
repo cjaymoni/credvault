@@ -13,6 +13,7 @@ use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 struct TestServer {
@@ -1416,4 +1417,103 @@ async fn changing_the_passphrase_signs_out_every_other_device() {
     assert_eq!(server.req(Method::GET, "/me", &elsewhere).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     let here = Account { token: fresh.token, ..alice };
     assert_eq!(server.req(Method::GET, "/me", &here).send().await.unwrap().status(), StatusCode::OK);
+}
+
+/// `/secrets/keys` is a static segment next to `/secrets/{id}`; it must not be
+/// swallowed by the parameter route, and it must carry no payloads.
+#[tokio::test]
+async fn the_keys_projection_omits_payloads_and_does_not_collide_with_an_id() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let (id, _) = server.create_secret(&alice, "GitHub", &payload()).await;
+
+    let response = server.req(Method::GET, "/secrets/keys", &alice).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains("payload"), "the projection must not carry ciphertext: {body}");
+
+    let keys: Vec<SecretKeyView> = serde_json::from_str(&body).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].id, id);
+    assert!(keys[0].is_owner);
+    assert_eq!(keys[0].key_version, 0);
+
+    // The parameter route still works beside it.
+    assert_eq!(
+        server.req(Method::GET, &format!("/secrets/{id}"), &alice).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn one_person_cannot_be_buried_in_invitations_by_a_crowd() {
+    let server = spawn().await;
+    let victim = register(&server, "victim@example.com", "correct horse battery").await;
+
+    // Fill the victim's list to the cap directly; the senders do not matter,
+    // which is the point — each would be within its own inviter budget.
+    let now = Utc::now();
+    for i in 0..MAX_PENDING_INVITES_RECEIVED {
+        sqlx::query("INSERT INTO secrets (owner_id, name, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(victim.id)
+            .bind(format!("filler {i}"))
+            .bind("{}")
+            .bind(now)
+            .bind(now)
+            .execute(&server.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO invites (secret_id, inviter_id, invitee_id, wrapped_key, message, created_at) \
+             VALUES ((SELECT MAX(id) FROM secrets), ?, ?, ?, '', ?)",
+        )
+        .bind(victim.id)
+        .bind(victim.id)
+        .bind("{}")
+        .bind(now)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+
+    let sender = register(&server, "sender@example.com", "correct horse battery").await;
+    let (id, key) = server.create_secret(&sender, "one more", &payload()).await;
+    let response = server
+        .req(Method::POST, &format!("/secrets/{id}/invites"), &sender)
+        .json(&InviteRequest {
+            email: victim.email.clone(),
+            fingerprint: victim.identity.public_key().fingerprint(),
+            wrapped_key: key.wrap_for(victim.identity.public_key()).unwrap(),
+            message: String::new(),
+            key_version: 0,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // The refusal explains itself without reporting how many they have.
+    let message = error_text(response).await;
+    assert!(message.contains("too many invitations waiting"), "{message}");
+    assert!(!message.contains(&MAX_PENDING_INVITES_RECEIVED.to_string()), "leaks their count: {message}");
+}
+
+/// Every other endpoint that touches a credential is throttled; this one runs
+/// two Argon2 passes and takes the write lock, so it is the one that most needs
+/// to be.
+#[tokio::test]
+async fn passphrase_changes_are_throttled_per_account() {
+    let limits = RateLimits { password_burst: 2, password_refill: Duration::from_secs(600), ..Default::default() };
+    let server = spawn_with(ServerConfig { rate_limits: limits, ..Default::default() }).await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+
+    // Two wrong attempts spend the burst; the third is refused before Argon2.
+    let mut wrong = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    wrong.current_auth_hash =
+        Some(MasterKey::derive("not-the-password", "alice@example.com").unwrap().auth_hash(&server.address));
+    for _ in 0..2 {
+        let response = server.req(Method::POST, "/password", &alice).json(&wrong).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = server.req(Method::POST, "/password", &alice).json(&wrong).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }

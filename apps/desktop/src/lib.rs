@@ -821,23 +821,32 @@ async fn change_password(
     }
     let new_master = derive_master(new_password, email).await?;
 
-    // Re-wrap against what the server has now. Anything that moves in the
-    // meantime is caught by the key version the server checks.
-    let views = api.list_secrets().await?;
-    let rewrapped_keys = rewrap_owned(&views, &old_master, &new_master)?;
+    // Keys without payloads: re-wrapping never looks at a payload, and at the
+    // quota fetching them would be tens of megabytes read and thrown away.
+    // Anything that moves in the meantime is caught by the key version the
+    // server checks.
+    let keys = api.list_secret_keys().await?;
+    let rewrapped_keys = rewrap_owned(&keys, &old_master, &new_master)?;
 
     let identity_key = with_session(&state, |session| {
         Ok(session.identity.encrypt_private_key(&new_master.private_key_encryption_key()))
     })?;
     let password_login = with_session(&state, |session| Ok(session.password_login))?;
-    let session = api
-        .change_password(&ChangePasswordRequest {
-            current_auth_hash: password_login.then(|| old_master.auth_hash(&server)),
-            new_auth_hash: password_login.then(|| new_master.auth_hash(&server)),
-            encrypted_private_key: identity_key,
-            rewrapped_keys,
-        })
-        .await?;
+    let request = ChangePasswordRequest {
+        current_auth_hash: password_login.then(|| old_master.auth_hash(&server)),
+        new_auth_hash: password_login.then(|| new_master.auth_hash(&server)),
+        encrypted_private_key: identity_key,
+        rewrapped_keys,
+    };
+    let session = match api.change_password(&request).await {
+        Ok(session) => session,
+        // An answer that never arrived is not the same as a change that never
+        // happened, and the difference decides which passphrase the vault now
+        // has. Treating it as a failure is what loses a vault: the user keeps
+        // the old passphrase, discards the new one, and neither opens it.
+        Err(ClientError::Network(reason)) => return Err(resolve_lost_answer(&state, &api, reason).await),
+        Err(other) => return Err(other.into()),
+    };
 
     // Every other device was signed out, and this one holds a new token and a
     // new self-wrap key. Cached secret keys stay valid — they did not change —
@@ -850,18 +859,52 @@ async fn change_password(
     })
 }
 
+/// Work out whether a passphrase change landed when its answer did not.
+///
+/// The server deletes every session inside the transaction that commits the
+/// change, so the token this client is holding is valid if and only if the
+/// change did *not* go through. That makes an unauthenticated probe a reliable
+/// answer to a question the user otherwise cannot resolve.
+async fn resolve_lost_answer(state: &AppState, api: &ApiClient, reason: String) -> CommandError {
+    match api.me().await {
+        // The token still works, so nothing was committed.
+        Ok(_) => CommandError::new("network", format!("cannot reach the server: {reason}")),
+        Err(ClientError::Unauthorized) => {
+            // The token is gone, so the change landed and only the answer was
+            // lost. The local session holds key material that no longer
+            // matches the server, so it is dropped rather than left to fail
+            // later as "wrong passphrase".
+            if let Ok(mut guard) = state.session.lock() {
+                *guard = None;
+            }
+            CommandError::new(
+                "changed_but_unconfirmed",
+                "Your passphrase was changed, but the confirmation was lost on the way back. \
+                 Sign in again with the NEW passphrase — the old one no longer works.",
+            )
+        }
+        // The probe itself failed, so nothing is known. Say that, rather than
+        // guessing in either direction.
+        Err(_) => CommandError::new(
+            "changed_but_unknown",
+            "The server could not be reached, and it is not clear whether the change went through. \
+             Keep the new passphrase, sign out, and try it first.",
+        ),
+    }
+}
+
 /// Unwrap each owned secret's key with the old self-wrap key and wrap it again
 /// with the new one. Secrets shared with this account are skipped: their copies
 /// are sealed to the key pair, which does not change.
-fn rewrap_owned(views: &[SecretView], old: &MasterKey, new: &MasterKey) -> CommandResult<Vec<RewrappedKey>> {
+fn rewrap_owned(keys: &[SecretKeyView], old: &MasterKey, new: &MasterKey) -> CommandResult<Vec<RewrappedKey>> {
     let old_wrap = old.self_wrap_key();
     let new_wrap = new.self_wrap_key();
     let mut rewrapped = Vec::new();
-    for view in views.iter().filter(|view| view.is_owner) {
+    for view in keys.iter().filter(|view| view.is_owner) {
         let WrappedKey::Owner(sealed) = &view.wrapped_key else {
             return Err(CommandError::new(
                 "untrusted_key",
-                format!("the server returned a key copy for \"{}\" that you could not have made", view.name),
+                format!("the server returned a key copy for secret {} that you could not have made", view.id),
             ));
         };
         let key = SecretKey::unwrap_owner(&old_wrap, sealed).map_err(user_facing)?;

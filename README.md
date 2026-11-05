@@ -125,6 +125,12 @@ against the convenience before enabling it.
   — the app re-wraps every key under the new one in a single step, and signs
   out every other device — but nothing can recover one you have lost.
 - Someone you share with can read that one secret, not your other secrets.
+- Changing your passphrase needs the old one. For an account created through
+  Google there is nothing the server can check, so a stolen session can replace
+  the stored keys and make the vault unopenable. A stolen session can already
+  delete every secret, so this adds no reach — but it fails as "wrong
+  passphrase" rather than as anything obviously destructive. Sign out of
+  devices you do not recognise.
 - The server operator can see who shares with whom and the names of secrets,
   but not their contents. The operator cannot alter, relabel or replace a
   secret you own. For a secret shared *with* you the operator could show you

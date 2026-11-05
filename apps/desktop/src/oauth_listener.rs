@@ -8,10 +8,12 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 /// Path the redirect URI points at. Anything else that connects gets a 404.
@@ -74,39 +76,61 @@ impl RedirectListener {
     }
 
     async fn accept_callback(self, expected_state: &str) -> Result<Zeroizing<String>, RedirectError> {
+        let expected: Arc<str> = Arc::from(expected_state);
+        // Each connection is answered in its own task, so a socket that stalls
+        // costs only its own read deadline. Answering them in turn would make
+        // N stalled sockets cost N * READ_TIMEOUT, and enough of them reach
+        // WAIT_TIMEOUT before the real redirect is ever read — which is the
+        // starvation this listener is supposed to be immune to.
+        let (sender, mut answers) = mpsc::channel::<Result<Zeroizing<String>, RedirectError>>(1);
         loop {
-            let (mut stream, _) = self.listener.accept().await?;
-            // Anything that is not the redirect is answered and forgotten: it
-            // does not count against the one that matters and does not end the
-            // wait. Browsers open speculative connections, and any other
-            // process on this machine can open as many as it likes, so a
-            // budget here would be something to exhaust. The overall timeout
-            // in `wait_for_code` is what bounds this loop.
-            let target = match tokio::time::timeout(READ_TIMEOUT, read_request_target(&mut stream)).await {
-                Ok(Ok(Some(target))) => target,
-                // Malformed, cut short, or too slow to send a request line.
-                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => continue,
-            };
-            let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{target}")) else {
-                let _ = respond(&mut stream, "404 Not Found", NOT_FOUND_PAGE).await;
-                continue;
-            };
-            if url.path() != CALLBACK_PATH {
-                let _ = respond(&mut stream, "404 Not Found", NOT_FOUND_PAGE).await;
-                continue;
+            tokio::select! {
+                Some(answer) = answers.recv() => return answer,
+                accepted = self.listener.accept() => {
+                    let (stream, _) = accepted?;
+                    tokio::spawn(answer_one(stream, Arc::clone(&expected), sender.clone()));
+                }
             }
-
-            let result = parse_callback(&url, expected_state);
-            let page = match &result {
-                Ok(_) => DONE_PAGE,
-                Err(_) => FAILED_PAGE,
-            };
-            // The code is in hand by now. Failing to draw the page back to the
-            // browser is not a reason to lose it.
-            let _ = respond(&mut stream, "200 OK", page).await;
-            return result;
         }
     }
+}
+
+/// Answer one connection, and report an answer only for a redirect carrying
+/// this attempt's `state`.
+///
+/// Everything else — a stalled socket, a speculative request for another path,
+/// a redirect belonging to a different sign-in — is served and forgotten. None
+/// of it may end the wait, because any process on this machine can produce all
+/// three.
+async fn answer_one(
+    mut stream: TcpStream,
+    expected_state: Arc<str>,
+    sender: mpsc::Sender<Result<Zeroizing<String>, RedirectError>>,
+) {
+    let Ok(Ok(Some(target))) = tokio::time::timeout(READ_TIMEOUT, read_request_target(&mut stream)).await else {
+        return;
+    };
+    let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{target}")) else {
+        let _ = respond(&mut stream, "404 Not Found", NOT_FOUND_PAGE).await;
+        return;
+    };
+    if url.path() != CALLBACK_PATH {
+        let _ = respond(&mut stream, "404 Not Found", NOT_FOUND_PAGE).await;
+        return;
+    }
+
+    let result = parse_callback(&url, &expected_state);
+    if matches!(result, Err(RedirectError::StateMismatch)) {
+        // Not this attempt's redirect. Tell whoever sent it, and go on waiting
+        // for the one that is.
+        let _ = respond(&mut stream, "200 OK", FAILED_PAGE).await;
+        return;
+    }
+    let page = if result.is_ok() { DONE_PAGE } else { FAILED_PAGE };
+    // The code is in hand by now; failing to draw the page is not a reason to
+    // lose it.
+    let _ = respond(&mut stream, "200 OK", page).await;
+    let _ = sender.send(result).await;
 }
 
 /// Pull `code` out of a redirect, once it is established that the redirect
@@ -273,10 +297,12 @@ mod tests {
         assert_eq!(*waiting.await.unwrap().unwrap(), "survived");
     }
 
-    /// A connection that holds the socket open without sending is the one that
-    /// used to block everything behind it. Takes about `READ_TIMEOUT`.
+    /// Sockets opened and held without sending are what used to queue behind
+    /// each other: answering them in turn made sixty of them cost five minutes,
+    /// which is the whole wait. Held open together, they must cost one read
+    /// deadline between them.
     #[tokio::test]
-    async fn a_stalled_connection_does_not_block_the_redirect_behind_it() {
+    async fn many_stalled_connections_do_not_block_the_redirect() {
         use tokio::net::TcpStream;
 
         let listener = RedirectListener::bind().await.unwrap();
@@ -284,28 +310,57 @@ mod tests {
         let address = redirect.trim_start_matches("http://").trim_end_matches("/callback").to_string();
         let waiting = tokio::spawn(async move { listener.wait_for_code("st").await });
 
-        // Connect and say nothing, keeping the socket open for the duration.
-        let stalled = TcpStream::connect(&address).await.unwrap();
+        // Enough that, answered one at a time, they would exhaust WAIT_TIMEOUT.
+        let stalled: Vec<TcpStream> = {
+            let mut held = Vec::new();
+            for _ in 0..(WAIT_TIMEOUT.as_secs() / READ_TIMEOUT.as_secs()) + 10 {
+                held.push(TcpStream::connect(&address).await.unwrap());
+            }
+            held
+        };
 
+        let started = std::time::Instant::now();
         let done = reqwest::Client::new()
             .get(format!("{redirect}?code=not-blocked&state=st"))
-            .timeout(READ_TIMEOUT * 4)
+            .timeout(READ_TIMEOUT * 2)
             .send()
             .await
             .unwrap();
         assert!(done.status().is_success());
         assert_eq!(*waiting.await.unwrap().unwrap(), "not-blocked");
+        assert!(started.elapsed() < READ_TIMEOUT, "the redirect waited on the stalled sockets");
         drop(stalled);
     }
 
+    /// A redirect carrying someone else's state is told it failed, but it does
+    /// not end this attempt: anything on this machine can send one, and a
+    /// sign-in that any local process can cancel is the starvation bug wearing
+    /// a different hat.
     #[tokio::test]
-    async fn a_redirect_for_another_attempt_is_refused() {
+    async fn a_redirect_for_another_attempt_does_not_end_the_wait() {
         let listener = RedirectListener::bind().await.unwrap();
         let redirect = listener.redirect_uri().to_string();
         let waiting = tokio::spawn(async move { listener.wait_for_code("expected").await });
 
         let response = reqwest::get(format!("{redirect}?code=the-code&state=someone-elses")).await.unwrap();
         assert!(response.text().await.unwrap().contains("Sign-in failed"));
-        assert!(matches!(waiting.await.unwrap(), Err(RedirectError::StateMismatch)));
+
+        // The real one still lands.
+        let done = reqwest::get(format!("{redirect}?code=mine&state=expected")).await.unwrap();
+        assert!(done.text().await.unwrap().contains("go back to credvault"));
+        assert_eq!(*waiting.await.unwrap().unwrap(), "mine");
+    }
+
+    /// A provider error *does* end the wait, because the state matched: it is
+    /// this user's own redirect reporting that they declined.
+    #[tokio::test]
+    async fn a_provider_error_for_this_attempt_ends_the_wait() {
+        let listener = RedirectListener::bind().await.unwrap();
+        let redirect = listener.redirect_uri().to_string();
+        let waiting = tokio::spawn(async move { listener.wait_for_code("st").await });
+
+        let response = reqwest::get(format!("{redirect}?error=access_denied&state=st")).await.unwrap();
+        assert!(response.text().await.unwrap().contains("Sign-in failed"));
+        assert!(matches!(waiting.await.unwrap(), Err(RedirectError::Provider(code)) if code == "access_denied"));
     }
 }

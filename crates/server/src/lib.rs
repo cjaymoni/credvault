@@ -57,6 +57,19 @@ pub struct RateLimits {
     /// `resolve_by_fingerprint` does that on its own.
     pub lookup_burst: u32,
     pub lookup_refill: Duration,
+    /// Also per authenticated user. A passphrase change verifies one Argon2
+    /// hash and computes another, and holds the write lock while it rewrites
+    /// every owner key, which makes it the most expensive thing an account can
+    /// ask for. The verify is also an online guess at the current passphrase,
+    /// so it must not be unbounded.
+    pub password_burst: u32,
+    pub password_refill: Duration,
+    /// Per authenticated user, because the ceiling exists to stop one account
+    /// driving unbounded outbound requests to Google. An address-keyed bucket
+    /// would miss that: an account can rotate addresses, and several accounts
+    /// behind one NAT would share a budget none of them spent.
+    pub link_burst: u32,
+    pub link_refill: Duration,
 }
 
 impl Default for RateLimits {
@@ -74,6 +87,12 @@ impl Default for RateLimits {
             register_refill: Duration::from_secs(60),
             lookup_burst: 30,
             lookup_refill: Duration::from_secs(3),
+            // Changing a passphrase is a thing a person does rarely and
+            // deliberately; five in a row is already generous.
+            password_burst: 5,
+            password_refill: Duration::from_secs(60),
+            link_burst: 5,
+            link_refill: Duration::from_secs(60),
         }
     }
 }
@@ -121,6 +140,13 @@ pub struct AppState {
     /// rather than a middleware, because the caller is only known after the
     /// session has been resolved.
     pub lookup_limiter: Arc<RateLimiter<i64>>,
+    /// Throttles passphrase changes per account. In the handler rather than a
+    /// middleware for the same reason as the lookup: the caller is only known
+    /// once the session has been resolved.
+    pub password_limiter: Arc<RateLimiter<i64>>,
+    /// Throttles Google links per account, bounding the outbound requests one
+    /// account can make the server perform.
+    pub link_limiter: Arc<RateLimiter<i64>>,
 }
 
 /// Open (creating if needed) the SQLite database and apply migrations.
@@ -154,11 +180,14 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     let oauth_start_limit = limit_for(limits.login_burst, limits.login_refill);
     let oauth_callback_limit = limit_for(limits.login_burst, limits.login_refill);
     let oauth_register_limit = limit_for(limits.register_burst, limits.register_refill);
-    // Linking is authenticated, but every call makes the server fetch a token
-    // from Google, so it still needs a ceiling: an account must not be able to
-    // drive unbounded outbound requests.
+    // An address bucket in front of the link route, to absorb floods before a
+    // session is even resolved. The ceiling that actually bounds what one
+    // account can make the server fetch from Google is per-user and lives in
+    // the handler; see `AppState::link_limiter`.
     let oauth_link_limit = limit_for(limits.login_burst, limits.login_refill);
     let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
+    let password_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
+    let link_limiter = Arc::new(RateLimiter::new(limits.link_burst, limits.link_refill));
 
     let api = Router::new()
         .route(
@@ -191,6 +220,7 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .route("/password", post(handlers::change_password))
         .route("/users/lookup", get(handlers::lookup_user))
         .route("/secrets", get(handlers::list_secrets).post(handlers::create_secret))
+        .route("/secrets/keys", get(handlers::list_secret_keys))
         .route("/secrets/{id}", get(handlers::get_secret).put(handlers::update_secret).delete(handlers::delete_secret))
         .route("/secrets/{id}/access", get(handlers::secret_access))
         .route("/secrets/{id}/access/{user_id}/revoke", post(handlers::revoke_access))
@@ -205,7 +235,7 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .nest("/api", api)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState { pool, config: Arc::new(config), lookup_limiter })
+        .with_state(AppState { pool, config: Arc::new(config), lookup_limiter, password_limiter, link_limiter })
 }
 
 /// Convenience for callers that want the connect-info service type spelled out.

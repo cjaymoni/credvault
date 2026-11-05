@@ -190,6 +190,17 @@ impl ApiClient {
         self.send(Method::GET, "/secrets", Self::NO_BODY).await
     }
 
+    /// The signed-in account's own profile. Also used as a liveness probe for
+    /// the session token itself: a 401 means the token is gone.
+    pub async fn me(&self) -> Result<UserProfile, ClientError> {
+        self.send(Method::GET, "/me", Self::NO_BODY).await
+    }
+
+    /// Keys without payloads, for re-wrapping a vault.
+    pub async fn list_secret_keys(&self) -> Result<Vec<SecretKeyView>, ClientError> {
+        self.send(Method::GET, "/secrets/keys", Self::NO_BODY).await
+    }
+
     pub async fn get_secret(&self, id: i64) -> Result<SecretView, ClientError> {
         self.send(Method::GET, &format!("/secrets/{id}"), Self::NO_BODY).await
     }

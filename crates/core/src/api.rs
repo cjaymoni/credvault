@@ -24,12 +24,21 @@ pub const MAX_REGISTRATION_TOKEN_LEN: usize = 256;
 /// volume stops every account on the server, not just the one that did it.
 pub const MAX_SECRETS_PER_ACCOUNT: i64 = 1_000;
 
-/// How many invites one account may have outstanding at once.
+/// How many invites one account may have outstanding at once, as the inviter.
 ///
-/// Also bounds what can be pushed *into* someone else's list: an invite is
-/// unique per secret and invitee, so filling a stranger's inbox would take a
-/// secret each, and this cap is reached first.
+/// This bounds what one account can create. It does *not* bound what can be
+/// pushed into someone else's list, because several accounts can each spend
+/// their own budget on the same person; see
+/// [`MAX_PENDING_INVITES_RECEIVED`].
 pub const MAX_PENDING_INVITES_PER_ACCOUNT: i64 = 100;
+
+/// How many unanswered invites one account may be sent.
+///
+/// Higher than the per-inviter cap, because being invited by many people is
+/// legitimate in a way that inviting many people at once is not. What it stops
+/// is a crowd of accounts each spending their own budget on one victim, which
+/// the per-inviter cap alone allows.
+pub const MAX_PENDING_INVITES_RECEIVED: i64 = 500;
 
 const REDACTED: &str = "<redacted>";
 
@@ -462,9 +471,16 @@ impl fmt::Debug for OAuthRegisterRequest {
 /// this account, and invites addressed to it, keep working.
 #[derive(Serialize, Deserialize)]
 pub struct ChangePasswordRequest {
-    /// Proof of the current passphrase. Required for an account that signs in
-    /// with a password; a session alone must not be enough to change it.
-    /// Absent for a Google account, which has no password login to prove.
+    /// Proof of the current passphrase, for an account that signs in with a
+    /// password: a session alone is not enough to change that account's
+    /// passphrase.
+    ///
+    /// A Google account has no password login and so nothing the server can
+    /// check, and this is absent. For those accounts a session *is* enough to
+    /// replace the stored key material, which is a destructive power a session
+    /// already has — it can delete every secret — but one that leaves the
+    /// vault looking intact. Closing it would mean storing a passphrase-derived
+    /// verifier for Google accounts as well; see the README.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_auth_hash: Option<Zeroizing<String>>,
     /// The new credential, for accounts that sign in with a password. Absent
@@ -487,6 +503,20 @@ impl fmt::Debug for ChangePasswordRequest {
             .field("rewrapped_keys", &self.rewrapped_keys.len())
             .finish_non_exhaustive()
     }
+}
+
+/// One secret's key, without its payload.
+///
+/// `GET /api/secrets` carries every payload, which is right for showing a
+/// vault and wrong for re-wrapping one: at the quota that is tens of megabytes
+/// of ciphertext fetched only to be dropped, over a connection that then has
+/// to stay up long enough to send the answer back.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SecretKeyView {
+    pub id: i64,
+    pub key_version: i64,
+    pub is_owner: bool,
+    pub wrapped_key: WrappedKey,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

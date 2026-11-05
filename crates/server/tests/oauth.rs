@@ -691,3 +691,33 @@ async fn a_google_account_cannot_set_a_password_through_the_passphrase_change() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+/// Records the exception documented on `ChangePasswordRequest`: for a Google
+/// account the server has nothing to verify, so a session is enough. If this
+/// ever stops being true, this test is what says so.
+#[tokio::test]
+async fn a_google_session_alone_can_replace_the_vault_keys() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@example.com");
+    let server = spawn(Arc::clone(&stub)).await;
+    let (session, email) = sign_up(&server, "code-1", "first-passphrase-here", None).await;
+
+    // Nothing derived from the current passphrase is presented, and nothing
+    // the server holds can tell that these bytes are not a real key.
+    let nonsense = MasterKey::derive("attacker-chosen-pass", &email).unwrap();
+    let identity = Identity::generate();
+    let body = ChangePasswordRequest {
+        current_auth_hash: None,
+        new_auth_hash: None,
+        encrypted_private_key: identity.encrypt_private_key(&nonsense.private_key_encryption_key()),
+        rewrapped_keys: Vec::new(),
+    };
+    let response = server
+        .client
+        .post(format!("{}/password", server.base))
+        .bearer_auth(&session.token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "a Google session is sufficient today");
+}

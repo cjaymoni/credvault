@@ -1212,11 +1212,34 @@ async function submitPassphraseChange(event) {
     showListScreen();
     await refresh();
   } catch (error) {
+    // Two outcomes mean the change may already have happened and the answer
+    // was lost. Showing them as a form error would be read as "it failed",
+    // and a user who believes that throws away the passphrase that now opens
+    // their vault. They get the sign-in screen and a banner that stays put.
+    if (error?.code === "changed_but_unconfirmed" || error?.code === "changed_but_unknown") {
+      await signOutAfterAmbiguousChange(error.message);
+      return;
+    }
     setError("pp-error", error);
     if (error?.code === "locked") $("pp-current").focus();
   } finally {
     if ($("btn-pp-save")?.isConnected) setBusy($("btn-pp-save"), false);
   }
+}
+
+/// Drop back to the sign-in screen carrying a warning that does not vanish.
+/// The local session is already gone on the Rust side in this case, so there
+/// is nothing to log out of; this only resets what is on screen.
+async function signOutAfterAmbiguousChange(message) {
+  clearReveals();
+  state.secrets = []; state.selected = null; state.editing = false; state.user = null;
+  $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
+  closeAccountSheet({ restoreFocus: false });
+  setError("main-error", "");
+  $("app").classList.add("hidden");
+  $("auth").classList.remove("hidden");
+  showStartupWarning(message);
+  $("password").focus();
 }
 
 // ----- create / edit form ----------------------------------------------------

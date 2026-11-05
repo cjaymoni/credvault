@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Nothing this app stores may leave the device by backup or by transfer.
+
+  What is on disk is the pinned-key store and the WebView's local storage: no
+  session token and no vault key, which are held in memory only. Even so, the
+  pin store is the trust anchor for key fingerprints, and a restored copy is
+  one the user did not write. API 31 and up read these rules; allowBackup in
+  the manifest covers older releases.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

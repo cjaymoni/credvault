@@ -1,0 +1,8 @@
+target/
+apps/desktop/gen/android/build/
+apps/desktop/gen/android/app/build/
+deploy/
+.git/
+*.db
+*.db-*
+.DS_Store

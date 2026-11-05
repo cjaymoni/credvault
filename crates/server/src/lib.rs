@@ -5,6 +5,7 @@ pub mod auth;
 pub mod error;
 mod extract;
 mod handlers;
+pub mod oauth;
 pub mod ratelimit;
 
 use std::net::SocketAddr;
@@ -19,10 +20,28 @@ use sqlx::SqlitePool;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+use oauth::OAuthProvider;
 use ratelimit::{AuthLimit, RateLimiter};
 
 /// Largest request body the server accepts; blobs are capped lower in handlers.
-const MAX_REQUEST_BYTES: usize = 256 * 1024;
+///
+/// Sized by the one request that is legitimately large: a passphrase change
+/// carries every owner copy of a secret key at once, because changing half of
+/// what the passphrase derives would leave a vault nobody can open. At the
+/// quota that is roughly 175 KB of base64 and JSON.
+pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
+
+/// Roughly what one re-wrapped key costs on the wire: a 12-byte nonce and a
+/// 48-byte ciphertext in base64, inside two JSON objects, with room to spare.
+const REWRAPPED_KEY_WIRE_BYTES: usize = 256;
+
+/// The two limits are set independently and must not drift into a state where
+/// a vault at the quota cannot have its passphrase changed — which would be
+/// discovered by a user who had already typed a new one.
+const _: () = assert!(
+    api::MAX_SECRETS_PER_ACCOUNT as usize * REWRAPPED_KEY_WIRE_BYTES < MAX_REQUEST_BYTES,
+    "a full re-wrap must fit in one request body"
+);
 
 /// Token buckets: per client address for the unauthenticated endpoints, per
 /// caller id for the directory lookup.
@@ -34,8 +53,8 @@ pub struct RateLimits {
     pub register_refill: Duration,
     /// Per authenticated user, not per address: an address can be rotated at
     /// will and an account cannot, and this is what bounds guessing at
-    /// fingerprints. It is no longer about hiding who has an account, which
-    /// `resolve_by_fingerprint` now does on its own.
+    /// fingerprints. Hiding who has an account is not its job;
+    /// `resolve_by_fingerprint` does that on its own.
     pub lookup_burst: u32,
     pub lookup_refill: Duration,
 }
@@ -78,6 +97,20 @@ pub struct ServerConfig {
     /// enable behind a reverse proxy that overwrites the header.
     pub trust_forwarded_for: bool,
     pub rate_limits: RateLimits,
+    /// Sign in with Google, when the operator has configured a client id and
+    /// secret. `None` leaves the OAuth endpoints answering 404 and the
+    /// capabilities endpoint reporting that the button should not be shown.
+    pub oauth: Option<Arc<dyn OAuthProvider>>,
+}
+
+impl ServerConfig {
+    /// The configured provider, or a 404 explaining that this server does not
+    /// offer Google sign-in. Handlers call this rather than unwrapping.
+    pub fn require_oauth(&self) -> Result<&Arc<dyn OAuthProvider>, error::ApiError> {
+        self.oauth
+            .as_ref()
+            .ok_or_else(|| error::ApiError::NotFound("google sign-in is not enabled on this server".into()))
+    }
 }
 
 #[derive(Clone)]
@@ -116,6 +149,15 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     };
     let login_limit = limit_for(limits.login_burst, limits.login_refill);
     let register_limit = limit_for(limits.register_burst, limits.register_refill);
+    // Separate buckets: starting a sign-in and completing one are different
+    // costs, and one must not exhaust the other's allowance.
+    let oauth_start_limit = limit_for(limits.login_burst, limits.login_refill);
+    let oauth_callback_limit = limit_for(limits.login_burst, limits.login_refill);
+    let oauth_register_limit = limit_for(limits.register_burst, limits.register_refill);
+    // Linking is authenticated, but every call makes the server fetch a token
+    // from Google, so it still needs a ceiling: an account must not be able to
+    // drive unbounded outbound requests.
+    let oauth_link_limit = limit_for(limits.login_burst, limits.login_refill);
     let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
 
     let api = Router::new()
@@ -124,9 +166,29 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
             post(handlers::register).layer(middleware::from_fn_with_state(register_limit, ratelimit::limit)),
         )
         .route("/login", post(handlers::login).layer(middleware::from_fn_with_state(login_limit, ratelimit::limit)))
+        .route("/capabilities", get(handlers::capabilities))
+        .route(
+            "/oauth/start",
+            post(handlers::oauth_start).layer(middleware::from_fn_with_state(oauth_start_limit, ratelimit::limit)),
+        )
+        .route(
+            "/oauth/callback",
+            post(handlers::oauth_callback)
+                .layer(middleware::from_fn_with_state(oauth_callback_limit, ratelimit::limit)),
+        )
+        .route(
+            "/oauth/register",
+            post(handlers::oauth_register)
+                .layer(middleware::from_fn_with_state(oauth_register_limit, ratelimit::limit)),
+        )
+        .route(
+            "/oauth/link",
+            post(handlers::oauth_link).layer(middleware::from_fn_with_state(oauth_link_limit, ratelimit::limit)),
+        )
         .route("/logout", post(handlers::logout))
         .route("/sessions", delete(handlers::logout_everywhere))
         .route("/me", get(handlers::me))
+        .route("/password", post(handlers::change_password))
         .route("/users/lookup", get(handlers::lookup_user))
         .route("/secrets", get(handlers::list_secrets).post(handlers::create_secret))
         .route("/secrets/{id}", get(handlers::get_secret).put(handlers::update_secret).delete(handlers::delete_secret))
@@ -139,7 +201,7 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .route("/invites/{id}/decline", post(handlers::decline_invite));
 
     Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(handlers::health))
         .nest("/api", api)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())

@@ -13,7 +13,13 @@ const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLen
 const THEME_KEY = "theme";
 const THEME_CHOICES = ["system", "light", "dark"];
 
-const state = { secrets: [], selected: null, editing: false, authMode: "login", inviteCount: 0, formFields: [] };
+const state = { secrets: [], selected: null, editing: false, authMode: "login", inviteCount: 0, formFields: [],
+  // What the server at the URL in the box offers, and the Google sign-in
+  // waiting for a passphrase, if there is one.
+  capabilities: null, google: null, user: null,
+  // Set when the server at that URL answered but speaks a protocol this build
+  // cannot use; null the rest of the time.
+  incompatible: null };
 const MOBILE_QUERY = window.matchMedia("(max-width: 720px)");
 const isMobile = () => MOBILE_QUERY.matches;
 const timers = { toast: null };
@@ -240,6 +246,8 @@ function setAuthMode(mode) {
   $("password").autocomplete = isRegister ? "new-password" : "current-password";
   $("btn-auth").textContent = isRegister ? "Create account" : "Log in";
   setError("auth-error", "");
+  // Switching tabs abandons a Google sign-in that was waiting for a passphrase.
+  if (state.google) { state.google = null; showGoogleForm(false); }
 }
 
 /// The registration token is only needed on servers that require one, so the
@@ -283,7 +291,134 @@ async function authenticate(event) {
   }
 }
 
+// ----- sign in with Google ----------------------------------------------------
+// Google only establishes who someone is. The vault key comes from the
+// passphrase either way, so every path here ends at a passphrase prompt.
+
+/// Ask the server what it offers, so the button appears only where it works.
+/// A server that cannot be reached simply has no button: there is nothing the
+/// user can do about it from this screen, and an error here would fire on
+/// every keystroke in the URL box.
+///
+/// A protocol mismatch is the exception and is shown. It means a server did
+/// answer, so it is not keystroke noise, and it is the one failure here that
+/// tells the user something they must act on: nothing on this screen will work
+/// until the app or the server is updated.
+async function refreshCapabilities() {
+  const serverUrl = $("server").value.trim() || DEFAULT_SERVER;
+  const wasIncompatible = state.incompatible;
+  try {
+    state.capabilities = await invoke("server_capabilities", { serverUrl });
+    state.incompatible = null;
+  } catch (error) {
+    state.capabilities = null;
+    state.incompatible = error?.code === "incompatible" ? String(error.message) : null;
+  }
+  // Only ever write the shared error line about this: clearing it
+  // unconditionally would wipe a sign-in error the user still needs to read.
+  if (state.incompatible) setError("auth-error", state.incompatible);
+  else if (wasIncompatible) setError("auth-error", "");
+  const offered = Boolean(state.capabilities?.google_sign_in) && !state.google;
+  $("google-block").classList.toggle("hidden", !offered);
+  $("btn-link-google").classList.toggle("hidden", !state.capabilities?.google_sign_in);
+}
+
+/// Swap the password form for the passphrase prompt, or back again.
+function showGoogleForm(show) {
+  $("auth-form").classList.toggle("hidden", show);
+  $("google-block").classList.toggle("hidden", show || !state.capabilities?.google_sign_in);
+  $("google-form").classList.toggle("hidden", !show);
+  document.querySelector(".segmented").classList.toggle("hidden", show);
+  if (!show) {
+    $("google-password").value = "";
+    $("google-registration-token").value = "";
+    setError("google-error", "");
+  }
+}
+
+async function startGoogleSignIn() {
+  setError("auth-error", "");
+  const serverUrl = $("server").value.trim() || DEFAULT_SERVER;
+  setBusy($("btn-google"), true, "Waiting for your browser…");
+  try {
+    const stage = await invoke("google_sign_in", { serverUrl });
+    remember("server", serverUrl);
+    state.google = stage;
+    const creating = stage.stage === "create_account";
+    $("auth-title").textContent = creating ? "Create your vault" : "Unlock your vault";
+    $("google-lead").textContent = creating
+      ? `Signed in to Google as ${stage.email}. Choose a passphrase to encrypt this vault — it is never sent anywhere, and nobody can reset it.`
+      : `Signed in to Google as ${stage.email}. Enter the passphrase that unlocks this vault.`;
+    $("google-password-hint").textContent = creating
+      ? `At least ${UI.minPasswordLength} characters. There is no passphrase reset.`
+      : "Google cannot unlock your vault; only this passphrase can.";
+    $("google-password").autocomplete = creating ? "new-password" : "current-password";
+    $("btn-google-submit").textContent = creating ? "Create vault" : "Unlock vault";
+    $("google-token-field").classList.toggle("hidden", !(creating && stage.registration_token_required));
+    showGoogleForm(true);
+    $("google-password").focus();
+  } catch (error) {
+    setError("auth-error", error);
+  } finally {
+    setBusy($("btn-google"), false);
+  }
+}
+
+async function submitGooglePassphrase(event) {
+  event.preventDefault();
+  setError("google-error", "");
+  const creating = state.google?.stage === "create_account";
+  const password = $("google-password").value;
+  if (!password) { setError("google-error", "Enter your passphrase."); $("google-password").focus(); return; }
+  if (creating && password.length < UI.minPasswordLength) {
+    setError("google-error", `Use at least ${UI.minPasswordLength} characters for your passphrase.`);
+    $("google-password").focus();
+    return;
+  }
+
+  const args = creating
+    ? { password, registrationToken: $("google-registration-token").value.trim() || null }
+    : { password };
+  setBusy($("btn-google-submit"), true, creating ? "Creating vault…" : "Unlocking…");
+  try {
+    const user = await invoke(creating ? "google_create_account" : "google_unlock", args);
+    remember("email", user.email);
+    state.google = null;
+    showGoogleForm(false);
+    showApp(user);
+  } catch (error) {
+    setError("google-error", error);
+    if (creating && /token/i.test(String(error?.message ?? error))) {
+      $("google-token-field").classList.remove("hidden");
+    }
+  } finally {
+    setBusy($("btn-google-submit"), false);
+  }
+}
+
+/// Abandon a Google sign-in and go back to the password form. The attempt is
+/// dropped on the Rust side the next time one starts, and the session it was
+/// holding is never installed.
+function cancelGoogleSignIn() {
+  state.google = null;
+  showGoogleForm(false);
+  setAuthMode(state.authMode);
+}
+
+async function linkGoogle() {
+  setBusy($("btn-link-google"), true);
+  try {
+    await invoke("google_link");
+    toast("Google account linked");
+  } catch (error) {
+    setError("main-error", error);
+  } finally {
+    setBusy($("btn-link-google"), false);
+  }
+}
+
 function showApp(user) {
+  state.user = user;
   $("who-email").textContent = user.email;
   $("who-server").textContent = user.server_url;
   $("who-server").title = user.server_url;
@@ -1004,6 +1139,86 @@ function renderInviteConfirm(id, info) {
   (changed ? $("btn-invite-cancel") : $("btn-invite-confirm")).focus();
 }
 
+// ----- changing the passphrase -----------------------------------------------
+
+/// Everything the passphrase derives is replaced at once, so this is a single
+/// form and a single request. For an account that signs in with Google the
+/// passphrase is not the login, and the copy says so rather than implying the
+/// Google password is involved.
+function renderPassphraseForm() {
+  closeAccountSheet({ restoreFocus: false });
+  state.selected = null;
+  state.editing = true;
+  renderList();
+  showDetailScreen();
+  const isLogin = state.user?.password_login !== false;
+  $("detail").innerHTML = `
+    <form class="card" id="passphrase-form" novalidate aria-labelledby="passphrase-title">
+      <h2 id="passphrase-title" class="card-title">${icon("lock")} Change passphrase</h2>
+      <p class="card-lead">
+        ${isLogin
+          ? "This is what encrypts your vault and what you sign in with. Every other device is signed out."
+          : "This is what encrypts your vault. You will still sign in with Google, and every other device is signed out."}
+        Your secrets stay exactly as they are &mdash; only the key protecting them changes.
+      </p>
+      <div class="field">
+        <label for="pp-current">Current passphrase</label>
+        <input id="pp-current" type="password" autocomplete="current-password" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="pp-new">New passphrase</label>
+        <input id="pp-new" type="password" autocomplete="new-password" spellcheck="false">
+        <p class="hint">At least ${UI.minPasswordLength} characters. There is no reset: forget it and the vault is gone.</p>
+      </div>
+      <div class="field">
+        <label for="pp-confirm">Repeat new passphrase</label>
+        <input id="pp-confirm" type="password" autocomplete="new-password" spellcheck="false">
+      </div>
+      <div class="error" id="pp-error" role="alert"></div>
+      <div class="actions">
+        <button type="submit" class="btn primary" id="btn-pp-save">${icon("check")} Change passphrase</button>
+        <button type="button" class="btn" id="btn-pp-cancel">Cancel</button>
+      </div>
+    </form>`;
+
+  $("btn-pp-cancel").onclick = () => { state.editing = false; renderDetail(); showListScreen(); };
+  $("passphrase-form").onsubmit = submitPassphraseChange;
+  $("pp-current").focus();
+}
+
+async function submitPassphraseChange(event) {
+  event.preventDefault();
+  setError("pp-error", "");
+  const current = $("pp-current").value;
+  const next = $("pp-new").value;
+  if (next !== $("pp-confirm").value) {
+    setError("pp-error", "The new passphrases do not match.");
+    $("pp-confirm").focus();
+    return;
+  }
+  if (next === current) {
+    setError("pp-error", "That is the passphrase you already have.");
+    $("pp-new").focus();
+    return;
+  }
+  // Re-wrapping is one key per secret, so a large vault takes a moment and
+  // the button has to say so rather than looking stuck.
+  setBusy($("btn-pp-save"), true, "Re-encrypting your keys\u2026");
+  try {
+    await invoke("change_password", { current, newPassword: next });
+    toast("Passphrase changed");
+    state.editing = false;
+    renderDetail();
+    showListScreen();
+    await refresh();
+  } catch (error) {
+    setError("pp-error", error);
+    if (error?.code === "locked") $("pp-current").focus();
+  } finally {
+    if ($("btn-pp-save")?.isConnected) setBusy($("btn-pp-save"), false);
+  }
+}
+
 // ----- create / edit form ----------------------------------------------------
 
 /// The form's extra fields live in `state.formFields` rather than in the DOM,
@@ -1194,6 +1409,16 @@ $("tab-register").onclick = () => setAuthMode("register");
 $("auth-form").onsubmit = authenticate;
 $("btn-auth-toggle-pw").onclick = () => togglePasswordInput($("password"), $("btn-auth-toggle-pw"));
 $("btn-show-token").onclick = () => showTokenField(true);
+$("btn-google").onclick = startGoogleSignIn;
+$("google-form").onsubmit = submitGooglePassphrase;
+$("btn-google-cancel").onclick = cancelGoogleSignIn;
+$("btn-google-toggle-pw").onclick = () => togglePasswordInput($("google-password"), $("btn-google-toggle-pw"));
+$("btn-link-google").onclick = () => linkGoogle();
+$("btn-change-passphrase").onclick = () => renderPassphraseForm();
+// The button belongs to whichever server is in the box, so re-ask when it
+// settles rather than on every keystroke.
+$("server").onchange = () => refreshCapabilities();
+$("server").onblur = () => refreshCapabilities();
 $("btn-logout").onclick = () => logout().catch((error) => setError("main-error", error));
 $("btn-refresh").onclick = () => { closeAccountSheet({ restoreFocus: false }); refresh(); };
 $("btn-back").onclick = goBack;
@@ -1246,6 +1471,7 @@ invoke("startup_warnings")
   // slot, which both setAuthMode and submitting the form blank.
   .then((warnings) => { if (warnings.length) showStartupWarning(warnings.join("\n")); })
   .catch((error) => showStartupWarning(`Could not read startup warnings: ${error?.message ?? error}`));
+refreshCapabilities();
 invoke("session_info")
   .then((user) => { if (user) showApp(user); })
   .catch((error) => setError("auth-error", error));

@@ -54,6 +54,39 @@
       <div class="error" id="auth-error" role="alert"></div>
       <button type="submit" class="btn primary block" id="btn-auth">Log in</button>
     </form>
+
+    <div class="auth-alt hidden" id="google-block">
+      <div class="auth-divider"><span>or</span></div>
+      <button type="button" class="btn block google" id="btn-google">
+        <svg class="ic" viewBox="0 0 18 18" aria-hidden="true"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.7-1.57 2.68-3.88 2.68-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.8.54-1.84.86-3.04.86-2.34 0-4.32-1.58-5.03-3.7H.96v2.33A9 9 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.97 10.72a5.4 5.4 0 0 1 0-3.44V4.95H.96a9 9 0 0 0 0 8.1l3.01-2.33z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.95l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"/></svg>
+        <span>Continue with Google</span>
+      </button>
+      <p class="hint">Google proves who you are. Your vault still opens with your passphrase, which Google never sees.</p>
+    </div>
+
+    <!-- Shown after the browser step: Google has identified the account, and
+         only the passphrase can produce the key that opens it. -->
+    <form id="google-form" class="hidden" novalidate>
+      <p class="auth-lead" id="google-lead"></p>
+      <div class="field">
+        <label for="google-password">Vault passphrase</label>
+        <div class="input-row">
+          <input id="google-password" type="password" autocomplete="current-password">
+          <button type="button" class="icon-btn bordered" id="btn-google-toggle-pw" aria-label="Show passphrase" aria-pressed="false" title="Show passphrase">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <p class="hint" id="google-password-hint"></p>
+      </div>
+      <div class="field hidden" id="google-token-field">
+        <label for="google-registration-token">Registration token</label>
+        <input id="google-registration-token" autocomplete="off" spellcheck="false">
+        <p class="hint">This server only creates accounts for people who have its token.</p>
+      </div>
+      <div class="error" id="google-error" role="alert"></div>
+      <button type="submit" class="btn primary block" id="btn-google-submit">Unlock vault</button>
+      <button type="button" class="link-btn block" id="btn-google-cancel">Cancel</button>
+    </form>
   </div>
   <div class="auth-foot"><span>End-to-end encrypted · Self-hosted · Open source</span>
     <div class="theme-switch" id="theme-switch-auth" role="group" aria-label="Appearance">
@@ -103,6 +136,18 @@
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>
       <span class="chip-label">Your key</span>
       <code class="fp" id="fingerprint"></code>
+    </button>
+
+    <button type="button" class="chip hidden" id="btn-link-google"
+      title="Use your Google account to sign in to this server next time. Your passphrase is still what unlocks the vault.">
+      <svg class="ic" viewBox="0 0 18 18" aria-hidden="true"><path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.92c1.7-1.57 2.68-3.88 2.68-6.62z"/><path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.26c-.8.54-1.84.86-3.04.86-2.34 0-4.32-1.58-5.03-3.7H.96v2.33A9 9 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.97 10.72a5.4 5.4 0 0 1 0-3.44V4.95H.96a9 9 0 0 0 0 8.1l3.01-2.33z"/><path fill="#EA4335" d="M9 3.58c1.32 0 2.5.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.95l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"/></svg>
+      <span class="chip-label">Link Google</span>
+    </button>
+
+    <button type="button" class="chip" id="btn-change-passphrase"
+      title="Change the passphrase this vault is encrypted with.">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="4" y="11" width="16" height="10" rx="2"/></svg>
+      <span class="chip-label">Change passphrase</span>
     </button>
 
     <div class="theme-switch" id="theme-switch-app" role="group" aria-label="Appearance">

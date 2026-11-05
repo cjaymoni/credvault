@@ -4,6 +4,7 @@
 
 mod client;
 mod known_keys;
+mod oauth_listener;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -15,16 +16,20 @@ use std::time::Duration;
 use credvault_core::aead::KEY_LEN;
 use credvault_core::api::*;
 use credvault_core::identity::{normalize_fingerprint, FINGERPRINT_HEX_LEN};
+use credvault_core::kdf::ServerAddress;
 use credvault_core::secret::CustomField;
 use credvault_core::{kdf, password, secret, Identity, MasterKey, PublicKey, SecretKey, SecretPayload, WrappedKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_opener::OpenerExt;
 use zeroize::Zeroizing;
 
 use client::{ApiClient, ClientError};
 use known_keys::{KeyStatus, KnownKeys};
+use oauth_listener::RedirectListener;
 
 /// How long a copied password stays on the clipboard before it is wiped.
 const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(30);
@@ -39,6 +44,8 @@ struct UserSummary {
     server_url: String,
     /// Shown so the user can read it to people who want to share with them.
     fingerprint: String,
+    /// Whether changing the passphrase also changes how this account signs in.
+    password_login: bool,
 }
 
 /// A secret with everything except the password decrypted for display. If
@@ -234,6 +241,10 @@ struct Session {
     self_wrap_key: Zeroizing<[u8; KEY_LEN]>,
     /// Decrypted secret keys from the last list, so reveal/update need no re-unwrap.
     keys: HashMap<i64, LoadedKey>,
+    /// Whether the passphrase is also this account's server credential. False
+    /// for an account created through Google, whose passphrase derives the
+    /// vault keys but is not a login.
+    password_login: bool,
 }
 
 /// A secret's unwrapped key with the server's key version it came from. Writes
@@ -244,8 +255,43 @@ struct LoadedKey {
     version: i64,
 }
 
+/// A Google sign-in that has got as far as the server but cannot finish
+/// until the user supplies a passphrase: Google proves who they are, and only
+/// the passphrase produces the key that opens the vault.
+enum PendingGoogle {
+    /// The account exists. The passphrase decrypts the stored private key.
+    Unlock { api: ApiClient, session: SessionResponse },
+    /// No account yet. The passphrase becomes a new master key, and the key
+    /// pair derived from it is what finally creates the account.
+    CreateAccount { api: ApiClient, ticket: String, email: String },
+}
+
+impl PendingGoogle {
+    fn email(&self) -> &str {
+        match self {
+            Self::Unlock { session, .. } => &session.user.email,
+            Self::CreateAccount { email, .. } => email,
+        }
+    }
+}
+
+/// What the UI should ask for next after the browser step.
+#[derive(Clone, Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+enum GoogleSignInStage {
+    /// Existing account: ask for the passphrase that unlocks it.
+    Unlock { email: String },
+    /// New account: ask for a passphrase to create, and a registration token
+    /// if the server wants one.
+    CreateAccount { email: String, registration_token_required: bool },
+}
+
 struct AppState {
     session: Mutex<Option<Session>>,
+    /// Set between the browser step of a Google sign-in and the passphrase
+    /// that completes it. Held here rather than handed to the UI so the
+    /// server session token and the registration ticket stay in Rust.
+    pending_google: Mutex<Option<PendingGoogle>>,
     known_keys: Mutex<KnownKeys>,
     known_keys_path: PathBuf,
     /// Bumped on every copy; a clear task only fires if it is still current.
@@ -258,6 +304,7 @@ impl AppState {
         let (known_keys, warning) = load_known_keys_or_recover(&known_keys_path)?;
         Ok(Self {
             session: Mutex::new(None),
+            pending_google: Mutex::new(None),
             known_keys: Mutex::new(known_keys),
             known_keys_path,
             clipboard_generation: AtomicU64::new(0),
@@ -327,6 +374,7 @@ impl From<ClientError> for CommandError {
             ClientError::Conflict(_) => "conflict",
             ClientError::Unauthorized => "unauthorized",
             ClientError::InvalidUrl(_) => "invalid_url",
+            ClientError::Incompatible(_) => "incompatible",
         };
         Self::new(code, error.to_string())
     }
@@ -336,6 +384,24 @@ type CommandResult<T> = Result<T, CommandError>;
 
 fn user_facing(error: credvault_core::CryptoError) -> CommandError {
     CommandError::new("crypto", error.to_string())
+}
+
+/// Explain why a vault would not open.
+///
+/// A wrong passphrase and a vault written under a scheme this build does not
+/// implement are different problems with different answers, and only the first
+/// is fixed by typing more carefully. Collapsing both into "wrong passphrase"
+/// would send someone hunting for a typo in a passphrase that was correct;
+/// collapsing both into "your data may be corrupted" is worse still. The
+/// format tags carried by every stored blob are what make the two tellable
+/// apart, so this is where that distinction has to be spent.
+fn unlock_failure(error: credvault_core::CryptoError, wrong_passphrase: &str) -> CommandError {
+    use credvault_core::CryptoError;
+    match error {
+        CryptoError::Decrypt => CommandError::new("locked", wrong_passphrase),
+        CryptoError::NewerFormat { .. } | CryptoError::UnknownFormat { .. } => user_facing(error),
+        other => CommandError::new("locked", format!("could not unlock your keys: {other}")),
+    }
 }
 
 /// Derive the master key on a blocking thread; Argon2 takes a few hundred ms.
@@ -352,35 +418,47 @@ fn with_session<T>(state: &AppState, f: impl FnOnce(&mut Session) -> CommandResu
     f(session)
 }
 
+/// Open a client for `server` and refuse to go on if this build and that
+/// server do not speak the same protocol.
+///
+/// Every command that reaches a server for the first time goes through here,
+/// so a mismatch is reported once, plainly, before a passphrase is typed or a
+/// credential is sent — rather than as whatever confusing failure the first
+/// real request happens to produce.
+async fn connect(server: &ServerAddress) -> CommandResult<ApiClient> {
+    let api = ApiClient::new(server.as_str())?;
+    api.check_protocol().await?;
+    Ok(api)
+}
+
 /// Clone the API handle out of the session so async work does not hold the lock.
 fn api(state: &AppState) -> CommandResult<ApiClient> {
     with_session(state, |s| Ok(s.api.clone()))
 }
 
-/// Accept `http://` only for loopback hosts: the auth hash is a reusable login
-/// credential and must never cross a network in the clear.
-fn normalize_server_url(url: &str) -> CommandResult<String> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let parsed = url::Url::parse(trimmed).map_err(|e| format!("invalid server URL: {e}"))?;
+/// Canonicalise the server address and apply this client's transport policy.
+///
+/// Canonical form comes from [`ServerAddress`], which is also what the auth
+/// hash is derived from, so the address shown in the UI, the address keys are
+/// pinned against, and the address the credential is bound to are the same
+/// string. On top of that: `http://` only for loopback hosts, because the auth
+/// hash is a reusable login credential and must never cross a network in the
+/// clear.
+fn normalize_server_url(url: &str) -> CommandResult<ServerAddress> {
+    let address = ServerAddress::parse(url).map_err(user_facing)?;
+    let parsed = url::Url::parse(address.as_str()).map_err(|e| format!("invalid server URL: {e}"))?;
     let is_loopback = match parsed.host() {
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => return Err("server URL must include a host".into()),
     };
-    match parsed.scheme() {
-        "https" => {}
-        "http" if is_loopback => {}
-        "http" => {
-            return Err("http:// is only allowed for localhost; use https:// for a remote server so your login \
-                        credential is not sent in the clear"
-                .into())
-        }
-        other => return Err(format!("unsupported URL scheme {other:?}; use https://").into()),
+    if parsed.scheme() == "http" && !is_loopback {
+        return Err("http:// is only allowed for localhost; use https:// for a remote server so your login \
+                    credential is not sent in the clear"
+            .into());
     }
-    // The parsed form lower-cases the scheme and host, so the same server typed
-    // two ways shares one set of pinned keys.
-    Ok(parsed.to_string().trim_end_matches('/').to_string())
+    Ok(address)
 }
 
 // ----- account commands -------------------------------------------------------
@@ -397,13 +475,15 @@ async fn register(
     // The length floor applies here and nowhere else: logging in must keep
     // working for an account created under an older, shorter floor.
     kdf::validate_new_password(&password).map_err(user_facing)?;
+    // Before the key derivation, not after: Argon2 takes a few hundred ms, and
+    // there is no reason to spend them on a server that cannot be used.
+    let api = connect(&server_url).await?;
     let master = derive_master(password, email.clone()).await?;
     let identity = Identity::generate();
-    let api = ApiClient::new(&server_url)?;
     let session = api
         .register(&RegisterRequest {
             email: email.clone(),
-            auth_hash: master.auth_hash(),
+            auth_hash: master.auth_hash(&server_url),
             public_key: identity.public_key().clone(),
             encrypted_private_key: identity.encrypt_private_key(&master.private_key_encryption_key()),
             registration_token: registration_token.filter(|token| !token.trim().is_empty()),
@@ -416,6 +496,7 @@ async fn register(
         session.user.email,
         identity,
         master.self_wrap_key(),
+        session.user.password_login,
     )
 }
 
@@ -427,14 +508,12 @@ async fn login(
     password: Zeroizing<String>,
 ) -> CommandResult<UserSummary> {
     let server_url = normalize_server_url(&server_url)?;
+    let api = connect(&server_url).await?;
     let master = derive_master(password, email.clone()).await?;
-    let api = ApiClient::new(&server_url)?;
-    let session = api.login(&LoginRequest { email, auth_hash: master.auth_hash() }).await?;
+    let session = api.login(&LoginRequest { email, auth_hash: master.auth_hash(&server_url) }).await?;
     let identity =
         Identity::decrypt_private_key(&master.private_key_encryption_key(), &session.user.encrypted_private_key)
-            .map_err(|_| {
-                CommandError::new("locked", "could not unlock your keys; the account data may be corrupted")
-            })?;
+            .map_err(|error| unlock_failure(error, "that password does not unlock this vault"))?;
     install_session(
         &state,
         api.with_token(&session.token),
@@ -442,6 +521,7 @@ async fn login(
         session.user.email,
         identity,
         master.self_wrap_key(),
+        session.user.password_login,
     )
 }
 
@@ -450,6 +530,7 @@ fn summary_of(session: &Session) -> UserSummary {
         email: session.email.clone(),
         server_url: session.api.base_url().to_string(),
         fingerprint: session.identity.public_key().fingerprint(),
+        password_login: session.password_login,
     }
 }
 
@@ -460,8 +541,9 @@ fn install_session(
     email: String,
     identity: Identity,
     self_wrap_key: Zeroizing<[u8; KEY_LEN]>,
+    password_login: bool,
 ) -> CommandResult<UserSummary> {
-    let session = Session { api, user_id, email, identity, self_wrap_key, keys: HashMap::new() };
+    let session = Session { api, user_id, email, identity, self_wrap_key, keys: HashMap::new(), password_login };
     let summary = summary_of(&session);
     let mut guard = state.session.lock().map_err(|_| "session lock poisoned".to_string())?;
     *guard = Some(session);
@@ -480,6 +562,202 @@ async fn logout(state: State<'_, AppState>) -> CommandResult<()> {
     }
     let mut guard = state.session.lock().map_err(|_| "session lock poisoned".to_string())?;
     *guard = None;
+    drop(guard);
+    clear_pending_google(&state);
+    Ok(())
+}
+
+// ----- sign in with Google ----------------------------------------------------
+
+// Google proves who someone is; it never produces key material. Every path
+// through this section therefore ends with a passphrase prompt, and the master
+// key is derived on this device exactly as it is for a password login.
+
+fn pending_lock(state: &AppState) -> CommandResult<std::sync::MutexGuard<'_, Option<PendingGoogle>>> {
+    state.pending_google.lock().map_err(|_| "pending sign-in lock poisoned".to_string().into())
+}
+
+fn clear_pending_google(state: &AppState) {
+    if let Ok(mut guard) = state.pending_google.lock() {
+        *guard = None;
+    }
+}
+
+/// Run the browser half of a sign-in and hand back the code it produced.
+/// Shared by signing in and by linking, which differ only in purpose.
+async fn authorize_with_google(
+    app: &AppHandle,
+    api: &ApiClient,
+    purpose: OAuthPurpose,
+) -> CommandResult<OAuthCallbackRequest> {
+    let listener = RedirectListener::bind()
+        .await
+        .map_err(|e| CommandError::new("oauth", format!("could not listen for the sign-in response: {e}")))?;
+    let started =
+        api.oauth_start(&OAuthStartRequest { redirect_uri: listener.redirect_uri().to_string(), purpose }).await?;
+
+    // The system browser, not the app webview: the user should be typing a
+    // Google password into Google's own window, where they can see the URL.
+    app.opener()
+        .open_url(started.authorization_url.clone(), None::<&str>)
+        .map_err(|e| CommandError::new("oauth", format!("could not open your browser: {e}")))?;
+
+    let code = listener.wait_for_code(&started.state).await.map_err(|e| CommandError::new("oauth", e.to_string()))?;
+    // `app_secret` came back over this client's own HTTPS connection and was
+    // never in the URL the browser followed, so returning it with the code is
+    // what proves this app started the flow.
+    Ok(OAuthCallbackRequest { state: started.state, app_secret: started.app_secret, code })
+}
+
+/// What the server at `server_url` supports. Called before the sign-in screen
+/// is drawn so the Google button only appears where it works.
+#[tauri::command]
+async fn server_capabilities(server_url: String) -> CommandResult<Capabilities> {
+    let server_url = normalize_server_url(&server_url)?;
+    Ok(connect(&server_url).await?.capabilities().await?)
+}
+
+/// Do the browser half of a sign-in and report what the user must supply next.
+#[tauri::command]
+async fn google_sign_in(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server_url: String,
+) -> CommandResult<GoogleSignInStage> {
+    let server_url = normalize_server_url(&server_url)?;
+    let api = connect(&server_url).await?;
+    let capabilities = api.capabilities().await?;
+    if !capabilities.google_sign_in {
+        return Err(CommandError::new("oauth", "this server does not offer sign in with Google"));
+    }
+
+    // Any earlier attempt is void the moment a new one starts.
+    clear_pending_google(&state);
+    let callback = authorize_with_google(&app, &api, OAuthPurpose::SignIn).await?;
+
+    let (pending, stage) = match api.oauth_callback(&callback).await? {
+        OAuthCallbackResponse::SignedIn(session) => {
+            let email = session.user.email.clone();
+            let api = api.with_token(&session.token);
+            (PendingGoogle::Unlock { api, session }, GoogleSignInStage::Unlock { email })
+        }
+        OAuthCallbackResponse::RegistrationRequired { ticket, email } => (
+            PendingGoogle::CreateAccount { api, ticket, email: email.clone() },
+            GoogleSignInStage::CreateAccount {
+                email,
+                registration_token_required: capabilities.registration_token_required,
+            },
+        ),
+    };
+    *pending_lock(&state)? = Some(pending);
+    Ok(stage)
+}
+
+/// The address the pending sign-in is for. It is the key-derivation salt, so
+/// the passphrase must be stretched against exactly this string.
+fn pending_google_email(state: &AppState) -> CommandResult<String> {
+    let guard = pending_lock(state)?;
+    guard
+        .as_ref()
+        .map(|pending| pending.email().to_string())
+        .ok_or_else(|| CommandError::new("oauth", "that sign-in is no longer in progress; start it again"))
+}
+
+/// Deriving the master key takes long enough for another sign-in to have
+/// replaced the pending one. Finishing against that one would use a key
+/// derived from the wrong salt: on an unlock it would simply fail, but on a
+/// sign-up it would create an account whose passphrase never opens it again.
+fn still_the_same_sign_in(pending: &PendingGoogle, email: &str) -> CommandResult<()> {
+    if pending.email() != email {
+        return Err(CommandError::new("oauth", "another sign-in started in the meantime; try again"));
+    }
+    Ok(())
+}
+
+/// Finish signing in to an account that already exists: decrypt the stored
+/// private key with the passphrase.
+#[tauri::command]
+async fn google_unlock(state: State<'_, AppState>, password: Zeroizing<String>) -> CommandResult<UserSummary> {
+    let email = pending_google_email(&state)?;
+    let master = derive_master(password, email.clone()).await?;
+
+    // The pending attempt stays in place until the passphrase works, so a
+    // typo costs a retry rather than another trip through the browser.
+    let unlocked = {
+        let guard = pending_lock(&state)?;
+        let Some(pending @ PendingGoogle::Unlock { api, session }) = guard.as_ref() else {
+            return Err(CommandError::new("oauth", "that sign-in is no longer in progress; start it again"));
+        };
+        still_the_same_sign_in(pending, &email)?;
+        let identity =
+            Identity::decrypt_private_key(&master.private_key_encryption_key(), &session.user.encrypted_private_key)
+                .map_err(|error| unlock_failure(error, "that passphrase does not unlock this vault"))?;
+        (api.clone(), session.user.id, session.user.email.clone(), identity, session.user.password_login)
+    };
+
+    clear_pending_google(&state);
+    let (api, user_id, email, identity, password_login) = unlocked;
+    install_session(&state, api, user_id, email, identity, master.self_wrap_key(), password_login)
+}
+
+/// Create the account a first Google sign-in asked for. The key pair is
+/// generated here and the private half leaves this device only under a key
+/// derived from the passphrase.
+#[tauri::command]
+async fn google_create_account(
+    state: State<'_, AppState>,
+    password: Zeroizing<String>,
+    registration_token: Option<String>,
+) -> CommandResult<UserSummary> {
+    kdf::validate_new_password(&password).map_err(user_facing)?;
+    let email = pending_google_email(&state)?;
+    let master = derive_master(password, email.clone()).await?;
+
+    let (api, ticket) = {
+        let guard = pending_lock(&state)?;
+        let Some(pending @ PendingGoogle::CreateAccount { api, ticket, .. }) = guard.as_ref() else {
+            return Err(CommandError::new("oauth", "that sign-up is no longer in progress; start it again"));
+        };
+        still_the_same_sign_in(pending, &email)?;
+        (api.clone(), ticket.clone())
+    };
+
+    let identity = Identity::generate();
+    let created = api
+        .oauth_register(&OAuthRegisterRequest {
+            ticket,
+            public_key: identity.public_key().clone(),
+            encrypted_private_key: identity.encrypt_private_key(&master.private_key_encryption_key()),
+            registration_token: registration_token.filter(|token| !token.trim().is_empty()),
+        })
+        .await?;
+
+    clear_pending_google(&state);
+    install_session(
+        &state,
+        api.with_token(&created.token),
+        created.user.id,
+        created.user.email.clone(),
+        identity,
+        master.self_wrap_key(),
+        created.user.password_login,
+    )
+}
+
+/// Bind a Google account to the credvault account already signed in, so it can
+/// use the button next time.
+///
+/// The account email is left as it is: it is the salt the vault key comes
+/// from, and changing it would make every stored secret undecryptable.
+#[tauri::command]
+async fn google_link(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
+    let api = api(&state)?;
+    let capabilities = api.capabilities().await?;
+    if !capabilities.google_sign_in {
+        return Err(CommandError::new("oauth", "this server does not offer sign in with Google"));
+    }
+    let callback = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
+    api.oauth_link(&callback).await?;
     Ok(())
 }
 
@@ -506,6 +784,94 @@ fn ui_constants() -> UiConstants {
         max_label_length: secret::MAX_LABEL_LEN,
         max_field_length: secret::MAX_FIELD_LEN,
     }
+}
+
+/// Change the passphrase this vault is derived from.
+///
+/// Everything the old passphrase produced is replaced at once, because half a
+/// change is a vault nobody can open: the server either takes all of it or
+/// none. The payloads are not touched — each secret's key is random and
+/// unchanged, so only the owner's wrapping of it is redone — and neither is
+/// the key pair, so secrets shared *with* this account keep working.
+///
+/// # Errors
+/// `locked` if the current passphrase is wrong, `conflict` if the vault
+/// changed while re-wrapping (refresh and try again), `crypto` if the new
+/// passphrase fails the length floor.
+#[tauri::command]
+async fn change_password(
+    state: State<'_, AppState>,
+    current: Zeroizing<String>,
+    new_password: Zeroizing<String>,
+) -> CommandResult<()> {
+    kdf::validate_new_password(&new_password).map_err(user_facing)?;
+    let (api, email, server_url) = with_session(&state, |session| {
+        Ok((session.api.clone(), session.email.clone(), session.api.base_url().to_string()))
+    })?;
+    let server = normalize_server_url(&server_url)?;
+
+    let old_master = derive_master(current, email.clone()).await?;
+    // Checked here rather than left to the server, so a typo costs one local
+    // comparison instead of a round trip that also re-wraps every key.
+    let matches_session: bool = with_session(&state, |session| {
+        Ok(old_master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref()).into())
+    })?;
+    if !matches_session {
+        return Err(CommandError::new("locked", "that is not your current passphrase"));
+    }
+    let new_master = derive_master(new_password, email).await?;
+
+    // Re-wrap against what the server has now. Anything that moves in the
+    // meantime is caught by the key version the server checks.
+    let views = api.list_secrets().await?;
+    let rewrapped_keys = rewrap_owned(&views, &old_master, &new_master)?;
+
+    let identity_key = with_session(&state, |session| {
+        Ok(session.identity.encrypt_private_key(&new_master.private_key_encryption_key()))
+    })?;
+    let password_login = with_session(&state, |session| Ok(session.password_login))?;
+    let session = api
+        .change_password(&ChangePasswordRequest {
+            current_auth_hash: password_login.then(|| old_master.auth_hash(&server)),
+            new_auth_hash: password_login.then(|| new_master.auth_hash(&server)),
+            encrypted_private_key: identity_key,
+            rewrapped_keys,
+        })
+        .await?;
+
+    // Every other device was signed out, and this one holds a new token and a
+    // new self-wrap key. Cached secret keys stay valid — they did not change —
+    // but they are dropped rather than reasoned about.
+    with_session(&state, |current| {
+        current.api = api.with_token(&session.token);
+        current.self_wrap_key = new_master.self_wrap_key();
+        current.keys.clear();
+        Ok(())
+    })
+}
+
+/// Unwrap each owned secret's key with the old self-wrap key and wrap it again
+/// with the new one. Secrets shared with this account are skipped: their copies
+/// are sealed to the key pair, which does not change.
+fn rewrap_owned(views: &[SecretView], old: &MasterKey, new: &MasterKey) -> CommandResult<Vec<RewrappedKey>> {
+    let old_wrap = old.self_wrap_key();
+    let new_wrap = new.self_wrap_key();
+    let mut rewrapped = Vec::new();
+    for view in views.iter().filter(|view| view.is_owner) {
+        let WrappedKey::Owner(sealed) = &view.wrapped_key else {
+            return Err(CommandError::new(
+                "untrusted_key",
+                format!("the server returned a key copy for \"{}\" that you could not have made", view.name),
+            ));
+        };
+        let key = SecretKey::unwrap_owner(&old_wrap, sealed).map_err(user_facing)?;
+        rewrapped.push(RewrappedKey {
+            secret_id: view.id,
+            key_version: view.key_version,
+            wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&new_wrap)),
+        });
+    }
+    Ok(rewrapped)
 }
 
 // ----- secret commands --------------------------------------------------------
@@ -1077,6 +1443,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -1087,6 +1454,12 @@ pub fn run() {
             register,
             login,
             logout,
+            server_capabilities,
+            google_sign_in,
+            google_unlock,
+            google_create_account,
+            google_link,
+            change_password,
             session_info,
             startup_warnings,
             ui_constants,
@@ -1118,15 +1491,13 @@ mod tests {
 
     #[test]
     fn server_url_requires_https_except_on_loopback() {
-        assert_eq!(normalize_server_url(" https://vault.example.com/ ").unwrap(), "https://vault.example.com");
-        assert_eq!(
-            normalize_server_url("https://vault.example.com:8443/base/").unwrap(),
-            "https://vault.example.com:8443/base"
-        );
-        assert_eq!(normalize_server_url("http://127.0.0.1:8787").unwrap(), "http://127.0.0.1:8787");
-        assert_eq!(normalize_server_url("http://LocalHost:8787").unwrap(), "http://localhost:8787");
-        assert_eq!(normalize_server_url("HTTPS://Vault.Example.com").unwrap(), "https://vault.example.com");
-        assert_eq!(normalize_server_url("http://[::1]:8787").unwrap(), "http://[::1]:8787");
+        let canonical = |url: &str| normalize_server_url(url).unwrap().as_str().to_string();
+        assert_eq!(canonical(" https://vault.example.com/ "), "https://vault.example.com");
+        assert_eq!(canonical("https://vault.example.com:8443/base/"), "https://vault.example.com:8443/base");
+        assert_eq!(canonical("http://127.0.0.1:8787"), "http://127.0.0.1:8787");
+        assert_eq!(canonical("http://LocalHost:8787"), "http://localhost:8787");
+        assert_eq!(canonical("HTTPS://Vault.Example.com"), "https://vault.example.com");
+        assert_eq!(canonical("http://[::1]:8787"), "http://[::1]:8787");
 
         let remote = normalize_server_url("http://vault.example.com").unwrap_err();
         assert!(remote.message.contains("https://"), "{remote}");
@@ -1138,6 +1509,48 @@ mod tests {
         assert!(normalize_server_url("https://").is_err());
     }
 
+    /// The address the UI shows, the address keys are pinned against and the
+    /// address the credential is bound to must be one string, or a user who
+    /// types the same server differently is locked out of their own account.
+    #[test]
+    fn the_credential_is_bound_to_the_canonical_address() {
+        let master = MasterKey::derive("correct horse battery", "kat@example.com").unwrap();
+        let typed = normalize_server_url("HTTPS://Vault.Example.com/").unwrap();
+        let plain = normalize_server_url("https://vault.example.com").unwrap();
+        assert_eq!(master.auth_hash(&typed), master.auth_hash(&plain));
+
+        let elsewhere = normalize_server_url("https://vault.example.org").unwrap();
+        assert_ne!(master.auth_hash(&typed), master.auth_hash(&elsewhere));
+    }
+
+    /// The whole point of tagging stored blobs: someone whose passphrase is
+    /// correct must not be told it is wrong, and must not be told their data
+    /// is corrupt either, when the real problem is a scheme this build cannot
+    /// run.
+    #[test]
+    fn a_vault_from_another_scheme_is_not_reported_as_a_bad_passphrase() {
+        use credvault_core::CryptoError;
+
+        let wrong_key = unlock_failure(CryptoError::Decrypt, "that password does not unlock this vault");
+        assert_eq!(wrong_key.code, "locked");
+        assert_eq!(wrong_key.message, "that password does not unlock this vault");
+
+        for error in [
+            CryptoError::NewerFormat { what: "vault key", found: 2 },
+            CryptoError::UnknownFormat { what: "vault key", found: 7 },
+        ] {
+            let reported = unlock_failure(error, "that password does not unlock this vault");
+            assert_ne!(reported.code, "locked", "{reported:?}");
+            assert!(reported.message.contains("vault key"), "{reported:?}");
+            assert!(!reported.message.contains("password"), "{reported:?}");
+        }
+
+        // Anything else is still a failure to unlock, and still says so.
+        let malformed = unlock_failure(CryptoError::Encoding("private key must be 32 bytes".into()), "wrong password");
+        assert_eq!(malformed.code, "locked");
+        assert!(malformed.message.contains("32 bytes"), "{malformed:?}");
+    }
+
     fn test_session(identity: Identity) -> Session {
         Session {
             api: ApiClient::new("http://localhost:1").unwrap(),
@@ -1146,6 +1559,7 @@ mod tests {
             identity,
             self_wrap_key: Zeroizing::new(credvault_core::aead::random_bytes()),
             keys: HashMap::new(),
+            password_login: true,
         }
     }
 
@@ -1332,6 +1746,25 @@ mod tests {
         assert_eq!(edited[1].value, "SECOND-code", "the deleted row's value must not be the one kept");
         assert_eq!(edited[1].id, "cc03");
         assert!(edited[1].secret && !edited[0].secret);
+    }
+
+    /// The stage names are a contract with the sign-in screen: it picks which
+    /// prompt to show from `stage`, so renaming a variant here silently breaks
+    /// the flow rather than failing to compile.
+    #[test]
+    fn the_sign_in_stage_tells_the_ui_which_prompt_to_show() {
+        let unlock = serde_json::to_value(GoogleSignInStage::Unlock { email: "kat@example.com".into() }).unwrap();
+        assert_eq!(unlock["stage"], "unlock");
+        assert_eq!(unlock["email"], "kat@example.com");
+
+        let create = serde_json::to_value(GoogleSignInStage::CreateAccount {
+            email: "kat@example.com".into(),
+            registration_token_required: true,
+        })
+        .unwrap();
+        assert_eq!(create["stage"], "create_account");
+        assert_eq!(create["email"], "kat@example.com");
+        assert_eq!(create["registration_token_required"], true);
     }
 
     #[test]

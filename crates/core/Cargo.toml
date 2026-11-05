@@ -18,3 +18,5 @@ chrono = { version = "0.4", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Canonicalising the server address that the auth hash is bound to.
+url = "2"

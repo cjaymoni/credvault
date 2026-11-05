@@ -3,7 +3,9 @@
 
 use std::net::SocketAddr;
 
+use chrono::Utc;
 use credvault_core::api::MAX_BLOB_BYTES;
+use credvault_core::kdf::ServerAddress;
 use credvault_core::secret::CustomField;
 use credvault_core::{Identity, MasterKey, PublicKey, Sealed, SecretKey, SecretPayload, WrappedKey};
 use credvault_server::api::*;
@@ -15,6 +17,9 @@ use zeroize::Zeroizing;
 
 struct TestServer {
     base: String,
+    /// The address a user would type, which the auth hash is bound to. `base`
+    /// is this plus the `/api` prefix the client adds.
+    address: ServerAddress,
     client: Client,
     pool: SqlitePool,
     _dir: tempfile::TempDir,
@@ -33,7 +38,134 @@ async fn spawn_with(config: ServerConfig) -> TestServer {
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
     });
-    TestServer { base: format!("http://{addr}/api"), client: Client::new(), pool, _dir: dir }
+    TestServer {
+        base: format!("http://{addr}/api"),
+        address: ServerAddress::parse(&format!("http://{addr}")).unwrap(),
+        client: Client::new(),
+        pool,
+        _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn health_reports_the_protocol_without_a_session() {
+    let server = spawn().await;
+    // Outside /api, and no credential of any kind.
+    let response = Client::new().get(format!("{}/health", server.address)).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let health: Health = response.json().await.unwrap();
+    assert_eq!(health.status, "ok");
+    assert_eq!(health.protocol, PROTOCOL_VERSION);
+    assert_eq!(health.min_client_protocol, MIN_CLIENT_PROTOCOL);
+    // A client built from this source can talk to it.
+    check_protocol(&health).expect("a server and client from one tree must agree");
+}
+
+/// Fill an account to one row below a quota by writing straight to the
+/// database. Going through the API a thousand times would spend a thousand
+/// Argon2-free but encryption-bound round trips to test an off-by-one.
+async fn fill_secrets(server: &TestServer, owner_id: i64, rows: i64) {
+    let now = Utc::now();
+    for i in 0..rows {
+        sqlx::query("INSERT INTO secrets (owner_id, name, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(owner_id)
+            .bind(format!("filler {i}"))
+            .bind("{}")
+            .bind(now)
+            .bind(now)
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_account_cannot_grow_past_its_secret_quota() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+
+    fill_secrets(&server, alice.id, MAX_SECRETS_PER_ACCOUNT - 1).await;
+    // The last one under the cap still goes in.
+    let key = SecretKey::generate();
+    let body = CreateSecretRequest {
+        name: "the last one".into(),
+        payload: key.encrypt("the last one", &payload()).unwrap(),
+        wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&alice.self_wrap_key)),
+    };
+    let response = server.req(Method::POST, "/secrets", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // The next is refused, and says why.
+    let body = CreateSecretRequest {
+        name: "one too many".into(),
+        payload: key.encrypt("one too many", &payload()).unwrap(),
+        wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&alice.self_wrap_key)),
+    };
+    let response = server.req(Method::POST, "/secrets", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let message = error_text(response).await;
+    assert!(message.contains(&MAX_SECRETS_PER_ACCOUNT.to_string()), "{message}");
+
+    // Nothing partial was written, and another account is unaffected.
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM secrets WHERE owner_id = ?")
+        .bind(alice.id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, MAX_SECRETS_PER_ACCOUNT);
+    let bob = register(&server, "bob@example.com", "correct horse battery").await;
+    server.create_secret(&bob, "bob's own", &payload()).await;
+}
+
+#[tokio::test]
+async fn an_account_cannot_grow_past_its_pending_invite_quota() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let bob = register(&server, "bob@example.com", "correct horse battery").await;
+
+    // One secret per invite, because an invite is unique per secret and
+    // invitee. Rows are written directly; only the last invite goes through
+    // the API, which is where the quota is enforced.
+    let now = Utc::now();
+    for i in 0..MAX_PENDING_INVITES_PER_ACCOUNT {
+        sqlx::query("INSERT INTO secrets (owner_id, name, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(alice.id)
+            .bind(format!("secret {i}"))
+            .bind("{}")
+            .bind(now)
+            .bind(now)
+            .execute(&server.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO invites (secret_id, inviter_id, invitee_id, wrapped_key, message, created_at) \
+             VALUES ((SELECT MAX(id) FROM secrets), ?, ?, ?, '', ?)",
+        )
+        .bind(alice.id)
+        .bind(bob.id)
+        .bind("{}")
+        .bind(now)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+
+    let (id, key) = server.create_secret(&alice, "one more", &payload()).await;
+    let wrapped = key.wrap_for(bob.identity.public_key()).unwrap();
+    let response = server
+        .req(Method::POST, &format!("/secrets/{id}/invites"), &alice)
+        .json(&InviteRequest {
+            email: bob.email.clone(),
+            fingerprint: bob.identity.public_key().fingerprint(),
+            wrapped_key: wrapped,
+            message: String::new(),
+            key_version: 0,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(error_text(response).await.contains(&MAX_PENDING_INVITES_PER_ACCOUNT.to_string()));
 }
 
 struct Account {
@@ -45,14 +177,14 @@ struct Account {
     self_wrap_key: Zeroizing<[u8; 32]>,
 }
 
-fn register_body(email: &str, password: &str, identity: &Identity) -> RegisterRequest {
-    register_body_from(&MasterKey::derive(password, email).unwrap(), email, identity)
+fn register_body(server: &TestServer, email: &str, password: &str, identity: &Identity) -> RegisterRequest {
+    register_body_from(server, &MasterKey::derive(password, email).unwrap(), email, identity)
 }
 
-fn register_body_from(master: &MasterKey, email: &str, identity: &Identity) -> RegisterRequest {
+fn register_body_from(server: &TestServer, master: &MasterKey, email: &str, identity: &Identity) -> RegisterRequest {
     RegisterRequest {
         email: email.to_string(),
-        auth_hash: master.auth_hash(),
+        auth_hash: master.auth_hash(&server.address),
         public_key: identity.public_key().clone(),
         encrypted_private_key: identity.encrypt_private_key(&master.private_key_encryption_key()),
         registration_token: None,
@@ -63,7 +195,7 @@ fn register_body_from(master: &MasterKey, email: &str, identity: &Identity) -> R
 async fn register(server: &TestServer, email: &str, password: &str) -> Account {
     let identity = Identity::generate();
     let master = MasterKey::derive(password, email).unwrap();
-    let body = register_body_from(&master, email, &identity);
+    let body = register_body_from(server, &master, email, &identity);
     let response = server.client.post(format!("{}/register", server.base)).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let session: SessionResponse = response.json().await.unwrap();
@@ -246,7 +378,7 @@ async fn register_login_and_recover_identity() {
     assert_eq!(alice.email, "alice@example.com");
 
     let master = MasterKey::derive("alice-password", "alice@example.com").unwrap();
-    let response = login(&server, "ALICE@example.com", master.auth_hash()).await;
+    let response = login(&server, "ALICE@example.com", master.auth_hash(&server.address)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let session: SessionResponse = response.json().await.unwrap();
     let identity =
@@ -256,7 +388,10 @@ async fn register_login_and_recover_identity() {
 
     // Wrong password and unknown email both get the same 401.
     let wrong = MasterKey::derive("wrong-password", "alice@example.com").unwrap();
-    for (email, hash) in [("alice@example.com", wrong.auth_hash()), ("nobody@example.com", master.auth_hash())] {
+    for (email, hash) in [
+        ("alice@example.com", wrong.auth_hash(&server.address)),
+        ("nobody@example.com", master.auth_hash(&server.address)),
+    ] {
         assert_eq!(login(&server, email, hash).await.status(), StatusCode::UNAUTHORIZED);
     }
     // A malformed auth hash is rejected before any work is done.
@@ -274,7 +409,7 @@ async fn register_login_and_recover_identity() {
 async fn duplicate_email_rejected() {
     let server = spawn().await;
     register(&server, "dup@example.com", "dup-password").await;
-    let body = register_body("DUP@example.com", "other-password", &Identity::generate());
+    let body = register_body(&server, "DUP@example.com", "other-password", &Identity::generate());
     let response = server.client.post(format!("{}/register", server.base)).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
@@ -285,7 +420,8 @@ async fn each_invalid_registration_field_is_rejected_without_creating_an_account
     let lenient = RateLimits { register_burst: 100, ..Default::default() };
     let server = spawn_with(ServerConfig { rate_limits: lenient, ..Default::default() }).await;
     let good =
-        serde_json::to_value(register_body("fresh@example.com", "fresh-password", &Identity::generate())).unwrap();
+        serde_json::to_value(register_body(&server, "fresh@example.com", "fresh-password", &Identity::generate()))
+            .unwrap();
     let cases: Vec<(&str, serde_json::Value)> = vec![
         ("email", json!("not-an-email")),
         ("email", json!("has space@example.com")),
@@ -293,8 +429,10 @@ async fn each_invalid_registration_field_is_rejected_without_creating_an_account
         ("auth_hash", json!("")),
         ("public_key", json!("AAAA")),
         ("public_key", json!("not base64!")),
-        ("encrypted_private_key", json!({"nonce": "", "ciphertext": ""})),
-        ("encrypted_private_key", json!({"nonce": "AAAA", "ciphertext": "AAAA"})),
+        ("encrypted_private_key", json!({"v": 1, "nonce": "", "ciphertext": ""})),
+        ("encrypted_private_key", json!({"v": 1, "nonce": "AAAA", "ciphertext": "AAAA"})),
+        // A blob with no scheme version is not one this build wrote.
+        ("encrypted_private_key", json!({"nonce": "AAAAAAAAAAAAAAAA", "ciphertext": "AA=="})),
     ];
     for (field, value) in cases {
         let mut bad = good.clone();
@@ -325,22 +463,50 @@ async fn malformed_json_and_oversized_bodies_get_clear_errors() {
     assert!(error_text(response).await.contains("JSON"));
 
     let alice = register(&server, "alice@example.com", "alice-password").await;
-    let huge = json!({"name": "x", "payload": {"nonce": "AAAAAAAAAAAAAAAA", "ciphertext": "A".repeat(300 * 1024)}});
+    // Sized from the limit rather than from a number, so raising the limit
+    // cannot quietly turn this into a test of something else.
+    let over_the_limit = "A".repeat(credvault_server::MAX_REQUEST_BYTES + 1024);
+    let huge = json!({"name": "x", "payload": {"v": 1, "nonce": "AAAAAAAAAAAAAAAA", "ciphertext": over_the_limit}});
     let response = server.req(Method::POST, "/secrets", &alice).json(&huge).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// The reason the auth hash is bound to a server address: a hostile operator
+/// who logs what its own users send cannot turn round and sign in as them
+/// somewhere else. Same person, same password, two servers, two credentials.
+#[tokio::test]
+async fn a_credential_from_one_server_does_not_work_on_another() {
+    let home = spawn().await;
+    let elsewhere = spawn().await;
+    register(&home, "kat@example.com", "correct horse battery").await;
+    register(&elsewhere, "kat@example.com", "correct horse battery").await;
+
+    let master = MasterKey::derive("correct horse battery", "kat@example.com").unwrap();
+    assert_ne!(*master.auth_hash(&home.address), *master.auth_hash(&elsewhere.address));
+
+    // The credential the home server receives is useless at the other one...
+    let captured = master.auth_hash(&home.address);
+    let response = login(&elsewhere, "kat@example.com", captured).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // ...while each server still accepts the one derived for it.
+    for server in [&home, &elsewhere] {
+        let response = login(server, "kat@example.com", master.auth_hash(&server.address)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 #[tokio::test]
 async fn registration_can_be_closed_or_token_gated() {
     let closed = spawn_with(ServerConfig { registration: RegistrationPolicy::Closed, ..Default::default() }).await;
-    let body = register_body("a@example.com", "alpha-password", &Identity::generate());
+    let body = register_body(&closed, "a@example.com", "alpha-password", &Identity::generate());
     let response = closed.client.post(format!("{}/register", closed.base)).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let gated =
         spawn_with(ServerConfig { registration: RegistrationPolicy::Token("let-me-in".into()), ..Default::default() })
             .await;
-    let mut body = register_body("b@example.com", "bravo-password", &Identity::generate());
+    let mut body = register_body(&gated, "b@example.com", "bravo-password", &Identity::generate());
     let response = gated.client.post(format!("{}/register", gated.base)).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     body.registration_token = Some("wrong".into());
@@ -357,11 +523,11 @@ async fn login_and_registration_are_rate_limited_per_address() {
     let master = MasterKey::derive("some-password", "nobody@example.com").unwrap();
     let mut statuses = Vec::new();
     for _ in 0..11 {
-        statuses.push(login(&server, "nobody@example.com", master.auth_hash()).await.status());
+        statuses.push(login(&server, "nobody@example.com", master.auth_hash(&server.address)).await.status());
     }
     assert!(statuses[..10].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{statuses:?}");
     assert_eq!(statuses[10], StatusCode::TOO_MANY_REQUESTS);
-    let response = login(&server, "nobody@example.com", master.auth_hash()).await;
+    let response = login(&server, "nobody@example.com", master.auth_hash(&server.address)).await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(response.headers().get("retry-after").is_some());
 
@@ -396,7 +562,7 @@ async fn expired_sessions_are_rejected_and_pruned() {
 
     // The next login prunes the expired row.
     let master = MasterKey::derive("alice-password", "alice@example.com").unwrap();
-    assert_eq!(login(&server, "alice@example.com", master.auth_hash()).await.status(), StatusCode::OK);
+    assert_eq!(login(&server, "alice@example.com", master.auth_hash(&server.address)).await.status(), StatusCode::OK);
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions").fetch_one(&server.pool).await.unwrap();
     assert_eq!(count, 1);
 }
@@ -406,7 +572,8 @@ async fn logout_invalidates_only_that_token_and_logout_everywhere_all() {
     let server = spawn().await;
     let alice = register(&server, "alice@example.com", "alice-password").await;
     let master = MasterKey::derive("alice-password", "alice@example.com").unwrap();
-    let second: SessionResponse = login(&server, "alice@example.com", master.auth_hash()).await.json().await.unwrap();
+    let second: SessionResponse =
+        login(&server, "alice@example.com", master.auth_hash(&server.address)).await.json().await.unwrap();
     let alice_second = with_token(&alice, second.token);
 
     let response = server.req(Method::POST, "/logout", &alice).send().await.unwrap();
@@ -414,7 +581,8 @@ async fn logout_invalidates_only_that_token_and_logout_everywhere_all() {
     assert_eq!(server.req(Method::GET, "/me", &alice).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     assert_eq!(server.req(Method::GET, "/me", &alice_second).send().await.unwrap().status(), StatusCode::OK);
 
-    let third: SessionResponse = login(&server, "alice@example.com", master.auth_hash()).await.json().await.unwrap();
+    let third: SessionResponse =
+        login(&server, "alice@example.com", master.auth_hash(&server.address)).await.json().await.unwrap();
     let alice_third = with_token(&alice, third.token);
     let response = server.req(Method::DELETE, "/sessions", &alice_second).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -461,7 +629,8 @@ async fn lookup_is_rate_limited_per_account_not_per_address() {
 
     // A second session for Alice does not refill her budget either.
     let master = MasterKey::derive("alice-password", "alice@example.com").unwrap();
-    let session: SessionResponse = login(&server, "alice@example.com", master.auth_hash()).await.json().await.unwrap();
+    let session: SessionResponse =
+        login(&server, "alice@example.com", master.auth_hash(&server.address)).await.json().await.unwrap();
     let second = Account { token: session.token, ..alice };
     assert_eq!(lookup(&second, "bob@example.com", &bob_fp).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
 
@@ -584,7 +753,8 @@ async fn secret_lifecycle_for_owner() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let oversized = Sealed { nonce: vec![0; 12], ciphertext: vec![0; MAX_BLOB_BYTES + 1] };
+    let oversized =
+        Sealed { v: credvault_core::aead::SEALED_FORMAT, nonce: vec![0; 12], ciphertext: vec![0; MAX_BLOB_BYTES + 1] };
     let response = server
         .req(Method::PUT, &format!("/secrets/{id}"), &alice)
         .json(&UpdateSecretRequest { key_version: 0, name: "x".into(), payload: oversized })
@@ -1082,4 +1252,168 @@ async fn an_owner_copy_must_always_be_self_wrapped() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(server.list(&bob).await.len(), 1, "nothing changed");
+}
+
+// ----- changing the passphrase ----------------------------------------------
+
+/// Everything the old passphrase derived, re-derived under a new one.
+///
+/// This is the client's half of the change, written out here so the test
+/// exercises the same shape the desktop sends.
+async fn rewrap_everything(
+    server: &TestServer,
+    account: &Account,
+    old_password: &str,
+    new_password: &str,
+) -> ChangePasswordRequest {
+    let old = MasterKey::derive(old_password, &account.email).unwrap();
+    let new = MasterKey::derive(new_password, &account.email).unwrap();
+    let views: Vec<SecretView> =
+        server.req(Method::GET, "/secrets", account).send().await.unwrap().json().await.unwrap();
+
+    let mut rewrapped_keys = Vec::new();
+    for view in views.iter().filter(|view| view.is_owner) {
+        let WrappedKey::Owner(sealed) = &view.wrapped_key else { panic!("an owned secret must have an owner copy") };
+        let key = SecretKey::unwrap_owner(&old.self_wrap_key(), sealed).unwrap();
+        rewrapped_keys.push(RewrappedKey {
+            secret_id: view.id,
+            key_version: view.key_version,
+            wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&new.self_wrap_key())),
+        });
+    }
+
+    ChangePasswordRequest {
+        current_auth_hash: Some(old.auth_hash(&server.address)),
+        new_auth_hash: Some(new.auth_hash(&server.address)),
+        encrypted_private_key: account.identity.encrypt_private_key(&new.private_key_encryption_key()),
+        rewrapped_keys,
+    }
+}
+
+#[tokio::test]
+async fn the_old_passphrase_stops_working_and_the_new_one_opens_the_vault() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+    let (id, _) = server.create_secret(&alice, "GitHub", &payload()).await;
+
+    let body = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    let response = server.req(Method::POST, "/password", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fresh: SessionResponse = response.json().await.unwrap();
+
+    // The old credential is gone and the new one works.
+    let old = MasterKey::derive("old-password-here", "alice@example.com").unwrap();
+    let new = MasterKey::derive("new-password-here", "alice@example.com").unwrap();
+    assert_eq!(
+        login(&server, "alice@example.com", old.auth_hash(&server.address)).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let relogin = login(&server, "alice@example.com", new.auth_hash(&server.address)).await;
+    assert_eq!(relogin.status(), StatusCode::OK);
+    let session: SessionResponse = relogin.json().await.unwrap();
+
+    // The private key opens under the new encryption key, and the secret's own
+    // key opens under the new self-wrap key: the whole vault still works.
+    let identity =
+        Identity::decrypt_private_key(&new.private_key_encryption_key(), &session.user.encrypted_private_key).unwrap();
+    assert_eq!(identity.public_key(), alice.identity.public_key());
+
+    let reread = Account { token: fresh.token, self_wrap_key: new.self_wrap_key(), ..alice };
+    let view: SecretView =
+        server.req(Method::GET, &format!("/secrets/{id}"), &reread).send().await.unwrap().json().await.unwrap();
+    assert_eq!(decrypt(&view, &reread), payload());
+}
+
+#[tokio::test]
+async fn a_wrong_current_passphrase_changes_nothing() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+    server.create_secret(&alice, "GitHub", &payload()).await;
+
+    let mut body = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    let wrong = MasterKey::derive("not-the-password", "alice@example.com").unwrap();
+    body.current_auth_hash = Some(wrong.auth_hash(&server.address));
+
+    let response = server.req(Method::POST, "/password", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // The old credential still works, so nothing was half-applied.
+    let old = MasterKey::derive("old-password-here", "alice@example.com").unwrap();
+    assert_eq!(login(&server, "alice@example.com", old.auth_hash(&server.address)).await.status(), StatusCode::OK);
+}
+
+/// A session alone must not be enough: otherwise a stolen token locks the
+/// owner out of a vault nobody can recover.
+#[tokio::test]
+async fn a_session_without_the_current_passphrase_cannot_change_it() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+
+    let mut body = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    body.current_auth_hash = None;
+    let response = server.req(Method::POST, "/password", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(error_text(response).await.contains("current password"));
+}
+
+/// A rotation landing mid-change would leave the owner holding a key that no
+/// longer opens the payload. The whole change is refused instead.
+#[tokio::test]
+async fn a_rotation_during_the_change_is_refused_rather_than_written() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+    let bob = register(&server, "bob@example.com", "bob-password-here").await;
+    let (id, key) = server.create_secret(&alice, "GitHub", &payload()).await;
+    let invite: Created = server.invite(&alice, id, &key, &bob.email).await.json().await.unwrap();
+    server.accept(&bob, invite.id).await;
+
+    // The client re-wraps against what it can see right now.
+    let body = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    // Another device revokes Bob, which rotates the key and bumps the version.
+    let (response, _) = server.revoke(&alice, id, bob.id, &payload()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = server.req(Method::POST, "/password", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    // Nothing moved: the old passphrase still logs in and still opens the vault.
+    let old = MasterKey::derive("old-password-here", "alice@example.com").unwrap();
+    assert_eq!(login(&server, "alice@example.com", old.auth_hash(&server.address)).await.status(), StatusCode::OK);
+}
+
+/// A secret created after the client started re-wrapping is not covered by the
+/// submission, so the change must not go through half-done.
+#[tokio::test]
+async fn a_secret_created_during_the_change_is_refused() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+    server.create_secret(&alice, "GitHub", &payload()).await;
+
+    let body = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    server.create_secret(&alice, "GitLab", &payload()).await;
+
+    let response = server.req(Method::POST, "/password", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn changing_the_passphrase_signs_out_every_other_device() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+    let master = MasterKey::derive("old-password-here", "alice@example.com").unwrap();
+
+    // A second device.
+    let other: SessionResponse =
+        login(&server, "alice@example.com", master.auth_hash(&server.address)).await.json().await.unwrap();
+    let elsewhere = Account { token: other.token, ..register(&server, "other@example.com", "other-password-x").await };
+
+    let body = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    let response = server.req(Method::POST, "/password", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fresh: SessionResponse = response.json().await.unwrap();
+
+    // The other device is signed out; the device that made the change is not.
+    assert_eq!(server.req(Method::GET, "/me", &elsewhere).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let here = Account { token: fresh.token, ..alice };
+    assert_eq!(server.req(Method::GET, "/me", &here).send().await.unwrap().status(), StatusCode::OK);
 }

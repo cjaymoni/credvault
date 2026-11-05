@@ -15,12 +15,17 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as DalekPublic, StaticSecret};
 use zeroize::Zeroizing;
 
-use crate::aead::{self, Sealed, KEY_LEN};
+use crate::aead::{self, Context, Sealed, KEY_LEN};
 use crate::encoding;
 use crate::{CryptoError, Result};
 
-const SEALED_BOX_INFO: &[u8] = b"credvault/sealed-box/v1";
-const PRIVATE_KEY_AAD: &[u8] = b"credvault/private-key/v1";
+/// HKDF info for the per-box key, distinct from the AEAD label below because
+/// they belong to different primitives. Neither carries a version: the version
+/// of the scheme lives in the blob, as [`crate::aead::SEALED_FORMAT`], where a
+/// reader can see it.
+const SEALED_BOX_KDF_INFO: &[u8] = b"credvault/kdf/sealed-box";
+const SEALED_BOX: Context = Context::new("shared key", b"credvault/aead/sealed-box");
+const PRIVATE_KEY: Context = Context::new("vault key", b"credvault/aead/private-key");
 const PUBLIC_KEY_LEN: usize = 32;
 /// 96 bits: long enough that a collision cannot be found by brute force, short
 /// enough to read out loud in six groups.
@@ -117,12 +122,12 @@ impl Identity {
 
     /// Encrypt the private key for storage on the server.
     pub fn encrypt_private_key(&self, key: &[u8; KEY_LEN]) -> Sealed {
-        aead::encrypt(key, self.secret.as_bytes(), PRIVATE_KEY_AAD)
+        aead::encrypt(key, self.secret.as_bytes(), &PRIVATE_KEY)
     }
 
     /// Recover an identity from its server-stored encrypted private key.
     pub fn decrypt_private_key(key: &[u8; KEY_LEN], sealed: &Sealed) -> Result<Self> {
-        let bytes = Zeroizing::new(aead::decrypt(key, sealed, PRIVATE_KEY_AAD)?);
+        let bytes = Zeroizing::new(aead::decrypt(key, sealed, &PRIVATE_KEY)?);
         let array: Zeroizing<[u8; 32]> = Zeroizing::new(
             bytes.as_slice().try_into().map_err(|_| CryptoError::Encoding("private key must be 32 bytes".into()))?,
         );
@@ -140,7 +145,7 @@ impl Identity {
             return Err(CryptoError::Decrypt);
         }
         let key = derive_box_key(shared.as_bytes(), &boxed.ephemeral_public, &self.public);
-        aead::decrypt(&key, &boxed.sealed, SEALED_BOX_INFO)
+        aead::decrypt(&key, &boxed.sealed, &SEALED_BOX)
     }
 }
 
@@ -153,7 +158,7 @@ pub fn seal(recipient: &PublicKey, plaintext: &[u8]) -> Result<SealedBox> {
         return Err(CryptoError::InvalidInput("recipient public key is a low-order point".into()));
     }
     let key = derive_box_key(shared.as_bytes(), &ephemeral_public, recipient);
-    Ok(SealedBox { ephemeral_public, sealed: aead::encrypt(&key, plaintext, SEALED_BOX_INFO) })
+    Ok(SealedBox { ephemeral_public, sealed: aead::encrypt(&key, plaintext, &SEALED_BOX) })
 }
 
 fn derive_box_key(shared: &[u8; 32], ephemeral: &PublicKey, recipient: &PublicKey) -> Zeroizing<[u8; KEY_LEN]> {
@@ -162,7 +167,7 @@ fn derive_box_key(shared: &[u8; 32], ephemeral: &PublicKey, recipient: &PublicKe
     salt[PUBLIC_KEY_LEN..].copy_from_slice(&recipient.0);
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     Hkdf::<Sha256>::new(Some(&salt), shared)
-        .expand(SEALED_BOX_INFO, out.as_mut())
+        .expand(SEALED_BOX_KDF_INFO, out.as_mut())
         .expect("32-byte HKDF output is always valid");
     out
 }
@@ -170,6 +175,30 @@ fn derive_box_key(shared: &[u8; 32], ephemeral: &PublicKey, recipient: &PublicKe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex(text: &str) -> [u8; 32] {
+        let bytes: Vec<u8> = text
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                let digit = |c: u8| (c as char).to_digit(16).expect("vector is not hex") as u8;
+                digit(pair[0]) * 16 + digit(pair[1])
+            })
+            .collect();
+        bytes.try_into().expect("vector is not 32 bytes")
+    }
+
+    /// RFC 7748 section 5.2, through the same Diffie-Hellman call `seal` and
+    /// `open` use. Confirms the scalar is clamped and the bytes are in the
+    /// order the spec expects, which a round-trip test cannot show because
+    /// both ends would make the same mistake.
+    #[test]
+    fn x25519_matches_rfc_7748() {
+        let secret = StaticSecret::from(hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"));
+        let point = DalekPublic::from(hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"));
+        let shared = secret.diffie_hellman(&point);
+        assert_eq!(shared.as_bytes(), &hex("c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"));
+    }
 
     #[test]
     fn seal_and_open() {

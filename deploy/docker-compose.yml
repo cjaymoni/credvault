@@ -1,0 +1,55 @@
+# Project name is fixed so volume names are predictable (credvault_data,
+# credvault_caddy_data) regardless of the directory this is run from.
+name: credvault
+
+# credvault on a single VPS: Caddy terminates TLS, credvault is reachable only
+# on the internal network. Nothing but 80/443 is published to the host.
+services:
+  credvault:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: credvault-server:local
+    restart: unless-stopped
+    environment:
+      # Listen on all interfaces *inside the container*; the container itself
+      # publishes no ports, so this is not exposed to the internet.
+      CREDVAULT_BIND: 0.0.0.0:8787
+      CREDVAULT_DATA_DIR: /data
+      # Rate limits are keyed on the rightmost X-Forwarded-For address, which
+      # is the one Caddy appends. Only correct behind the proxy below.
+      CREDVAULT_TRUST_FORWARDED_FOR: "true"
+      CREDVAULT_REGISTRATION_TOKEN: ${CREDVAULT_REGISTRATION_TOKEN:?set this in .env}
+      # Optional; both blank keeps the server password-only. Clap requires
+      # them together, so a lone value stops the server rather than quietly
+      # running without the button.
+      CREDVAULT_GOOGLE_CLIENT_ID: ${CREDVAULT_GOOGLE_CLIENT_ID:-}
+      CREDVAULT_GOOGLE_CLIENT_SECRET: ${CREDVAULT_GOOGLE_CLIENT_SECRET:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - data:/data
+    networks: [internal]
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CREDVAULT_DOMAIN: ${CREDVAULT_DOMAIN:?set this in .env}
+      CREDVAULT_ACME_EMAIL: ${CREDVAULT_ACME_EMAIL:?set this in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [credvault]
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  data:
+  caddy_data:
+  caddy_config:

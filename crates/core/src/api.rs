@@ -16,7 +16,95 @@ pub const MAX_BLOB_BYTES: usize = 64 * 1024;
 /// Upper bound on a registration token sent by a client.
 pub const MAX_REGISTRATION_TOKEN_LEN: usize = 256;
 
+/// How many secrets one account may own.
+///
+/// Far above what a person keeps and far below what it takes to fill a disk.
+/// The server stores only ciphertext it cannot read, so it has no way to tell
+/// a real vault from someone writing until the volume is full — and a full
+/// volume stops every account on the server, not just the one that did it.
+pub const MAX_SECRETS_PER_ACCOUNT: i64 = 1_000;
+
+/// How many invites one account may have outstanding at once.
+///
+/// Also bounds what can be pushed *into* someone else's list: an invite is
+/// unique per secret and invitee, so filling a stranger's inbox would take a
+/// secret each, and this cap is reached first.
+pub const MAX_PENDING_INVITES_PER_ACCOUNT: i64 = 100;
+
 const REDACTED: &str = "<redacted>";
+
+// ----- protocol version -------------------------------------------------------
+
+/// Version of the wire protocol spoken between a client and a server.
+///
+/// Bump it when a change would make a peer get an answer *wrong*: a field
+/// whose meaning moved, an endpoint whose contract changed, a response an
+/// older client would misread. A field that older peers can ignore safely is
+/// additive and needs no bump.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The oldest server protocol a client built from this source will talk to.
+pub const MIN_SERVER_PROTOCOL: u32 = 1;
+
+/// The oldest client protocol a server built from this source still serves.
+///
+/// Raising this locks out installed clients, so it moves only when serving
+/// them would be wrong rather than merely inconvenient.
+pub const MIN_CLIENT_PROTOCOL: u32 = 1;
+
+/// The body of `GET /health`.
+///
+/// Unauthenticated, so it carries the protocol numbers and nothing else. In
+/// particular it does not report the build version, which would tell a passer
+/// by which release to look up advisories for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Health {
+    /// Always `"ok"`. A body at all is what says the process is serving.
+    pub status: String,
+    /// The protocol this server speaks.
+    pub protocol: u32,
+    /// The oldest client protocol this server still serves.
+    pub min_client_protocol: u32,
+}
+
+impl Health {
+    /// What a server built from this source reports.
+    pub fn current() -> Self {
+        Self { status: "ok".into(), protocol: PROTOCOL_VERSION, min_client_protocol: MIN_CLIENT_PROTOCOL }
+    }
+}
+
+/// Why this build and a particular server cannot understand each other.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProtocolMismatch {
+    #[error(
+        "this server needs a newer credvault: it serves protocol {required} and later, and this app speaks {speaks}"
+    )]
+    ClientTooOld { required: u32, speaks: u32 },
+    #[error(
+        "this server is too old for this app: it speaks protocol {speaks}, and this app needs {required} or later"
+    )]
+    ServerTooOld { speaks: u32, required: u32 },
+}
+
+/// Decide whether this build can talk to a server that reports `health`.
+///
+/// Both numbers are needed, and neither alone would do. The server's
+/// `protocol` says what it speaks, which is how a client refuses one too old
+/// to understand it. `min_client_protocol` says what it still serves, which is
+/// how a *newer* server tells an old client to update rather than letting it
+/// fail later, one confusing request at a time. A server ahead of this client
+/// that still serves this client's protocol is compatible, and that is the
+/// ordinary case after a server upgrade.
+pub fn check_protocol(health: &Health) -> Result<(), ProtocolMismatch> {
+    if PROTOCOL_VERSION < health.min_client_protocol {
+        return Err(ProtocolMismatch::ClientTooOld { required: health.min_client_protocol, speaks: PROTOCOL_VERSION });
+    }
+    if health.protocol < MIN_SERVER_PROTOCOL {
+        return Err(ProtocolMismatch::ServerTooOld { speaks: health.protocol, required: MIN_SERVER_PROTOCOL });
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -71,6 +159,16 @@ pub struct UserProfile {
     pub email: String,
     pub public_key: PublicKey,
     pub encrypted_private_key: Sealed,
+    /// Whether this account signs in with a password. False for an account
+    /// created through Google, which still has a passphrase for its vault but
+    /// does not use it as a server credential. Clients need this to know
+    /// whether a passphrase change should also change the login.
+    #[serde(default = "yes")]
+    pub password_login: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,6 +298,222 @@ pub struct InviteView {
     pub created_at: DateTime<Utc>,
 }
 
+// ----- sign in with Google (OpenID Connect) ---------------------------------
+
+/// Longest authorization code a client may send. Google's are far shorter;
+/// this only stops an unbounded string reaching the token endpoint.
+pub const MAX_AUTH_CODE_LEN: usize = 2048;
+/// Longest `state` or ticket a client may send back. Both are issued by the
+/// server as 32 random bytes in URL-safe base64, so 128 is generous.
+pub const MAX_OPAQUE_TOKEN_LEN: usize = 128;
+
+/// What a sign-in flow is for. A flow started to link an identity to an
+/// existing account must not be completable as a sign-in, or someone who can
+/// trick a user into starting a link could sign in as them instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthPurpose {
+    /// Sign in, creating the account if the identity is not known yet.
+    SignIn,
+    /// Bind this identity to the account that is already signed in.
+    Link,
+}
+
+impl OAuthPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SignIn => "sign_in",
+            Self::Link => "link",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "sign_in" => Some(Self::SignIn),
+            "link" => Some(Self::Link),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OAuthStartRequest {
+    /// Loopback address the native app is listening on, e.g.
+    /// `http://127.0.0.1:49152/callback`. The server checks it is a loopback
+    /// address before handing it to the provider.
+    pub redirect_uri: String,
+    #[serde(default = "sign_in_purpose")]
+    pub purpose: OAuthPurpose,
+}
+
+fn sign_in_purpose() -> OAuthPurpose {
+    OAuthPurpose::SignIn
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct OAuthStartResponse {
+    /// Open this in the system browser.
+    pub authorization_url: String,
+    /// Echoed back by the provider; the client returns it with the code so the
+    /// server can find the attempt it belongs to.
+    pub state: String,
+    /// Proof that the caller is the client that began this flow.
+    ///
+    /// `state` and `code` both travel through the browser, so they are visible
+    /// in the address bar, in history, and to anything with access to the
+    /// profile. PKCE does not help: the server is the confidential client and
+    /// holds the verifier, so the code is bound to the server rather than to
+    /// the app that will redeem it. This is the piece that is bound to the
+    /// app — handed over the client's own HTTPS connection, never placed in
+    /// the authorization URL, and required again at the callback.
+    pub app_secret: Zeroizing<String>,
+}
+
+impl fmt::Debug for OAuthStartResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthStartResponse")
+            .field("authorization_url", &self.authorization_url)
+            .field("state", &self.state)
+            .field("app_secret", &REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct OAuthCallbackRequest {
+    pub state: String,
+    /// The `app_secret` from [`OAuthStartResponse`].
+    pub app_secret: Zeroizing<String>,
+    /// Single-use, but still a credential until it is spent.
+    pub code: Zeroizing<String>,
+}
+
+impl fmt::Debug for OAuthCallbackRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthCallbackRequest")
+            .field("state", &self.state)
+            .field("app_secret", &REDACTED)
+            .field("code", &REDACTED)
+            .finish()
+    }
+}
+
+/// Either the identity is already bound to an account, or it is not and the
+/// client has to create one. The server cannot create it alone: an account
+/// needs a key pair that only a client holding a passphrase can produce.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum OAuthCallbackResponse {
+    SignedIn(SessionResponse),
+    RegistrationRequired {
+        /// Short-lived; present it to `/oauth/register` with a fresh key pair.
+        ticket: String,
+        /// The provider's verified address. This becomes the account email and
+        /// therefore the key-derivation salt, so the client must derive its
+        /// master key from exactly this string.
+        email: String,
+    },
+}
+
+impl fmt::Debug for OAuthCallbackResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SignedIn(session) => f.debug_tuple("SignedIn").field(session).finish(),
+            Self::RegistrationRequired { email, .. } => {
+                f.debug_struct("RegistrationRequired").field("ticket", &REDACTED).field("email", email).finish()
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct OAuthRegisterRequest {
+    pub ticket: String,
+    pub public_key: PublicKey,
+    pub encrypted_private_key: Sealed,
+    /// Required when the server was started with a registration token. A
+    /// verified Google address is not by itself permission to have an account
+    /// on someone else's server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_token: Option<String>,
+}
+
+impl fmt::Debug for OAuthRegisterRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthRegisterRequest")
+            .field("ticket", &REDACTED)
+            .field("public_key", &self.public_key)
+            .field("registration_token", &self.registration_token.as_ref().map(|_| REDACTED))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Change the passphrase a vault is derived from.
+///
+/// Everything derived from the old passphrase is replaced at once, because
+/// half of it would be unrecoverable: a new credential without re-wrapped keys
+/// locks the owner out of their own secrets, and re-wrapped keys without a new
+/// credential do the same from the other side.
+///
+/// Payloads are deliberately absent. Each secret's AES key is random and does
+/// not change; only the owner's wrapping of it does, so the work is
+/// proportional to how many secrets are owned rather than to their size. For
+/// the same reason the X25519 identity is untouched: secrets shared *with*
+/// this account, and invites addressed to it, keep working.
+#[derive(Serialize, Deserialize)]
+pub struct ChangePasswordRequest {
+    /// Proof of the current passphrase. Required for an account that signs in
+    /// with a password; a session alone must not be enough to change it.
+    /// Absent for a Google account, which has no password login to prove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_auth_hash: Option<Zeroizing<String>>,
+    /// The new credential, for accounts that sign in with a password. Absent
+    /// for a Google account, whose login is not a passphrase and must not
+    /// become one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_auth_hash: Option<Zeroizing<String>>,
+    /// The X25519 private key re-encrypted under the new encryption key.
+    pub encrypted_private_key: Sealed,
+    /// Every owner copy of a secret key, re-wrapped under the new self-wrap
+    /// key. Must cover exactly the secrets this account owns.
+    pub rewrapped_keys: Vec<RewrappedKey>,
+}
+
+impl fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChangePasswordRequest")
+            .field("current_auth_hash", &self.current_auth_hash.as_ref().map(|_| REDACTED))
+            .field("new_auth_hash", &self.new_auth_hash.as_ref().map(|_| REDACTED))
+            .field("rewrapped_keys", &self.rewrapped_keys.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RewrappedKey {
+    pub secret_id: i64,
+    /// The `key_version` this was re-wrapped against. A rotation that lands
+    /// mid-change would leave the new owner copy holding a key that no longer
+    /// opens the payload, so a mismatch is a 409 rather than a write.
+    pub key_version: i64,
+    /// Must be [`WrappedKey::Owner`]: nobody else can produce one.
+    pub wrapped_key: WrappedKey,
+}
+
+/// What this server supports, so a client knows whether to offer the button
+/// and whether to ask for a registration token before creating an account.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub password_sign_in: bool,
+    pub google_sign_in: bool,
+    /// True when the server was started with a registration token. Clients
+    /// prompt for it during signup; the server checks it regardless of what
+    /// this says.
+    pub registration_token_required: bool,
+    /// True when the server accepts no new accounts at all.
+    pub registration_closed: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,8 +527,44 @@ mod tests {
     }
 
     #[test]
+    fn a_server_built_from_this_source_is_compatible() {
+        check_protocol(&Health::current()).expect("client and server from one tree must agree");
+    }
+
+    /// The case that makes this worth having: the server moved ahead, still
+    /// serves this client, and nothing should stop.
+    #[test]
+    fn a_newer_server_that_still_serves_this_client_is_fine() {
+        let health = Health { protocol: PROTOCOL_VERSION + 5, ..Health::current() };
+        assert!(check_protocol(&health).is_ok());
+    }
+
+    #[test]
+    fn a_server_that_has_dropped_this_client_says_so() {
+        let health =
+            Health { protocol: PROTOCOL_VERSION + 5, min_client_protocol: PROTOCOL_VERSION + 1, ..Health::current() };
+        let error = check_protocol(&health).unwrap_err();
+        assert!(matches!(error, ProtocolMismatch::ClientTooOld { .. }), "{error:?}");
+        assert!(error.to_string().contains("newer credvault"), "{error}");
+    }
+
+    #[test]
+    fn a_server_older_than_this_client_can_talk_to_says_so() {
+        let health = Health { protocol: MIN_SERVER_PROTOCOL - 1, min_client_protocol: 0, ..Health::current() };
+        let error = check_protocol(&health).unwrap_err();
+        assert!(matches!(error, ProtocolMismatch::ServerTooOld { .. }), "{error:?}");
+        assert!(error.to_string().contains("too old"), "{error}");
+    }
+
+    #[test]
+    fn health_does_not_report_the_build_version() {
+        let json = serde_json::to_string(&Health::current()).unwrap();
+        assert_eq!(json, r#"{"status":"ok","protocol":1,"min_client_protocol":1}"#);
+    }
+
+    #[test]
     fn registration_token_is_optional_on_the_wire() {
-        let json = r#"{"email":"a@example.com","auth_hash":"x","public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","encrypted_private_key":{"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA=="}}"#;
+        let json = r#"{"email":"a@example.com","auth_hash":"x","public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","encrypted_private_key":{"v":1,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA=="}}"#;
         let request: RegisterRequest = serde_json::from_str(json).unwrap();
         assert!(request.registration_token.is_none());
     }

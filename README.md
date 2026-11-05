@@ -7,12 +7,10 @@ ability to share a single secret with another person.
 - **Server** (`crates/server`): Axum + SQLite. Stores only ciphertext.
 - **Core** (`crates/core`): the cryptography, shared by both.
 
-> **Pre-release.** There is no compatibility guarantee between builds yet, and
-> no upgrade path. This build changes the stored key format, the database
-> schema and the client/server API, so it needs a **fresh database**: a vault
-> written by an earlier build cannot be read by this one and cannot be
-> migrated, because the server holds only ciphertext it has no way to rewrite.
-> Run a matching client and server, built from the same commit.
+> **Pre-release.** Formats are not frozen and nothing is migrated between
+> builds. Run a client and a server built from the same commit, against a
+> database that commit created. The server holds only ciphertext, so it cannot
+> rewrite a vault into a new format on anyone's behalf.
 
 ## How the security works
 
@@ -22,6 +20,11 @@ The server never sees a password, a username, or a key that could decrypt one.
    device. Two sub-keys are derived from it: an *auth hash* that is sent to the
    server as your login credential (the server hashes it again with Argon2
    before storing), and an *encryption key* that protects your private key.
+   The auth hash is bound to the server's address, so the same email and
+   password produce a different credential on every server and one operator
+   cannot replay what its users send to it. The encryption key is deliberately
+   not bound that way: it protects data at rest and must keep working wherever
+   the data is.
 2. Every account has an X25519 key pair. The private key is encrypted with the
    encryption key above and stored on the server, so you can log in from any
    device and recover it.
@@ -63,27 +66,117 @@ Because the fingerprint is required up front, the server also cannot be used
 to find out who has an account: a wrong fingerprint, a wrong address and an
 address nobody has registered all give the same answer.
 
+### Sign in with Google (optional)
+
+Off unless the operator sets `CREDVAULT_GOOGLE_CLIENT_ID` and
+`CREDVAULT_GOOGLE_CLIENT_SECRET`; clients ask the server what it offers and
+only show the button where it works.
+
+Google establishes *who you are*. It cannot produce key material, so it
+replaces the login credential and nothing else: after signing in you still
+enter your passphrase, and the master key is still stretched from it with
+Argon2id on your device. The server stores no password for such an account.
+
+- The address Google vouches for becomes the account email, and therefore the
+  key-derivation salt. It is recorded once and never updated afterwards: if
+  Google later changes your address, the account is still found by Google's
+  immutable subject id, and the salt stays as it was. Changing it would make
+  every secret in the vault undecryptable.
+- An address that already has a password account is never adopted
+  automatically. Whoever controls that Google address today could otherwise
+  claim an account created by whoever held it before. Linking starts from
+  inside a signed-in session instead ("Link Google" in the account panel).
+- A first sign-in still needs the server's registration token, if it has one.
+  A verified Google address is not by itself permission to have an account on
+  someone else's server.
+- The sign-in page opens in your system browser, not in the app's window, so
+  you can see the URL you are typing a Google password into. The app listens
+  on a loopback port for the redirect and nothing else.
+- The client secret stays on the server, which performs the code exchange, so
+  it is never shipped inside the app.
+
+**What it costs.** Someone who takes over your Google account can reach the
+server as you: they see the names of your secrets, who you share with, and the
+encrypted blobs, and they can delete them. They cannot read any secret, because
+the passphrase never leaves your device and Google never had it. Weigh that
+against the convenience before enabling it.
+
+#### Setting it up
+
+1. In the Google Cloud console, create an OAuth client of type **Desktop app**.
+   That type is required: the app listens on whatever loopback port the
+   operating system gives it, and other client types only accept redirect URIs
+   registered in advance.
+2. Put the client id and secret in the server's environment:
+
+   ```sh
+   CREDVAULT_GOOGLE_CLIENT_ID=....apps.googleusercontent.com
+   CREDVAULT_GOOGLE_CLIENT_SECRET=...
+   ```
+
+3. Restart the server. `GET /api/capabilities` reports `google_sign_in: true`
+   once it is on.
+
 ### Consequences worth knowing
 
-- If you forget your account password there is no recovery. Nobody can reset it.
+- If you forget your account password there is no recovery. Nobody can reset
+  it. This is true of a Google account here too: Google can let you back into
+  the server, not into the vault. You can *change* it while you still know it
+  — the app re-wraps every key under the new one in a single step, and signs
+  out every other device — but nothing can recover one you have lost.
 - Someone you share with can read that one secret, not your other secrets.
 - The server operator can see who shares with whom and the names of secrets,
   but not their contents. The operator cannot alter, relabel or replace a
   secret you own. For a secret shared *with* you the operator could show you
   fabricated contents (your copy of its key is a sealed box anyone can make),
   but cannot learn the real ones, and you cannot write to it, so nothing
-  leaks. Secrets created before this release are upgraded to the protected
-  form automatically the first time you open the app.
-- The auth hash is derived from your email and password only, not from the
-  server address. The same email and password therefore produce the same login
-  credential on every credvault server, so do not reuse a password across
-  servers you do not trust equally.
+  leaks.
+- Your login credential is tied to the server address you type. Moving a
+  server to a new domain therefore invalidates every login on it: the vaults
+  are intact and still decrypt, but accounts have to be created again at the
+  new address. Pick the address before inviting people, and keep it.
 - The app refuses plain `http://` for anything except `localhost`, so use HTTPS
   (a reverse proxy is fine) for any server that is not on your own machine.
 - Anyone with an account can check whether an email has an account on the
   same server (this is what makes inviting by email work). On a server with
   open registration, anyone at all can, because registering a taken email
   returns a conflict; use `--registration-token` to close that off.
+
+### Versions
+
+Three numbers describe what a given app and server speak, and each sits where
+something can read it and act on it.
+
+**The protocol**, at `GET /health`. Unauthenticated, and it carries these two
+numbers and nothing else — not the build version, which would only tell a
+passer-by which advisories to look up.
+
+```json
+{ "status": "ok", "protocol": 1, "min_client_protocol": 1 }
+```
+
+`protocol` is what the server speaks; `min_client_protocol` is the oldest
+client it serves. The app reads both before it derives a key or sends a
+credential, and stops with a plain message when the two cannot work together.
+A server ahead of the app that still serves the app's protocol works normally.
+
+**The encryption scheme**, on every encrypted blob — your private key, each
+secret's key, each secret's contents. It covers the key derivation behind the
+blob, the cipher, and how the associated data is built. The number is in the
+clear, so a reader tells a scheme it cannot run from a wrong passphrase before
+it tries, and it is authenticated, so it cannot be edited and a build that
+reads two schemes cannot be walked back to the weaker one. A correct passphrase
+meeting an unfamiliar scheme is told exactly that, rather than being told the
+password was wrong.
+
+**The field layout**, inside each secret's ciphertext, for the shape of the
+fields themselves. A build that meets a secret written under a higher number
+refuses to open it instead of reading the parts it recognises — a client that
+dropped a field it did not know and then saved the secret back would destroy
+data it never showed you.
+
+All three are gates, not shims: each build reads its own formats and refuses
+the rest, loudly and by name.
 
 ## Build
 

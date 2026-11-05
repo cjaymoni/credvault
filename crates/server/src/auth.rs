@@ -139,6 +139,24 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
+/// Resolve a session only if one was offered.
+///
+/// A missing `Authorization` header is `None`, not a rejection: one endpoint
+/// serves both an anonymous sign-in and an authenticated link, and which it is
+/// cannot be known until the body is parsed. A header that *is* present and
+/// does not resolve is still an error — a stale token must not quietly become
+/// an anonymous request and start the wrong kind of flow.
+impl axum::extract::OptionalFromRequestParts<AppState> for AuthUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Option<Self>, Self::Rejection> {
+        if !parts.headers.contains_key(axum::http::header::AUTHORIZATION) {
+            return Ok(None);
+        }
+        <Self as FromRequestParts<AppState>>::from_request_parts(parts, state).await.map(Some)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;

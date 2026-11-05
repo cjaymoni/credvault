@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use credvault_core::identity::normalize_fingerprint;
 use credvault_core::kdf::{normalize_email, validate_auth_hash};
@@ -14,10 +16,12 @@ use sha2::{Digest, Sha256};
 use sqlx::{SqliteExecutor, SqlitePool, Transaction};
 use subtle::ConstantTimeEq;
 
+use zeroize::Zeroizing;
+
 use crate::auth::{self, AuthUser};
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ApiJson;
-use crate::{AppState, RegistrationPolicy};
+use crate::{oauth, AppState, RegistrationPolicy};
 use credvault_core::api::*;
 
 type Tx = Transaction<'static, sqlx::Sqlite>;
@@ -113,6 +117,19 @@ async fn require_key_version<'e>(
     }
 }
 
+/// Refuse a write that would take an account past a quota.
+///
+/// Counted inside the caller's write transaction, never before it: two
+/// simultaneous creates that each read the count separately would both see
+/// room and both insert.
+async fn check_quota(tx: &mut Tx, label: &str, sql: &str, user_id: i64, limit: i64) -> ApiResult<()> {
+    let (used,): (i64,) = sqlx::query_as(sql).bind(user_id).fetch_one(&mut **tx).await?;
+    if used >= limit {
+        return Err(ApiError::Forbidden(format!("you already have {used} {label}, which is the limit of {limit}")));
+    }
+    Ok(())
+}
+
 const STALE_KEY_MESSAGE: &str = "the secret's key was rotated since you loaded it; refresh and try again";
 const MEMBERSHIP_CHANGED_MESSAGE: &str = "the secret's membership changed since you loaded it; refresh and try again";
 
@@ -137,8 +154,8 @@ async fn issue_session(pool: &SqlitePool, user_id: i64) -> ApiResult<String> {
 }
 
 async fn load_profile(pool: &SqlitePool, user_id: i64) -> ApiResult<UserProfile> {
-    let (id, email, public_key, encrypted_private_key): (i64, String, String, String) =
-        sqlx::query_as("SELECT id, email, public_key, encrypted_private_key FROM users WHERE id = ?")
+    let (id, email, public_key, encrypted_private_key, password_login): (i64, String, String, String, bool) =
+        sqlx::query_as("SELECT id, email, public_key, encrypted_private_key, password_login FROM users WHERE id = ?")
             .bind(user_id)
             .fetch_one(pool)
             .await?;
@@ -147,6 +164,7 @@ async fn load_profile(pool: &SqlitePool, user_id: i64) -> ApiResult<UserProfile>
         email,
         public_key: decode_stored_public_key(&public_key)?,
         encrypted_private_key: decode_stored(&encrypted_private_key)?,
+        password_login,
     })
 }
 
@@ -358,6 +376,139 @@ fn fingerprint_matches(expected: &str, supplied: &str) -> bool {
     expected.ct_eq(&supplied).into()
 }
 
+/// Replace everything derived from the account passphrase, in one transaction.
+///
+/// The three pieces have to move together or the vault becomes unopenable: a
+/// new credential without re-wrapped keys locks the owner out of their own
+/// secrets, and re-wrapped keys without a new credential do the same from the
+/// other side. Neither is recoverable, because the server holds no plaintext.
+///
+/// # Errors
+/// [`ApiError::Unauthorized`] if the current passphrase is wrong;
+/// [`ApiError::BadRequest`] if the submission is malformed or does not match
+/// the account's login type; [`ApiError::Conflict`] if the account or any of
+/// its secrets changed while the client was re-wrapping.
+pub async fn change_password(
+    State(state): State<AppState>,
+    user: AuthUser,
+    ApiJson(body): ApiJson<ChangePasswordRequest>,
+) -> ApiResult<Json<SessionResponse>> {
+    let private_key = encode_sealed("encrypted_private_key", &body.encrypted_private_key)?;
+    let mut rewrapped: HashMap<i64, (i64, String)> = HashMap::with_capacity(body.rewrapped_keys.len());
+    for entry in &body.rewrapped_keys {
+        // Only the owner can produce an owner copy, which is what stops the
+        // server handing itself a key it knows.
+        check_wrapped_kind(&entry.wrapped_key, true)?;
+        let encoded = encode_wrapped("wrapped_key", &entry.wrapped_key)?;
+        if rewrapped.insert(entry.secret_id, (entry.key_version, encoded)).is_some() {
+            return Err(ApiError::BadRequest(format!("secret {} is listed twice", entry.secret_id)));
+        }
+    }
+
+    let (stored_credential, password_login): (String, bool) =
+        sqlx::query_as("SELECT auth_hash, password_login FROM users WHERE id = ?")
+            .bind(user.id)
+            .fetch_one(&state.pool)
+            .await?;
+
+    // Argon2 twice over, so both run before the write lock is taken rather
+    // than holding SQLite's single writer for the best part of a second.
+    let new_credential = verify_and_rehash(&body, &stored_credential, password_login).await?;
+
+    let mut tx = begin_write(&state.pool).await?;
+    // Compare-and-swap on the stored credential. Two passphrase changes racing
+    // would otherwise both pass the check above and the loser's re-wrapped
+    // keys would be written under a key nobody holds.
+    let changed =
+        sqlx::query("UPDATE users SET auth_hash = ?, encrypted_private_key = ? WHERE id = ? AND auth_hash = ?")
+            .bind(&new_credential)
+            .bind(private_key)
+            .bind(user.id)
+            .bind(&stored_credential)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::Conflict("this account changed while you were typing; try again".into()));
+    }
+
+    let owned: Vec<(i64, i64)> = sqlx::query_as("SELECT id, key_version FROM secrets WHERE owner_id = ?")
+        .bind(user.id)
+        .fetch_all(&mut *tx)
+        .await?;
+    if owned.len() != rewrapped.len() {
+        return Err(ApiError::Conflict(REWRAP_MISMATCH_MESSAGE.into()));
+    }
+    for (secret_id, key_version) in &owned {
+        // A rotation landing mid-change would leave the new owner copy holding
+        // a key that no longer opens the payload.
+        let Some((against, wrapped_key)) = rewrapped.get(secret_id) else {
+            return Err(ApiError::Conflict(REWRAP_MISMATCH_MESSAGE.into()));
+        };
+        if against != key_version {
+            return Err(ApiError::Conflict(STALE_KEY_MESSAGE.into()));
+        }
+        let updated = sqlx::query("UPDATE secret_keys SET wrapped_key = ? WHERE secret_id = ? AND user_id = ?")
+            .bind(wrapped_key)
+            .bind(secret_id)
+            .bind(user.id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if updated != 1 {
+            return Err(ApiError::Conflict(REWRAP_MISMATCH_MESSAGE.into()));
+        }
+    }
+
+    // Every other device is signed out: ending sessions is most of the point
+    // of changing a passphrase you think someone else has.
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    let token = issue_session(&state.pool, user.id).await?;
+    let profile = load_profile(&state.pool, user.id).await?;
+    Ok(Json(SessionResponse { token, user: profile }))
+}
+
+const REWRAP_MISMATCH_MESSAGE: &str = "the secrets you own changed while you were typing; refresh and try again";
+
+/// Check the current passphrase and produce the credential to store.
+///
+/// A Google account has no password login, and must not gain one here: its
+/// stored credential is a hash of random bytes and stays exactly as it was.
+async fn verify_and_rehash(
+    body: &ChangePasswordRequest,
+    stored_credential: &str,
+    password_login: bool,
+) -> ApiResult<String> {
+    if !password_login {
+        if body.current_auth_hash.is_some() || body.new_auth_hash.is_some() {
+            return Err(ApiError::BadRequest(
+                "this account signs in with Google, so it has no password to change".into(),
+            ));
+        }
+        return Ok(stored_credential.to_string());
+    }
+
+    let current = body
+        .current_auth_hash
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("the current password is required".into()))?;
+    let new = body.new_auth_hash.as_ref().ok_or_else(|| ApiError::BadRequest("a new password is required".into()))?;
+    validate_auth_hash(current)?;
+    validate_auth_hash(new)?;
+
+    let stored = stored_credential.to_string();
+    let presented = current.clone();
+    let verified = tokio::task::spawn_blocking(move || auth::verify_credential(&presented, &stored))
+        .await
+        .map_err(ApiError::internal)?;
+    if !verified {
+        return Err(ApiError::Unauthorized);
+    }
+    auth::hash_credential(new.clone()).await
+}
+
 // ----- secrets --------------------------------------------------------------
 
 type SecretRow = (i64, String, String, i64, String, String, DateTime<Utc>, i64);
@@ -418,6 +569,14 @@ pub async fn create_secret(
     let now = Utc::now();
 
     let mut tx = begin_write(&state.pool).await?;
+    check_quota(
+        &mut tx,
+        "secrets",
+        "SELECT COUNT(*) FROM secrets WHERE owner_id = ?",
+        user.id,
+        MAX_SECRETS_PER_ACCOUNT,
+    )
+    .await?;
     let secret_id =
         sqlx::query("INSERT INTO secrets (owner_id, name, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
             .bind(user.id)
@@ -637,6 +796,14 @@ pub async fn create_invite(
     // rotation committing in between would purge the pending invites and leave
     // this one behind, holding a key that no longer opens the payload.
     let mut tx = begin_write(&state.pool).await?;
+    check_quota(
+        &mut tx,
+        "invites waiting to be answered",
+        "SELECT COUNT(*) FROM invites WHERE inviter_id = ?",
+        user.id,
+        MAX_PENDING_INVITES_PER_ACCOUNT,
+    )
+    .await?;
     // A wrapped key made from a rotated-away version would never open the payload.
     require_key_version(&mut *tx, secret_id, user.id, body.key_version).await?;
 
@@ -757,6 +924,335 @@ pub async fn decline_invite(
         return Err(ApiError::NotFound("invite not found".into()));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- sign in with Google --------------------------------------------------
+
+/// Accounts created through Google have no password to check. Rather than
+/// making `users.auth_hash` nullable and teaching every login path about the
+/// exception, the column holds an Argon2 hash of 32 random bytes that nobody
+/// has ever seen. Password login for such an account then fails through the
+/// ordinary code path, with the ordinary timing, because the credential simply
+/// does not match — there is no special case to get wrong.
+async fn unusable_credential() -> ApiResult<String> {
+    let random: [u8; 32] = credvault_core::aead::random_bytes();
+    auth::hash_credential(Zeroizing::new(BASE64.encode(random))).await
+}
+
+fn check_opaque_len(label: &str, value: &str, max: usize) -> ApiResult<()> {
+    if value.is_empty() || value.len() > max {
+        return Err(ApiError::BadRequest(format!("{label} is missing or too long")));
+    }
+    Ok(())
+}
+
+/// Unauthenticated liveness probe, and the protocol numbers clients check
+/// before they send a credential anywhere. Served at `/health`, outside
+/// `/api`, because it is also what a monitor and an operator's `curl` hit.
+pub async fn health() -> Json<Health> {
+    Json(Health::current())
+}
+
+pub async fn capabilities(State(state): State<AppState>) -> Json<Capabilities> {
+    Json(Capabilities {
+        password_sign_in: true,
+        google_sign_in: state.config.oauth.is_some(),
+        registration_token_required: matches!(state.config.registration, RegistrationPolicy::Token(_)),
+        registration_closed: matches!(state.config.registration, RegistrationPolicy::Closed),
+    })
+}
+
+/// Begin a sign-in: record the attempt and return the URL to open in a browser.
+pub async fn oauth_start(
+    State(state): State<AppState>,
+    user: Option<AuthUser>,
+    ApiJson(body): ApiJson<OAuthStartRequest>,
+) -> ApiResult<Json<OAuthStartResponse>> {
+    let provider = state.config.require_oauth()?;
+    let redirect_uri = oauth::validate_loopback_redirect(&body.redirect_uri)?;
+    // Linking binds an identity to an account, so the attempt has to say which
+    // account, and only that session may finish it. Signing in has no account
+    // yet and is anonymous by nature.
+    let user_id = match body.purpose {
+        OAuthPurpose::Link => Some(user.ok_or(ApiError::Unauthorized)?.id),
+        OAuthPurpose::SignIn => None,
+    };
+    let (state_token, nonce) = oauth::new_state_and_nonce();
+    let (code_verifier, code_challenge) = oauth::pkce_pair();
+    let app_secret = oauth::new_app_secret();
+
+    sqlx::query(
+        "INSERT INTO oauth_attempts \
+         (state_hash, purpose, app_secret_hash, user_id, code_verifier, nonce, redirect_uri, expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(oauth::hash_opaque(&state_token))
+    .bind(body.purpose.as_str())
+    .bind(oauth::hash_opaque(&app_secret))
+    .bind(user_id)
+    .bind(code_verifier.as_str())
+    .bind(&nonce)
+    .bind(&redirect_uri)
+    .bind(auth::now_timestamp() + oauth::ATTEMPT_LIFETIME_SECS)
+    .execute(&state.pool)
+    .await?;
+
+    // Abandoned attempts are the common case (a user closes the browser tab),
+    // so prune here rather than letting them accumulate.
+    sqlx::query("DELETE FROM oauth_attempts WHERE expires_at <= ?")
+        .bind(auth::now_timestamp())
+        .execute(&state.pool)
+        .await?;
+
+    let authorization_url = provider.authorization_url(&oauth::AuthorizationRequest {
+        state: state_token.clone(),
+        nonce,
+        code_challenge,
+        redirect_uri,
+    });
+    Ok(Json(OAuthStartResponse { authorization_url, state: state_token, app_secret }))
+}
+
+/// One authorization attempt, taken out of the table as it is read.
+struct ConsumedAttempt {
+    code_verifier: Zeroizing<String>,
+    nonce: String,
+    redirect_uri: String,
+    /// The account a link flow was started from; `None` for a sign-in.
+    user_id: Option<i64>,
+}
+
+/// Take the attempt matching `state`, if it is unexpired, was started for
+/// `purpose`, and the caller can produce the secret it was started with.
+///
+/// The match and the delete are one statement. That makes a `state` single-use
+/// under two simultaneous requests, and it means a wrong secret finds no row
+/// rather than spending someone else's attempt. A wrong secret and a wrong
+/// state are therefore the same answer, which is the point: neither says
+/// whether the other was right.
+async fn consume_attempt(
+    pool: &SqlitePool,
+    state_token: &str,
+    app_secret: &str,
+    purpose: OAuthPurpose,
+    started_by: Option<i64>,
+) -> ApiResult<ConsumedAttempt> {
+    // `IS` rather than `=` so the sign-in case matches a NULL owner. Every
+    // condition is in the one statement, so an attempt presented with the
+    // wrong secret or by the wrong session finds no row at all — it is not
+    // deleted, and the client that really started it can still finish.
+    let row: Option<(String, String, String, String, Option<i64>)> = sqlx::query_as(
+        "DELETE FROM oauth_attempts \
+         WHERE state_hash = ? AND app_secret_hash = ? AND user_id IS ? AND expires_at > ? \
+         RETURNING purpose, code_verifier, nonce, redirect_uri, user_id",
+    )
+    .bind(oauth::hash_opaque(state_token))
+    .bind(oauth::hash_opaque(app_secret))
+    .bind(started_by)
+    .bind(auth::now_timestamp())
+    .fetch_optional(pool)
+    .await?;
+
+    let (stored_purpose, code_verifier, nonce, redirect_uri, user_id) =
+        row.ok_or_else(|| ApiError::BadRequest("this sign-in has expired or was already used; start it again".into()))?;
+    // A flow begun to link an identity must not finish as a sign-in, or the
+    // reverse. The row is consumed either way, so a mismatched attempt is also
+    // spent rather than left for a second try.
+    if oauth::purpose_from_storage(&stored_purpose)? != purpose {
+        return Err(ApiError::BadRequest("this sign-in was started for something else; start it again".into()));
+    }
+    Ok(ConsumedAttempt { code_verifier: Zeroizing::new(code_verifier), nonce, redirect_uri, user_id })
+}
+
+/// Exchange the code for a verified identity, consuming the attempt first.
+/// Also returns the account the attempt was started from, which only a link
+/// flow has.
+async fn verified_identity_from_callback(
+    state: &AppState,
+    body: &OAuthCallbackRequest,
+    purpose: OAuthPurpose,
+    started_by: Option<i64>,
+) -> ApiResult<(oauth::VerifiedIdentity, Option<i64>)> {
+    let provider = state.config.require_oauth()?;
+    check_opaque_len("state", &body.state, MAX_OPAQUE_TOKEN_LEN)?;
+    check_opaque_len("app_secret", &body.app_secret, MAX_OPAQUE_TOKEN_LEN)?;
+    check_opaque_len("code", &body.code, MAX_AUTH_CODE_LEN)?;
+    let attempt = consume_attempt(&state.pool, &body.state, &body.app_secret, purpose, started_by).await?;
+    let identity = provider
+        .exchange(oauth::ExchangeRequest {
+            code: body.code.clone(),
+            code_verifier: attempt.code_verifier,
+            redirect_uri: attempt.redirect_uri,
+            nonce: attempt.nonce,
+        })
+        .await?;
+    Ok((identity, attempt.user_id))
+}
+
+/// Finish a sign-in. Either the identity is already bound to an account and a
+/// session is issued, or it is not and the client is asked to create one: the
+/// server cannot, because an account needs a key pair only the client can make.
+pub async fn oauth_callback(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<OAuthCallbackRequest>,
+) -> ApiResult<Json<OAuthCallbackResponse>> {
+    let (identity, _) = verified_identity_from_callback(&state, &body, OAuthPurpose::SignIn, None).await?;
+
+    let existing: Option<(i64,)> =
+        sqlx::query_as("SELECT user_id FROM oauth_identities WHERE provider = ? AND subject = ?")
+            .bind(oauth::PROVIDER_GOOGLE)
+            .bind(&identity.subject)
+            .fetch_optional(&state.pool)
+            .await?;
+
+    if let Some((user_id,)) = existing {
+        let token = issue_session(&state.pool, user_id).await?;
+        let user = load_profile(&state.pool, user_id).await?;
+        return Ok(Json(OAuthCallbackResponse::SignedIn(SessionResponse { token, user })));
+    }
+
+    // An address that already has a password account is never adopted
+    // automatically: whoever controls that Google address today could
+    // otherwise take over an account created by whoever held it before.
+    // Linking has to start from inside an authenticated session.
+    let email_taken: Option<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE email = ?")
+        .bind(&identity.email)
+        .fetch_optional(&state.pool)
+        .await?;
+    if email_taken.is_some() {
+        return Err(ApiError::Conflict(
+            "an account already exists for that address; sign in with your passphrase and link Google from settings"
+                .into(),
+        ));
+    }
+
+    let ticket = oauth::new_ticket();
+    sqlx::query(
+        "INSERT INTO oauth_pending_registrations (ticket_hash, provider, subject, email, expires_at) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(oauth::hash_opaque(&ticket))
+    .bind(oauth::PROVIDER_GOOGLE)
+    .bind(&identity.subject)
+    .bind(&identity.email)
+    .bind(auth::now_timestamp() + oauth::ATTEMPT_LIFETIME_SECS)
+    .execute(&state.pool)
+    .await?;
+    sqlx::query("DELETE FROM oauth_pending_registrations WHERE expires_at <= ?")
+        .bind(auth::now_timestamp())
+        .execute(&state.pool)
+        .await?;
+
+    Ok(Json(OAuthCallbackResponse::RegistrationRequired { ticket, email: identity.email }))
+}
+
+/// Create the account a `RegistrationRequired` ticket stands for. The client
+/// has by now asked for a new passphrase and derived a key pair from it and
+/// from the email in the ticket; neither reaches the server in usable form.
+pub async fn oauth_register(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<OAuthRegisterRequest>,
+) -> ApiResult<(StatusCode, Json<SessionResponse>)> {
+    state.config.require_oauth()?;
+    check_opaque_len("ticket", &body.ticket, MAX_OPAQUE_TOKEN_LEN)?;
+    check_registration_policy(&state.config.registration, body.registration_token.as_deref())?;
+    let private_key = encode_sealed("encrypted_private_key", &body.encrypted_private_key)?;
+    let public_key = body.public_key.to_base64();
+
+    let pending: Option<(String, String, String)> = sqlx::query_as(
+        "DELETE FROM oauth_pending_registrations WHERE ticket_hash = ? AND expires_at > ? \
+         RETURNING provider, subject, email",
+    )
+    .bind(oauth::hash_opaque(&body.ticket))
+    .bind(auth::now_timestamp())
+    .fetch_optional(&state.pool)
+    .await?;
+    let (provider, subject, email) = pending
+        .ok_or_else(|| ApiError::BadRequest("this sign-up has expired or was already used; start it again".into()))?;
+
+    let credential = unusable_credential().await?;
+
+    let mut tx = begin_write(&state.pool).await?;
+    let inserted = sqlx::query(
+        "INSERT INTO users (email, auth_hash, password_login, public_key, encrypted_private_key, created_at) \
+         VALUES (?, ?, 0, ?, ?, ?)",
+    )
+    .bind(&email)
+    .bind(credential)
+    .bind(public_key)
+    .bind(private_key)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await;
+
+    let user_id = match inserted {
+        Ok(result) => result.last_insert_rowid(),
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            return Err(ApiError::Conflict("an account with that email already exists".into()))
+        }
+        Err(other) => return Err(other.into()),
+    };
+
+    // Same transaction as the user row: an account with no way to sign in
+    // would be unreachable and unrecoverable.
+    let linked = sqlx::query(
+        "INSERT INTO oauth_identities (provider, subject, user_id, email, linked_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&provider)
+    .bind(&subject)
+    .bind(user_id)
+    .bind(&email)
+    .bind(auth::now_timestamp())
+    .execute(&mut *tx)
+    .await;
+    if let Err(sqlx::Error::Database(db)) = &linked {
+        if db.is_unique_violation() {
+            return Err(ApiError::Conflict("that Google account is already linked to an account here".into()));
+        }
+    }
+    linked?;
+    tx.commit().await?;
+
+    let token = issue_session(&state.pool, user_id).await?;
+    let user = load_profile(&state.pool, user_id).await?;
+    Ok((StatusCode::CREATED, Json(SessionResponse { token, user })))
+}
+
+/// Bind a Google identity to the account already signed in, so that account
+/// can use the button next time.
+///
+/// The account email is deliberately left alone. It is the salt the vault key
+/// is derived from, so changing it would make every existing secret
+/// undecryptable; the Google address is recorded on the identity row instead.
+pub async fn oauth_link(
+    State(state): State<AppState>,
+    user: AuthUser,
+    ApiJson(body): ApiJson<OAuthCallbackRequest>,
+) -> ApiResult<StatusCode> {
+    // The caller's id is part of what selects the attempt, so a link can only
+    // be finished by the session that began it. Without that, any
+    // authenticated caller holding a valid link state and secret could bind
+    // that identity to their own account instead.
+    let (identity, _) = verified_identity_from_callback(&state, &body, OAuthPurpose::Link, Some(user.id)).await?;
+
+    let linked = sqlx::query(
+        "INSERT INTO oauth_identities (provider, subject, user_id, email, linked_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(oauth::PROVIDER_GOOGLE)
+    .bind(&identity.subject)
+    .bind(user.id)
+    .bind(&identity.email)
+    .bind(auth::now_timestamp())
+    .execute(&state.pool)
+    .await;
+
+    match linked {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            Err(ApiError::Conflict("that Google account, or this credvault account, is already linked".into()))
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 #[cfg(test)]

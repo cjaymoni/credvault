@@ -23,6 +23,10 @@ pub enum ClientError {
     Unauthorized,
     #[error("invalid server URL: {0}")]
     InvalidUrl(String),
+    /// This build and the server do not speak the same protocol. Reported
+    /// before any credential is sent, because nothing later will work.
+    #[error("{0}")]
+    Incompatible(String),
 }
 
 #[derive(Clone)]
@@ -62,7 +66,18 @@ impl ApiClient {
         path: &str,
         body: Option<&impl Serialize>,
     ) -> Result<T, ClientError> {
-        let mut request = self.http.request(method, format!("{}/api{path}", self.base_url));
+        self.send_to(method, &format!("{}/api{path}", self.base_url), body).await
+    }
+
+    /// The transport every request shares. Takes a whole URL, because
+    /// `/health` sits outside `/api`.
+    async fn send_to<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&impl Serialize>,
+    ) -> Result<T, ClientError> {
+        let mut request = self.http.request(method, url);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
@@ -94,6 +109,34 @@ impl ApiClient {
 
     const NO_BODY: Option<&()> = None;
 
+    /// The server's protocol numbers. Outside `/api`, so this is the same
+    /// document an operator curls.
+    ///
+    /// A 200 that is not this document means the far end is not a credvault
+    /// server this build can talk to, so it is reported as an incompatibility
+    /// rather than as a malformed response.
+    pub async fn health(&self) -> Result<Health, ClientError> {
+        let url = format!("{}/health", self.base_url);
+        let response = self.http.get(&url).send().await.map_err(|e| ClientError::Network(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ClientError::Server(format!("the server's health check returned {status}")));
+        }
+        response.json().await.map_err(|_| {
+            ClientError::Incompatible(
+                "this server does not report a protocol version, so it is older than this app can talk to".into(),
+            )
+        })
+    }
+
+    /// Stop before sending anything if this build and the server cannot
+    /// understand each other. Unauthenticated and cheap, so every path that
+    /// reaches a server for the first time can afford to do it.
+    pub async fn check_protocol(&self) -> Result<(), ClientError> {
+        let health = self.health().await?;
+        credvault_core::api::check_protocol(&health).map_err(|mismatch| ClientError::Incompatible(mismatch.to_string()))
+    }
+
     pub async fn register(&self, body: &RegisterRequest) -> Result<SessionResponse, ClientError> {
         self.send(Method::POST, "/register", Some(body)).await
     }
@@ -102,8 +145,37 @@ impl ApiClient {
         self.send(Method::POST, "/login", Some(body)).await
     }
 
+    /// Replace everything the account passphrase derives, in one request.
+    /// All of it or none: see [`ChangePasswordRequest`].
+    pub async fn change_password(&self, body: &ChangePasswordRequest) -> Result<SessionResponse, ClientError> {
+        self.send(Method::POST, "/password", Some(body)).await
+    }
+
     pub async fn logout(&self) -> Result<(), ClientError> {
         self.send(Method::POST, "/logout", Self::NO_BODY).await
+    }
+
+    /// What this server offers, so the UI knows whether to show the Google
+    /// button and whether to ask for a registration token.
+    pub async fn capabilities(&self) -> Result<Capabilities, ClientError> {
+        self.send(Method::GET, "/capabilities", Self::NO_BODY).await
+    }
+
+    pub async fn oauth_start(&self, body: &OAuthStartRequest) -> Result<OAuthStartResponse, ClientError> {
+        self.send(Method::POST, "/oauth/start", Some(body)).await
+    }
+
+    pub async fn oauth_callback(&self, body: &OAuthCallbackRequest) -> Result<OAuthCallbackResponse, ClientError> {
+        self.send(Method::POST, "/oauth/callback", Some(body)).await
+    }
+
+    pub async fn oauth_register(&self, body: &OAuthRegisterRequest) -> Result<SessionResponse, ClientError> {
+        self.send(Method::POST, "/oauth/register", Some(body)).await
+    }
+
+    /// Bind a Google identity to the account this client is signed in as.
+    pub async fn oauth_link(&self, body: &OAuthCallbackRequest) -> Result<(), ClientError> {
+        self.send(Method::POST, "/oauth/link", Some(body)).await
     }
 
     /// The fingerprint is part of the query: the server only answers for a

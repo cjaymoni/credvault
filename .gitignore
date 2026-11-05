@@ -4,3 +4,11 @@ target/
 .DS_Store
 # regenerated on every tauri build
 apps/desktop/gen/schemas/
+
+# deployment secrets
+deploy/.env
+
+# Security review notes stay out of a public repository: an unfixed finding
+# written down here is a map of where to look. Keep them local, or in a
+# private tracker, until they are closed.
+docs/security-audit.md

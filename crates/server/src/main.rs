@@ -1,8 +1,12 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use clap::Parser;
+use credvault_server::oauth::{GoogleConfig, GoogleProvider};
 use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
+use zeroize::Zeroizing;
 
 /// credvault sync server. Stores only ciphertext; run it anywhere you trust
 /// to keep data, and put it behind HTTPS (a reverse proxy) for real use.
@@ -31,10 +35,61 @@ struct Args {
     /// address. Only enable behind a reverse proxy that sets that header.
     #[arg(long, env = "CREDVAULT_TRUST_FORWARDED_FOR")]
     trust_forwarded_for: bool,
+
+    /// Google OAuth client id. Setting it, with the matching secret, enables
+    /// "Sign in with Google". The client must be of type "Desktop app": the
+    /// app listens on a loopback port the OS picks, and only that client type
+    /// accepts a redirect URI whose port is not registered in advance.
+    #[arg(long, env = "CREDVAULT_GOOGLE_CLIENT_ID", requires = "google_client_secret")]
+    google_client_id: Option<String>,
+
+    /// Google OAuth client secret. Kept on the server so it is never shipped
+    /// inside the desktop app.
+    #[arg(long, env = "CREDVAULT_GOOGLE_CLIENT_SECRET", requires = "google_client_id", hide_env_values = true)]
+    google_client_secret: Option<String>,
+}
+
+/// Build the Google provider when both halves of the credential are present.
+///
+/// A blank value counts as absent: `docker compose` turns an unset variable
+/// into an empty environment variable, which clap otherwise reports as a value
+/// and would enable sign-in with an empty client id. Half a credential is a
+/// configuration mistake worth stopping for, rather than quietly running
+/// without the button the operator meant to switch on.
+fn google_provider(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<Option<Arc<GoogleProvider>>, Box<dyn std::error::Error>> {
+    let present = |value: Option<String>| value.filter(|text| !text.trim().is_empty());
+    match (present(client_id), present(client_secret)) {
+        (Some(id), Some(secret)) => {
+            let provider = GoogleProvider::new(GoogleConfig::new(id, Zeroizing::new(secret)))?;
+            Ok(Some(Arc::new(provider)))
+        }
+        (None, None) => Ok(None),
+        _ => Err("google sign-in needs both a client id and a client secret".into()),
+    }
+}
+
+/// Flags whose environment variable is set but empty.
+///
+/// `docker compose` turns an unset variable into an empty one, and clap reads
+/// an empty value for a `bool` flag as a value that is missing rather than as
+/// a flag that is off — so the server refuses to start. A blank value means
+/// "not set", the same way it does for the Google credentials.
+const BLANK_MEANS_UNSET: [&str; 2] = ["CREDVAULT_CLOSED_REGISTRATION", "CREDVAULT_TRUST_FORWARDED_FOR"];
+
+fn clear_blank_flag_env() {
+    for key in BLANK_MEANS_UNSET {
+        if std::env::var(key).is_ok_and(|value| value.trim().is_empty()) {
+            std::env::remove_var(key);
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    clear_blank_flag_env();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -68,10 +123,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(registration, RegistrationPolicy::Open) && !args.bind.ip().is_loopback() {
         tracing::warn!("registration is open on a non-loopback address; consider --registration-token");
     }
+    let oauth = google_provider(args.google_client_id, args.google_client_secret)?;
+    tracing::info!(google_sign_in = oauth.is_some(), "authentication methods");
     let config = ServerConfig {
         registration,
         trust_forwarded_for: args.trust_forwarded_for,
         rate_limits: RateLimits::default(),
+        oauth: oauth.map(|provider| provider as Arc<dyn credvault_server::oauth::OAuthProvider>),
     };
 
     let app = credvault_server::build_router(pool, config);
@@ -122,5 +180,53 @@ fn restrict_file_permissions(path: &Path) -> std::io::Result<()> {
     {
         let _ = path;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mutates process environment, so it is one test rather than several:
+    /// the others in this file read no environment at all.
+    #[test]
+    fn a_blank_flag_variable_counts_as_unset_rather_than_stopping_the_server() {
+        for key in BLANK_MEANS_UNSET {
+            std::env::set_var(key, "");
+            clear_blank_flag_env();
+            assert!(std::env::var(key).is_err(), "{key} blank should be removed");
+
+            std::env::set_var(key, "   ");
+            clear_blank_flag_env();
+            assert!(std::env::var(key).is_err(), "{key} whitespace should be removed");
+
+            // A real value is left alone, and so is a variable nobody set.
+            std::env::set_var(key, "true");
+            clear_blank_flag_env();
+            assert_eq!(std::env::var(key).unwrap(), "true");
+            std::env::remove_var(key);
+            clear_blank_flag_env();
+            assert!(std::env::var(key).is_err());
+        }
+    }
+
+    #[test]
+    fn google_sign_in_is_off_unless_both_halves_are_really_set() {
+        assert!(google_provider(None, None).unwrap().is_none());
+        // Compose writes an unset variable as an empty one; that is not config.
+        assert!(google_provider(Some(String::new()), Some(String::new())).unwrap().is_none());
+        assert!(google_provider(Some("  ".into()), Some("\t".into())).unwrap().is_none());
+        assert!(google_provider(Some("id".into()), Some("secret".into())).unwrap().is_some());
+    }
+
+    #[test]
+    fn half_a_credential_stops_the_server() {
+        for (id, secret) in [
+            (Some("id".to_string()), None),
+            (None, Some("secret".to_string())),
+            (Some("id".to_string()), Some("  ".to_string())),
+        ] {
+            assert!(google_provider(id, secret).is_err());
+        }
     }
 }

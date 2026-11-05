@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::aead::{self, Sealed, KEY_LEN};
+use crate::aead::{self, Context, Sealed, KEY_LEN};
 use crate::identity::{self, Identity, PublicKey, SealedBox};
 use crate::{CryptoError, Result};
 
@@ -27,7 +27,44 @@ pub const MAX_PLAINTEXT_BYTES: usize = 48 * 1024;
 /// when this crate is built, so the two limits cannot drift apart unnoticed.
 const _: () = assert!(MAX_PLAINTEXT_BYTES + 64 <= crate::api::MAX_BLOB_BYTES);
 
-const SELF_WRAP_AAD: &[u8] = b"credvault/self-wrap/v1";
+const SELF_WRAP: Context = Context::new("copy of a secret's key", b"credvault/aead/self-wrap");
+/// Bound to the secret's plaintext name as well as its purpose, so the server
+/// cannot present one secret's ciphertext under another's name.
+const SECRET_PAYLOAD: Context = Context::new("secret", b"credvault/aead/secret-payload");
+
+/// Format of the JSON that goes inside a secret's ciphertext.
+///
+/// It is written into the plaintext, so it is covered by the AEAD tag and a
+/// server cannot change it. Its job is forward-looking: a build that meets a
+/// payload written by a *newer* build must refuse it loudly rather than parse
+/// what it recognises and silently drop the rest — a client that dropped a
+/// field and then saved the secret back would destroy data it never showed.
+///
+/// Bump it when the meaning of a field changes or a field becomes required.
+/// Adding an optional field that older builds can ignore does not need a bump;
+/// that is what `serde(default)` on [`SecretPayload::fields`] already covers.
+pub const PAYLOAD_FORMAT: u32 = 1;
+
+/// What is actually encrypted: the payload, tagged with the format it was
+/// written in.
+#[derive(Serialize)]
+struct TaggedPayload<'a> {
+    v: u32,
+    #[serde(flatten)]
+    payload: &'a SecretPayload,
+}
+
+/// Reads the format tag and nothing else.
+///
+/// Deliberately a separate pass over the plaintext rather than a `flatten` on
+/// the way in: flattening makes serde buffer every field into an intermediate
+/// map it owns, which would put the password in an allocation this crate does
+/// not wipe. Skipping the other fields costs one more parse of at most
+/// [`MAX_PLAINTEXT_BYTES`] and keeps the plaintext in buffers that zeroise.
+#[derive(Deserialize)]
+struct FormatTag {
+    v: u32,
+}
 
 /// A secret's key wrapped for one person. The two forms differ in who could
 /// have produced them: anyone can seal a box to a public key, but only the
@@ -101,9 +138,9 @@ pub struct SecretPayload {
     #[serde(default)]
     pub notes: String,
     /// Extra details the fixed fields do not cover. `default` so a payload
-    /// without the key still decrypts. This release requires a fresh database
-    /// (see the README), so no such payload exists in practice; the default
-    /// costs nothing and keeps the next field addition from being a break.
+    /// without the key still decrypts, and `skip_serializing_if` so one with
+    /// no extras is written without it. Together they are what lets a field be
+    /// added here without the addition being a break.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<CustomField>,
 }
@@ -216,8 +253,9 @@ impl SecretKey {
         let name = validate_name(name)?;
         payload.validate()?;
         // The serialised plaintext is wiped as soon as it has been encrypted.
+        let tagged = TaggedPayload { v: PAYLOAD_FORMAT, payload };
         let json =
-            zeroize::Zeroizing::new(serde_json::to_vec(payload).map_err(|e| CryptoError::Encoding(e.to_string()))?);
+            zeroize::Zeroizing::new(serde_json::to_vec(&tagged).map_err(|e| CryptoError::Encoding(e.to_string()))?);
         // Per-field limits cannot catch every combination that adds up to too
         // much, so the total is checked once here, where the real size is known.
         if json.len() > MAX_PLAINTEXT_BYTES {
@@ -227,13 +265,26 @@ impl SecretKey {
                 json.len()
             )));
         }
-        Ok(aead::encrypt(&self.0, &json, name.as_bytes()))
+        Ok(aead::encrypt(&self.0, &json, &SECRET_PAYLOAD.bound_to(name.as_bytes())))
     }
 
     /// Decrypt a payload that was encrypted under `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::Decrypt`] if the key, the name, or the ciphertext is
+    /// wrong; [`CryptoError::UnsupportedPayloadFormat`] if the payload was
+    /// written by a newer build than this one; [`CryptoError::Encoding`] if
+    /// the plaintext is not a payload at all.
     pub fn decrypt(&self, name: &str, sealed: &Sealed) -> Result<SecretPayload> {
         let name = validate_name(name)?;
-        let json = zeroize::Zeroizing::new(aead::decrypt(&self.0, sealed, name.as_bytes())?);
+        let json = zeroize::Zeroizing::new(aead::decrypt(&self.0, sealed, &SECRET_PAYLOAD.bound_to(name.as_bytes()))?);
+        let tag: FormatTag = serde_json::from_slice(&json)
+            .map_err(|e| CryptoError::Encoding(format!("payload has no readable format tag: {e}")))?;
+        // No format below the current one has ever shipped, so an unfamiliar
+        // tag is not old data to migrate; it is a payload this build cannot
+        // account for, and guessing at it would be worse than stopping.
+        crate::check_format(SECRET_PAYLOAD.what(), tag.v, PAYLOAD_FORMAT)?;
         serde_json::from_slice(&json).map_err(|e| CryptoError::Encoding(format!("payload: {e}")))
     }
 
@@ -244,12 +295,12 @@ impl SecretKey {
 
     /// Wrap this key for its owner under their self-wrap key.
     pub fn wrap_for_owner(&self, self_wrap_key: &[u8; KEY_LEN]) -> Sealed {
-        aead::encrypt(self_wrap_key, &self.0, SELF_WRAP_AAD)
+        aead::encrypt(self_wrap_key, &self.0, &SELF_WRAP)
     }
 
     /// Recover the key from the owner's own copy.
     pub fn unwrap_owner(self_wrap_key: &[u8; KEY_LEN], sealed: &Sealed) -> Result<Self> {
-        let bytes = zeroize::Zeroizing::new(aead::decrypt(self_wrap_key, sealed, SELF_WRAP_AAD)?);
+        let bytes = zeroize::Zeroizing::new(aead::decrypt(self_wrap_key, sealed, &SELF_WRAP)?);
         Self::from_bytes(&bytes)
     }
 
@@ -368,6 +419,54 @@ mod tests {
         assert!(SecretKey::unwrap_with(&stranger, &for_owner).is_err());
     }
 
+    /// The tag travels inside the ciphertext, so it is covered by the AEAD tag
+    /// and the server can neither read nor change it.
+    #[test]
+    fn the_format_tag_is_written_inside_the_ciphertext() {
+        let key = SecretKey::generate();
+        let sealed = key.encrypt(NAME, &payload()).unwrap();
+        let plaintext = aead::decrypt(&key.0, &sealed, &SECRET_PAYLOAD.bound_to(NAME.as_bytes())).unwrap();
+        let json = String::from_utf8(plaintext).unwrap();
+        assert!(json.contains(r#""v":1"#), "{json}");
+        // The two tags are different things and only one of them is visible.
+        // What the server stores is the envelope: its own scheme version, the
+        // nonce and the ciphertext. The payload's tag is inside that
+        // ciphertext, along with every field it describes.
+        let stored = serde_json::to_string(&sealed).unwrap();
+        assert!(stored.starts_with(r#"{"v":1,"nonce":""#), "{stored}");
+        for field in ["username", "password", "notes", "fields"] {
+            assert!(!stored.contains(field), "{field} is visible in {stored}");
+        }
+    }
+
+    /// The reason the tag exists: refuse a payload from a newer build rather
+    /// than parse the fields this one knows and drop the rest.
+    #[test]
+    fn a_payload_from_a_newer_build_is_refused_not_half_read() {
+        let key = SecretKey::generate();
+        let from_the_future = format!(
+            r#"{{"v":{},"username":"jude","password":"hunter2","something_new":"must not be dropped"}}"#,
+            PAYLOAD_FORMAT + 1
+        );
+        let sealed = aead::encrypt(&key.0, from_the_future.as_bytes(), &SECRET_PAYLOAD.bound_to(NAME.as_bytes()));
+        let error = key.decrypt(NAME, &sealed).unwrap_err();
+        assert!(matches!(error, CryptoError::NewerFormat { found, .. } if found == PAYLOAD_FORMAT + 1), "{error:?}");
+        assert!(error.to_string().contains("this secret was saved by a newer version"), "{error}");
+    }
+
+    #[test]
+    fn an_untagged_or_unknown_payload_is_refused() {
+        let key = SecretKey::generate();
+        // No tag at all is a payload this build cannot account for...
+        let untagged = r#"{"username":"jude","password":"hunter2"}"#;
+        let sealed = aead::encrypt(&key.0, untagged.as_bytes(), &SECRET_PAYLOAD.bound_to(NAME.as_bytes()));
+        assert!(matches!(key.decrypt(NAME, &sealed), Err(CryptoError::Encoding(_))));
+        // ...and nor is a format number that never existed.
+        let zero = r#"{"v":0,"username":"j","password":"h"}"#;
+        let sealed = aead::encrypt(&key.0, zero.as_bytes(), &SECRET_PAYLOAD.bound_to(NAME.as_bytes()));
+        assert!(matches!(key.decrypt(NAME, &sealed), Err(CryptoError::UnknownFormat { found: 0, .. })));
+    }
+
     #[test]
     fn empty_password_and_oversized_fields_rejected() {
         let key = SecretKey::generate();
@@ -398,10 +497,11 @@ mod tests {
     }
 
     /// Characterises the `default` / `skip_serializing_if` pair: a payload
-    /// without the key decrypts as one with no extra fields, and one with no
-    /// extra fields is written without the key. This release requires a fresh
-    /// database, so it is not a claim about anything already stored — it is
-    /// what keeps the *next* field addition from being a breaking change.
+    /// without the key reads as one with no extra fields, and one with no
+    /// extra fields is written without the key. This works on the struct
+    /// alone, not the encrypted form, which also carries the `v` tag that
+    /// [`SecretKey::encrypt`] adds. It is what keeps a field added here from
+    /// being a breaking change.
     #[test]
     fn an_absent_field_list_reads_and_writes_as_no_extra_fields() {
         let older = r#"{"username":"jude","password":"hunter2","url":"","notes":"note"}"#;

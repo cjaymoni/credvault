@@ -44,10 +44,13 @@ pub const MAX_PENDING_INVITES_RECEIVED: i64 = 500;
 /// This is the cap that matters for abuse. Without it the ceiling above is
 /// reachable by a handful of accounts — five, at the per-inviter cap — each
 /// staying inside its own budget, and the victim's invite list is then closed
-/// to everyone until they work through hundreds of entries by hand. With it,
-/// closing someone's list takes fifty accounts rather than five, and no single
-/// account can take more than a fiftieth of it.
-pub const MAX_PENDING_INVITES_PER_PAIR: i64 = 10;
+/// to everyone until they work through hundreds of entries by hand.
+///
+/// Set above what one legitimate burst looks like: handing a new colleague the
+/// credentials they need is a dozen or two in a sitting, and that must not hit
+/// a wall. At this value it takes twenty accounts to fill someone's list
+/// rather than five, and no single account can take more than a twentieth.
+pub const MAX_PENDING_INVITES_PER_PAIR: i64 = 25;
 
 const REDACTED: &str = "<redacted>";
 

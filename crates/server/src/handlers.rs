@@ -411,22 +411,13 @@ pub async fn change_password(
 ) -> ApiResult<Json<SessionResponse>> {
     // Before anything expensive: this verifies one Argon2 hash and computes
     // another, so an unbounded caller is a way to starve the process.
+    //
+    // Spent on every outcome, including the conflicts. Refunding those was
+    // tried and is not safe: a conflict is raised *after* both Argon2 passes,
+    // and three of the ways to provoke one are decided entirely by the request
+    // body — an empty `rewrapped_keys` is enough — so a caller who knows their
+    // own passphrase could mint unlimited work for free.
     spend_account_budget(&state.password_limiter, user.id, "password change")?;
-    let outcome = rewrite_derived_material(&state, &user, body).await;
-    // A conflict means the vault moved under the caller — another device
-    // rotated a key or added a secret — which is not their doing, and the
-    // retry it demands must not be rationed.
-    if matches!(outcome, Err(ApiError::Conflict(_))) {
-        state.password_limiter.refund(user.id);
-    }
-    outcome
-}
-
-async fn rewrite_derived_material(
-    state: &AppState,
-    user: &AuthUser,
-    body: ChangePasswordRequest,
-) -> ApiResult<Json<SessionResponse>> {
     let private_key = encode_sealed("encrypted_private_key", &body.encrypted_private_key)?;
     let mut rewrapped: HashMap<i64, (i64, String)> = HashMap::with_capacity(body.rewrapped_keys.len());
     for entry in &body.rewrapped_keys {
@@ -887,8 +878,12 @@ pub async fn create_invite(
             .fetch_one(&mut *tx)
             .await?;
     if waiting_for_them >= MAX_PENDING_INVITES_RECEIVED || waiting_from_us >= MAX_PENDING_INVITES_PER_PAIR {
+        // One message for both caps. Which one was hit is not the caller's
+        // business — the other person's totals are theirs — and this wording
+        // is true either way, where "they have too many" would not be when the
+        // caller is the only one who sent any.
         return Err(ApiError::Forbidden(
-            "that person has too many invitations waiting; ask them to answer some first".into(),
+            "there are too many invitations waiting for that person to answer; ask them to clear some first".into(),
         ));
     }
     // A wrapped key made from a rotated-away version would never open the payload.

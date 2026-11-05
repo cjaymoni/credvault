@@ -1517,3 +1517,66 @@ async fn passphrase_changes_are_throttled_per_account() {
     let response = server.req(Method::POST, "/password", &alice).json(&wrong).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
+
+/// A caller can force a conflict at will — an empty `rewrapped_keys` is one —
+/// and every conflict arrives after both Argon2 passes have already run. So a
+/// conflict must still cost a token, or the budget is not a budget.
+#[tokio::test]
+async fn conflicts_still_spend_the_password_budget() {
+    let limits = RateLimits { password_burst: 2, password_refill: Duration::from_secs(600), ..Default::default() };
+    let server = spawn_with(ServerConfig { rate_limits: limits, ..Default::default() }).await;
+    let alice = register(&server, "alice@example.com", "old-password-here").await;
+    server.create_secret(&alice, "GitHub", &payload()).await;
+
+    // The passphrase is correct, so the expensive work happens every time; only
+    // the key set is wrong, which the caller chooses.
+    let mut body = rewrap_everything(&server, &alice, "old-password-here", "new-password-here").await;
+    body.rewrapped_keys.clear();
+
+    let mut conflicts = 0;
+    let mut throttled = 0;
+    for _ in 0..6 {
+        let response = server.req(Method::POST, "/password", &alice).json(&body).send().await.unwrap();
+        match response.status() {
+            StatusCode::CONFLICT => conflicts += 1,
+            StatusCode::TOO_MANY_REQUESTS => throttled += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert_eq!(conflicts, 2, "the burst is spent by conflicts like any other call");
+    assert_eq!(throttled, 4, "and then the caller is throttled");
+}
+
+/// One account may not take more than a small share of a stranger's invite
+/// list, however many secrets it owns.
+#[tokio::test]
+async fn one_account_cannot_fill_a_strangers_invite_list() {
+    let server = spawn().await;
+    let sender = register(&server, "sender@example.com", "correct horse battery").await;
+    let victim = register(&server, "victim@example.com", "correct horse battery").await;
+
+    // An invite is unique per secret and invitee, so each one needs its own
+    // secret. The cap must bite before the sender runs out of those.
+    let mut refused_at = None;
+    for attempt in 0..MAX_PENDING_INVITES_PER_PAIR + 2 {
+        let (id, key) = server.create_secret(&sender, &format!("secret {attempt}"), &payload()).await;
+        let response = server
+            .req(Method::POST, &format!("/secrets/{id}/invites"), &sender)
+            .json(&InviteRequest {
+                email: victim.email.clone(),
+                fingerprint: victim.identity.public_key().fingerprint(),
+                wrapped_key: key.wrap_for(victim.identity.public_key()).unwrap(),
+                message: String::new(),
+                key_version: 0,
+            })
+            .send()
+            .await
+            .unwrap();
+        if response.status() == StatusCode::FORBIDDEN {
+            refused_at = Some(attempt);
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    assert_eq!(refused_at, Some(MAX_PENDING_INVITES_PER_PAIR), "the cap must be the per-pair one");
+}

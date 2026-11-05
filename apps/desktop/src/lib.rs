@@ -859,12 +859,16 @@ async fn change_password(
     })
 }
 
-/// How long to wait before probing a second time.
+/// How long to keep asking before settling for an inconclusive answer, and
+/// how often.
 ///
-/// The first probe can land while the server is still inside the transaction,
-/// where the sessions have not been deleted yet, so one "still signed in" is
-/// evidence of nothing. Two of them, far enough apart, are.
-const PROBE_SETTLE: Duration = Duration::from_secs(5);
+/// Sized against the work being asked about rather than picked round. A probe
+/// can land while the server is still inside the transaction, where sessions
+/// have not been deleted yet, and "still signed in" then means *not yet*
+/// rather than *will not be*. Only watching for the answer to change tells
+/// those apart, so this keeps asking rather than sampling twice and guessing.
+const PROBE_BUDGET: Duration = Duration::from_secs(30);
+const PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// What a probe could establish about a change whose answer never arrived.
 enum ChangeOutcome {
@@ -915,18 +919,25 @@ async fn resolve_lost_answer(state: &AppState, api: &ApiClient, reason: String) 
     }
 }
 
-/// Ask twice whether this session still exists, with a gap between.
+/// Watch whether this session is still alive, until the answer is conclusive
+/// or the budget runs out.
+///
+/// A session that disappears is conclusive the moment it happens, because only
+/// the committing transaction deletes it. A session that is still there is
+/// never conclusive on its own — it only becomes an answer by staying there.
 async fn probe_change(api: &ApiClient) -> ChangeOutcome {
-    match api.me().await {
-        Err(ClientError::Unauthorized) => return ChangeOutcome::Applied,
-        Err(_) => return ChangeOutcome::Unknown,
-        Ok(_) => {}
-    }
-    tokio::time::sleep(PROBE_SETTLE).await;
-    match api.me().await {
-        Ok(_) => ChangeOutcome::NotApplied,
-        Err(ClientError::Unauthorized) => ChangeOutcome::Applied,
-        Err(_) => ChangeOutcome::Unknown,
+    let deadline = std::time::Instant::now() + PROBE_BUDGET;
+    loop {
+        let seen = match api.me().await {
+            // Nothing but the commit takes a session away.
+            Err(ClientError::Unauthorized) => return ChangeOutcome::Applied,
+            Ok(_) => ChangeOutcome::NotApplied,
+            Err(_) => ChangeOutcome::Unknown,
+        };
+        if std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        tokio::time::sleep(PROBE_INTERVAL).await;
     }
 }
 

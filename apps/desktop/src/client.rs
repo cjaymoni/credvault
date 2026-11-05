@@ -70,30 +70,21 @@ impl ApiClient {
         path: &str,
         body: Option<&impl Serialize>,
     ) -> Result<T, ClientError> {
-        self.send_to(method, &format!("{}/api{path}", self.base_url), body).await
+        self.send_within(method, path, body, None).await
     }
 
-    /// The transport every request shares. Takes a whole URL, because
-    /// `/health` sits outside `/api`.
-    async fn send_to<T: DeserializeOwned>(
-        &self,
-        method: Method,
-        url: &str,
-        body: Option<&impl Serialize>,
-    ) -> Result<T, ClientError> {
-        self.send_within(method, url, body, None).await
-    }
-
-    /// As `send_to`, with a deadline of its own. One request legitimately
-    /// takes far longer than the rest; see [`ApiClient::change_password`].
+    /// The transport every `/api` request shares, with a deadline of its own.
+    /// One request legitimately takes far longer than the rest; see
+    /// [`ApiClient::change_password`].
     async fn send_within<T: DeserializeOwned>(
         &self,
         method: Method,
-        url: &str,
+        path: &str,
         body: Option<&impl Serialize>,
         timeout: Option<std::time::Duration>,
     ) -> Result<T, ClientError> {
-        let mut request = self.http.request(method, url);
+        let url = format!("{}/api{path}", self.base_url);
+        let mut request = self.http.request(method, &url);
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
@@ -174,8 +165,7 @@ impl ApiClient {
     /// whether the change happened, and that ambiguity is the one thing this
     /// request must not produce.
     pub async fn change_password(&self, body: &ChangePasswordRequest) -> Result<SessionResponse, ClientError> {
-        let url = format!("{}/api/password", self.base_url);
-        self.send_within(Method::POST, &url, Some(body), Some(PASSWORD_CHANGE_TIMEOUT)).await
+        self.send_within(Method::POST, "/password", Some(body), Some(PASSWORD_CHANGE_TIMEOUT)).await
     }
 
     pub async fn logout(&self) -> Result<(), ClientError> {

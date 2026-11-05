@@ -74,17 +74,6 @@ impl<K: Copy + Eq + Hash + Ord> RateLimiter<K> {
         self.try_acquire_keyed_at(key, Instant::now())
     }
 
-    /// Give a token back to `key`, for work that was refused for reasons the
-    /// caller did not choose. Never takes a bucket above its capacity, and
-    /// does nothing for a key that has no bucket.
-    pub(crate) fn refund(&self, key: K) {
-        let capacity = f64::from(self.capacity);
-        let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(bucket) = buckets.get_mut(&key) {
-            bucket.tokens = (bucket.tokens + 1.0).min(capacity);
-        }
-    }
-
     fn try_acquire_keyed_at(&self, key: K, now: Instant) -> Result<(), Duration> {
         let capacity = f64::from(self.capacity);
         let mut buckets = self.buckets.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -315,31 +304,6 @@ mod tests {
         let buckets = limiter.buckets.lock().unwrap();
         assert!(!buckets.contains_key(&early));
         assert!(buckets.contains_key(&late));
-    }
-
-    #[test]
-    fn a_refund_restores_a_token_without_exceeding_capacity() {
-        let limiter: RateLimiter<i64> = RateLimiter::new(2, Duration::from_secs(600));
-        let start = Instant::now();
-        assert!(limiter.try_acquire_keyed_at(1, start).is_ok());
-        assert!(limiter.try_acquire_keyed_at(1, start).is_ok());
-        assert!(limiter.try_acquire_keyed_at(1, start).is_err());
-
-        limiter.refund(1);
-        assert!(limiter.try_acquire_keyed_at(1, start).is_ok(), "the refunded token is spendable");
-        assert!(limiter.try_acquire_keyed_at(1, start).is_err());
-
-        // Refunding beyond capacity does not bank credit for later.
-        for _ in 0..10 {
-            limiter.refund(1);
-        }
-        assert!(limiter.try_acquire_keyed_at(1, start).is_ok());
-        assert!(limiter.try_acquire_keyed_at(1, start).is_ok());
-        assert!(limiter.try_acquire_keyed_at(1, start).is_err());
-
-        // A key with no bucket is simply left alone.
-        limiter.refund(99);
-        assert_eq!(limiter.tracked(), 1);
     }
 
     #[test]

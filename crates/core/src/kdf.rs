@@ -27,7 +27,14 @@ const AUTH_INFO: &[u8] = b"credvault/auth-hash/v1";
 const ENC_INFO: &[u8] = b"credvault/private-key-encryption/v1";
 const SELF_WRAP_INFO: &[u8] = b"credvault/self-wrap/v1";
 
-pub const MIN_PASSWORD_LEN: usize = 8;
+/// The account password is the only thing protecting the vault, there is no
+/// recovery, and a stolen database can be attacked offline at whatever rate
+/// the attacker's hardware allows. Argon2 raises the cost per guess but
+/// cannot make a short password long, so the floor is set well above the
+/// eight characters that are conventional for ordinary logins.
+///
+/// This is policy for a *new* password only. See [`validate_new_password`].
+pub const MIN_PASSWORD_LEN: usize = 12;
 
 /// Length in bytes of the decoded auth hash sent to the server.
 pub const AUTH_HASH_LEN: usize = KEY_LEN;
@@ -59,11 +66,24 @@ fn salt_for(email: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Check a password someone is about to register with.
+///
+/// Deliberately separate from [`MasterKey::derive`], which must stay free of
+/// policy: `derive` also runs on every login, so enforcing a length floor
+/// there would lock anyone who registered under an older, shorter floor out
+/// of a vault that cannot be recovered. Raising the floor must only ever
+/// affect accounts being created.
+pub fn validate_new_password(password: &str) -> Result<()> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(CryptoError::InvalidInput(format!("password must be at least {MIN_PASSWORD_LEN} characters")));
+    }
+    Ok(())
+}
+
 impl MasterKey {
+    /// Derive the master key. Applies no password policy: see
+    /// [`validate_new_password`] for why that belongs at registration only.
     pub fn derive(password: &str, email: &str) -> Result<Self> {
-        if password.chars().count() < MIN_PASSWORD_LEN {
-            return Err(CryptoError::InvalidInput(format!("password must be at least {MIN_PASSWORD_LEN} characters")));
-        }
         let params = Params::new(ARGON2_MEMORY_KIB, ARGON2_ITERATIONS, ARGON2_PARALLELISM, Some(KEY_LEN))
             .map_err(|_| CryptoError::Kdf)?;
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -125,8 +145,19 @@ mod tests {
     }
 
     #[test]
-    fn short_password_rejected() {
-        assert!(MasterKey::derive("short", "me@example.com").is_err());
+    fn the_length_floor_applies_to_new_passwords_only() {
+        assert!(validate_new_password("short").is_err());
+        assert!(validate_new_password(&"x".repeat(MIN_PASSWORD_LEN - 1)).is_err());
+        assert!(validate_new_password(&"x".repeat(MIN_PASSWORD_LEN)).is_ok());
+        // Counted in characters, not bytes, so a short non-ASCII password is
+        // not waved through by its encoded length.
+        assert!(validate_new_password(&"é".repeat(MIN_PASSWORD_LEN - 1)).is_err());
+
+        // Deriving must stay policy-free: raising the floor would otherwise
+        // lock an existing account out of a vault nobody can recover.
+        assert!(MasterKey::derive("short", "me@example.com").is_ok());
+        let old = MasterKey::derive("8charpw!", "me@example.com").unwrap();
+        assert_eq!(*old.auth_hash(), *MasterKey::derive("8charpw!", "me@example.com").unwrap().auth_hash());
     }
 
     #[test]

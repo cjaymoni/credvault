@@ -7,6 +7,13 @@ ability to share a single secret with another person.
 - **Server** (`crates/server`): Axum + SQLite. Stores only ciphertext.
 - **Core** (`crates/core`): the cryptography, shared by both.
 
+> **Pre-release.** There is no compatibility guarantee between builds yet, and
+> no upgrade path. This build changes the stored key format, the database
+> schema and the client/server API, so it needs a **fresh database**: a vault
+> written by an earlier build cannot be read by this one and cannot be
+> migrated, because the server holds only ciphertext it has no way to rewrite.
+> Run a matching client and server, built from the same commit.
+
 ## How the security works
 
 The server never sees a password, a username, or a key that could decrypt one.
@@ -19,10 +26,11 @@ The server never sees a password, a username, or a key that could decrypt one.
    encryption key above and stored on the server, so you can log in from any
    device and recover it.
 3. Every secret has its own random AES-256-GCM key. The username, password,
-   URL, and notes are encrypted with it. Only the secret's *name* is stored in
-   plaintext so lists and invites can show it; the name is authenticated as
-   associated data, so the server cannot present one secret's contents under
-   another secret's name.
+   URL, notes, and any extra fields you add are encrypted with it, as one
+   blob, so the server cannot even tell which of them a secret has. Only the
+   secret's *name* is stored in plaintext so lists and invites can show it;
+   the name is authenticated as associated data, so the server cannot present
+   one secret's contents under another secret's name.
 4. That key is wrapped once per person who may read the secret. Your own copy
    is encrypted under a key derived from your master key, so nobody else,
    the server included, can produce one. Everyone else's copy is sealed to
@@ -41,15 +49,19 @@ key instead of your friend's and read whatever you share. To prevent that, the
 app shows a short **fingerprint** of every key:
 
 - Your own fingerprint is in the header after you log in ("Your key: …").
-- When you invite someone, the app shows the fingerprint of the key the server
-  returned for them. Ask them (by phone, in person, any channel that is not the
-  server) to read theirs out, and only confirm if it matches.
-- The app remembers keys it has confirmed. If the server later returns a
-  different key for the same person, you are warned before anything is
-  encrypted to it.
+- To invite someone the first time, you enter their fingerprint along with
+  their email. Ask them (by phone, in person, any channel that is not the
+  server) to read it out. The server answers the lookup only if the
+  fingerprint matches the key it holds, so you never encrypt to a key you were
+  not already expecting.
+- The app remembers keys it has confirmed, so sharing with the same person
+  again needs no typing. If the server later offers a different key for them,
+  the lookup fails and you are told to get their current fingerprint directly
+  rather than being shown a key to wave through.
 
-If you skip the comparison and just click confirm, you are trusting the server
-operator for that one secret.
+Because the fingerprint is required up front, the server also cannot be used
+to find out who has an account: a wrong fingerprint, a wrong address and an
+address nobody has registered all give the same answer.
 
 ### Consequences worth knowing
 
@@ -80,6 +92,7 @@ Requires Rust (https://rustup.rs). On Linux, Tauri also needs
 
 ```sh
 cargo test --workspace            # core + server + desktop tests
+node --test apps/desktop/ui-tests/   # the editor logic in apps/desktop/ui/fields.js
 cargo build --release -p credvault-server
 cargo install tauri-cli --version "^2" --locked
 cd apps/desktop && cargo tauri build     # produces an installer in target/release/bundle
@@ -107,14 +120,16 @@ one every 6 s; 5 registrations then one per minute). The data directory is
 created with owner-only permissions.
 
 Open the desktop app, enter the server URL, your email, and a password of at
-least 8 characters, then click **Create account** (enter the registration
+least 12 characters, then click **Create account** (enter the registration
 token too if the server requires one). From then on, **Log in**.
 
 To share a secret with someone: they create an account on the same server
-first. Then you open the secret, type their email under **Sharing**, click
-**Invite**, compare the fingerprint the app shows with the one in their app's
-header, and confirm. They see the invite the next time they log in or refresh,
-and accept or decline it. You can revoke their access at any time.
+first. Then you open the secret and, under **Sharing**, type their email and
+the fingerprint from their app's header, which they read out to you over some
+channel other than the server. Click **Invite** and confirm. Sharing with the
+same person later needs only their email, because the app has pinned their
+key. They see the invite the next time they log in or refresh, and accept or
+decline it. You can revoke their access at any time.
 
 Copied passwords are cleared from the clipboard after 30 seconds (unless you
 have copied something else since), and a revealed password is hidden again

@@ -26,6 +26,16 @@ const PUBLIC_KEY_LEN: usize = 32;
 /// enough to read out loud in six groups.
 const FINGERPRINT_BYTES: usize = 12;
 
+/// Hex digits in a fingerprint once the separators are stripped.
+pub const FINGERPRINT_HEX_LEN: usize = 2 * FINGERPRINT_BYTES;
+
+/// Fingerprints are read aloud and typed back in, so only the hex digits carry
+/// meaning: spacing, separators and case do not. Normalise before comparing,
+/// so that `3F1A 9C0E…` and `3f1a-9c0e-…` are the same fingerprint.
+pub fn normalize_fingerprint(text: &str) -> String {
+    text.chars().filter(char::is_ascii_hexdigit).map(|c| c.to_ascii_lowercase()).collect()
+}
+
 /// A user's public key, safe to publish. Serialises as base64 and can only be
 /// deserialised from exactly 32 bytes.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +221,23 @@ mod tests {
         let alice = Identity::generate();
         let json = serde_json::to_string(alice.public_key()).unwrap();
         assert_eq!(serde_json::from_str::<PublicKey>(&json).unwrap(), *alice.public_key());
+    }
+
+    #[test]
+    fn fingerprints_compare_ignoring_separators_and_case() {
+        let alice = Identity::generate();
+        let fp = alice.public_key().fingerprint();
+        let canonical = normalize_fingerprint(&fp);
+        assert_eq!(canonical.len(), FINGERPRINT_HEX_LEN);
+        assert!(canonical.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // The same fingerprint typed back in any of the ways a person might.
+        for typed in [fp.clone(), fp.to_uppercase(), fp.replace('-', " "), fp.replace('-', "")] {
+            assert_eq!(normalize_fingerprint(&typed), canonical, "{typed:?}");
+        }
+        // Non-hex noise is dropped, but a different key is still different.
+        assert_eq!(normalize_fingerprint(&format!("  {fp}  ")), canonical);
+        assert_ne!(normalize_fingerprint(&Identity::generate().public_key().fingerprint()), canonical);
+        assert_eq!(normalize_fingerprint(""), "");
     }
 
     #[test]

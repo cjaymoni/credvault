@@ -24,24 +24,37 @@ use ratelimit::{AuthLimit, RateLimiter};
 /// Largest request body the server accepts; blobs are capped lower in handlers.
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
-/// Per-client-address token buckets for the unauthenticated endpoints.
+/// Token buckets: per client address for the unauthenticated endpoints, per
+/// caller id for the directory lookup.
 #[derive(Clone, Debug)]
 pub struct RateLimits {
     pub login_burst: u32,
     pub login_refill: Duration,
     pub register_burst: u32,
     pub register_refill: Duration,
+    /// Per authenticated user, not per address: an address can be rotated at
+    /// will and an account cannot, and this is what bounds guessing at
+    /// fingerprints. It is no longer about hiding who has an account, which
+    /// `resolve_by_fingerprint` now does on its own.
+    pub lookup_burst: u32,
+    pub lookup_refill: Duration,
 }
 
 impl Default for RateLimits {
     /// Logins: a burst of 10, then one every 6 seconds. Registrations: a
-    /// burst of 5, then one per minute.
+    /// burst of 5, then one per minute. Lookups: a burst of 30, then one
+    /// every 3 seconds. Sharing with one person spends three: the lookup
+    /// that shows their fingerprint, the re-lookup that confirms the key
+    /// they approved, and the invite itself. Still far more than sharing
+    /// needs and far less than walking a list of addresses needs.
     fn default() -> Self {
         Self {
             login_burst: 10,
             login_refill: Duration::from_secs(6),
             register_burst: 5,
             register_refill: Duration::from_secs(60),
+            lookup_burst: 30,
+            lookup_refill: Duration::from_secs(3),
         }
     }
 }
@@ -71,6 +84,10 @@ pub struct ServerConfig {
 pub struct AppState {
     pub pool: SqlitePool,
     pub config: Arc<ServerConfig>,
+    /// Throttles the email directory per caller. Handlers take a token from it
+    /// rather than a middleware, because the caller is only known after the
+    /// session has been resolved.
+    pub lookup_limiter: Arc<RateLimiter<i64>>,
 }
 
 /// Open (creating if needed) the SQLite database and apply migrations.
@@ -92,13 +109,14 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     // Pay for the timing-equalisation hash now rather than on the first login.
     auth::dummy_hash();
 
+    let limits = config.rate_limits.clone();
     let limit_for = |burst, refill| AuthLimit {
         limiter: Arc::new(RateLimiter::new(burst, refill)),
         trust_forwarded_for: config.trust_forwarded_for,
     };
-    let limits = &config.rate_limits;
     let login_limit = limit_for(limits.login_burst, limits.login_refill);
     let register_limit = limit_for(limits.register_burst, limits.register_refill);
+    let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
 
     let api = Router::new()
         .route(
@@ -112,7 +130,6 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .route("/users/lookup", get(handlers::lookup_user))
         .route("/secrets", get(handlers::list_secrets).post(handlers::create_secret))
         .route("/secrets/{id}", get(handlers::get_secret).put(handlers::update_secret).delete(handlers::delete_secret))
-        .route("/secrets/{id}/owner-key", axum::routing::put(handlers::upgrade_owner_key))
         .route("/secrets/{id}/access", get(handlers::secret_access))
         .route("/secrets/{id}/access/{user_id}/revoke", post(handlers::revoke_access))
         .route("/secrets/{id}/invites", post(handlers::create_invite))
@@ -126,7 +143,7 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .nest("/api", api)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState { pool, config: Arc::new(config) })
+        .with_state(AppState { pool, config: Arc::new(config), lookup_limiter })
 }
 
 /// Convenience for callers that want the connect-info service type spelled out.

@@ -11,6 +11,10 @@ pub enum ClientError {
     Network(String),
     #[error("{0}")]
     Server(String),
+    /// 404: no account matched. Deliberately says nothing about whether the
+    /// address or the fingerprint was wrong, because the server does not say.
+    #[error("{0}")]
+    NotFound(String),
     /// 409: the secret changed under us (key rotated, membership changed, or
     /// a duplicate); callers may refresh and retry once.
     #[error("{0}")]
@@ -82,6 +86,9 @@ impl ApiClient {
         if status == StatusCode::CONFLICT {
             return Err(ClientError::Conflict(message));
         }
+        if status == StatusCode::NOT_FOUND {
+            return Err(ClientError::NotFound(message));
+        }
         Err(ClientError::Server(message))
     }
 
@@ -99,8 +106,11 @@ impl ApiClient {
         self.send(Method::POST, "/logout", Self::NO_BODY).await
     }
 
-    pub async fn lookup_user(&self, email: &str) -> Result<PublicUser, ClientError> {
-        let path = format!("/users/lookup?email={}", urlencode(email));
+    /// The fingerprint is part of the query: the server only answers for a
+    /// caller who already knows it, so this never reveals whether an address
+    /// has an account.
+    pub async fn lookup_user(&self, email: &str, fingerprint: &str) -> Result<PublicUser, ClientError> {
+        let path = format!("/users/lookup?email={}&fingerprint={}", urlencode(email), urlencode(fingerprint));
         self.send(Method::GET, &path, Self::NO_BODY).await
     }
 
@@ -118,10 +128,6 @@ impl ApiClient {
 
     pub async fn update_secret(&self, id: i64, body: &UpdateSecretRequest) -> Result<(), ClientError> {
         self.send(Method::PUT, &format!("/secrets/{id}"), Some(body)).await
-    }
-
-    pub async fn upgrade_owner_key(&self, id: i64, body: &UpgradeOwnerKeyRequest) -> Result<(), ClientError> {
-        self.send(Method::PUT, &format!("/secrets/{id}/owner-key"), Some(body)).await
     }
 
     pub async fn delete_secret(&self, id: i64) -> Result<(), ClientError> {

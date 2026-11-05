@@ -4,7 +4,8 @@
 use std::net::SocketAddr;
 
 use credvault_core::api::MAX_BLOB_BYTES;
-use credvault_core::{Identity, MasterKey, Sealed, SecretKey, SecretPayload, WrappedKey};
+use credvault_core::secret::CustomField;
+use credvault_core::{Identity, MasterKey, PublicKey, Sealed, SecretKey, SecretPayload, WrappedKey};
 use credvault_server::api::*;
 use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use reqwest::{Client, Method, StatusCode};
@@ -104,7 +105,11 @@ impl TestServer {
     }
 
     async fn list(&self, account: &Account) -> Vec<SecretView> {
-        self.req(Method::GET, "/secrets", account).send().await.unwrap().json().await.unwrap()
+        let response = self.req(Method::GET, "/secrets", account).send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        // Report the server's own error rather than a decode failure against it.
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("listing secrets failed: {status} {body} ({e})"))
     }
 
     async fn access(&self, account: &Account, secret_id: i64) -> AccessView {
@@ -113,9 +118,24 @@ impl TestServer {
         response.json().await.unwrap()
     }
 
+    /// The fingerprint the inviter would have been given out of band, read
+    /// straight from the database: how the caller came by it is not what these
+    /// tests are about. An address with no account gets a stand-in that
+    /// matches nothing, which is what a guess looks like.
+    async fn fingerprint_of(&self, email: &str) -> String {
+        let row: Option<(String,)> = sqlx::query_as("SELECT public_key FROM users WHERE email = ?")
+            .bind(email.to_lowercase())
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap();
+        row.map(|(key,)| PublicKey::from_base64(&key).unwrap().fingerprint())
+            .unwrap_or_else(|| "0000-0000-0000-0000-0000-0000".into())
+    }
+
     async fn invite(&self, owner: &Account, secret_id: i64, key: &SecretKey, email: &str) -> reqwest::Response {
+        let fingerprint = self.fingerprint_of(email).await;
         let lookup: PublicUser = self
-            .req(Method::GET, &format!("/users/lookup?email={email}"), owner)
+            .req(Method::GET, &format!("/users/lookup?email={email}&fingerprint={fingerprint}"), owner)
             .send()
             .await
             .unwrap()
@@ -126,6 +146,7 @@ impl TestServer {
         let body = InviteRequest {
             key_version,
             email: email.into(),
+            fingerprint,
             wrapped_key: key.wrap_for(&lookup.public_key).unwrap(),
             message: "for you".into(),
         };
@@ -189,6 +210,14 @@ fn payload() -> SecretPayload {
         password: "hunter2!".into(),
         url: "https://example.com".into(),
         notes: String::new(),
+        // Custom fields ride inside the encrypted blob, so every end-to-end
+        // test carries a pair of them to prove the server stores and shares
+        // them without being able to tell they are there.
+        // Fixed ids, so a payload compares equal to itself across calls.
+        fields: vec![
+            CustomField { id: "aa01".into(), label: "Account number".into(), value: "12345678".into(), secret: false },
+            CustomField { id: "bb02".into(), label: "Recovery code".into(), value: "aaaa-bbbb".into(), secret: true },
+        ],
     }
 }
 
@@ -304,14 +333,14 @@ async fn malformed_json_and_oversized_bodies_get_clear_errors() {
 #[tokio::test]
 async fn registration_can_be_closed_or_token_gated() {
     let closed = spawn_with(ServerConfig { registration: RegistrationPolicy::Closed, ..Default::default() }).await;
-    let body = register_body("a@example.com", "a-password", &Identity::generate());
+    let body = register_body("a@example.com", "alpha-password", &Identity::generate());
     let response = closed.client.post(format!("{}/register", closed.base)).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let gated =
         spawn_with(ServerConfig { registration: RegistrationPolicy::Token("let-me-in".into()), ..Default::default() })
             .await;
-    let mut body = register_body("b@example.com", "b-password", &Identity::generate());
+    let mut body = register_body("b@example.com", "bravo-password", &Identity::generate());
     let response = gated.client.post(format!("{}/register", gated.base)).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     body.registration_token = Some("wrong".into());
@@ -406,17 +435,101 @@ fn with_token(account: &Account, token: String) -> Account {
 }
 
 #[tokio::test]
-async fn lookup_validates_email_and_hides_nothing_extra() {
+async fn lookup_is_rate_limited_per_account_not_per_address() {
+    // Two lookups each, from one address, so only the account can tell them apart.
+    let limits =
+        RateLimits { lookup_burst: 2, lookup_refill: std::time::Duration::from_secs(60), ..Default::default() };
+    let server = spawn_with(ServerConfig { rate_limits: limits, ..Default::default() }).await;
+    let alice = register(&server, "alice@example.com", "alice-password").await;
+    let bob = register(&server, "bob@example.com", "bob-password").await;
+
+    let bob_fp = bob.identity.public_key().fingerprint();
+    let alice_fp = alice.identity.public_key().fingerprint();
+    let lookup = |account: &'_ Account, email: &'_ str, fingerprint: &'_ str| {
+        server.req(Method::GET, &format!("/users/lookup?email={email}&fingerprint={fingerprint}"), account).send()
+    };
+
+    // Misses count too, or guessing would be free.
+    assert_eq!(lookup(&alice, "ghost1@example.com", &bob_fp).await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(lookup(&alice, "bob@example.com", &bob_fp).await.unwrap().status(), StatusCode::OK);
+    let throttled = lookup(&alice, "ghost2@example.com", &bob_fp).await.unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(throttled.headers().get("retry-after").is_some());
+
+    // Bob shares Alice's address but not her budget.
+    assert_eq!(lookup(&bob, "alice@example.com", &alice_fp).await.unwrap().status(), StatusCode::OK);
+
+    // A second session for Alice does not refill her budget either.
+    let master = MasterKey::derive("alice-password", "alice@example.com").unwrap();
+    let session: SessionResponse = login(&server, "alice@example.com", master.auth_hash()).await.json().await.unwrap();
+    let second = Account { token: session.token, ..alice };
+    assert_eq!(lookup(&second, "bob@example.com", &bob_fp).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Inviting resolves an address the same way, so it spends from the same
+    // budget: a path that did not would simply be the unthrottled way in.
+    let (id, key) = server.create_secret(&second, "Bank", &payload()).await;
+    let body = InviteRequest {
+        key_version: 0,
+        email: "bob@example.com".into(),
+        fingerprint: bob_fp.clone(),
+        wrapped_key: key.wrap_for(bob.identity.public_key()).unwrap(),
+        message: String::new(),
+    };
+    let response =
+        server.req(Method::POST, &format!("/secrets/{id}/invites"), &second).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn lookup_answers_only_for_a_fingerprint_the_caller_already_knows() {
     let server = spawn().await;
     let alice = register(&server, "alice@example.com", "alice-password").await;
-    let response = server.req(Method::GET, "/users/lookup?email=not-an-email", &alice).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let response = server.req(Method::GET, "/users/lookup?email=ghost@example.com", &alice).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let response = server.req(Method::GET, "/users/lookup?email=ALICE@example.com", &alice).send().await.unwrap();
-    let user: PublicUser = response.json().await.unwrap();
-    assert_eq!(user.id, alice.id);
-    assert_eq!(&user.public_key, alice.identity.public_key());
+    let bob = register(&server, "bob@example.com", "bob-password").await;
+    let fp = bob.identity.public_key().fingerprint();
+    let get = |query: String| server.req(Method::GET, &format!("/users/lookup?{query}"), &alice).send();
+
+    // The right address and the right fingerprint, however it was typed.
+    for typed in [fp.clone(), fp.to_uppercase(), fp.replace('-', ""), fp.replace('-', " ")] {
+        let response = get(format!("email=BOB@Example.com&fingerprint={}", typed.replace(' ', "%20"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{typed:?}");
+        let user: PublicUser = response.json().await.unwrap();
+        assert_eq!(user.id, bob.id);
+        assert_eq!(&user.public_key, bob.identity.public_key());
+    }
+
+    // A malformed address is still a 400, and a missing fingerprint cannot be
+    // left off to get the old behaviour back.
+    assert_eq!(get(format!("email=not-an-email&fingerprint={fp}")).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(get("email=bob@example.com".into()).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    let long = "a".repeat(200);
+    assert_eq!(
+        get(format!("email=bob@example.com&fingerprint={long}")).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn lookup_never_reveals_whether_an_address_has_an_account() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "alice-password").await;
+    let bob = register(&server, "bob@example.com", "bob-password").await;
+    let wrong = Identity::generate().public_key().fingerprint();
+    let get = |email: &'_ str, fingerprint: &'_ str| {
+        server.req(Method::GET, &format!("/users/lookup?email={email}&fingerprint={fingerprint}"), &alice).send()
+    };
+
+    // Bob has an account and Carol does not. Without Bob's fingerprint the two
+    // are indistinguishable: same status, same body, so no answer leaks.
+    let registered = get("bob@example.com", &wrong).await.unwrap();
+    let unregistered = get("carol@example.com", &wrong).await.unwrap();
+    assert_eq!(registered.status(), StatusCode::NOT_FOUND);
+    assert_eq!(registered.status(), unregistered.status());
+    assert_eq!(registered.text().await.unwrap(), unregistered.text().await.unwrap());
+
+    // Knowing the fingerprint is the only thing that tells them apart, and it
+    // is something the person has to have told the caller themselves.
+    let known = get("bob@example.com", &bob.identity.public_key().fingerprint()).await.unwrap();
+    assert_eq!(known.status(), StatusCode::OK);
 }
 
 // ----- secrets --------------------------------------------------------------
@@ -673,6 +786,111 @@ async fn revoke_validates_membership_and_wrapped_key_set() {
 }
 
 #[tokio::test]
+async fn custom_fields_survive_sharing_and_stay_opaque_to_the_server() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "alice-password").await;
+    let bob = register(&server, "bob@example.com", "bob-password").await;
+    let (id, key) = server.create_secret(&alice, "Bank", &payload()).await;
+
+    // Extra details ride inside the encrypted blob, so none of it is readable
+    // in the row the server kept: not the labels, not the values.
+    let (stored_name, stored_payload): (String, String) =
+        sqlx::query_as("SELECT name, payload FROM secrets WHERE id = ?")
+            .bind(id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_name, "Bank", "only the name is stored in the clear, as before");
+    for leaked in ["Account number", "12345678", "Recovery code", "aaaa-bbbb"] {
+        assert!(!stored_payload.contains(leaked), "{leaked:?} leaked into the stored row");
+    }
+
+    // Bob gets them intact, hidden flag and order included, once it is shared.
+    let invite: Created = server.invite(&alice, id, &key, "bob@example.com").await.json().await.unwrap();
+    server.accept(&bob, invite.id).await;
+    let view = server.list(&bob).await.remove(0);
+    // An accepted invite becomes a member's copy, in the one form a member's
+    // copy may take. The invite carried a sealed box; this is where it lands.
+    assert!(matches!(view.wrapped_key, WrappedKey::Shared(_)));
+    let shared = decrypt(&view, &bob);
+    assert_eq!(shared.fields, payload().fields);
+    assert!(shared.fields[1].secret, "the hidden flag travels with the field");
+    assert_eq!(shared.fields[0].label, "Account number");
+}
+
+#[tokio::test]
+async fn an_invite_cannot_be_created_against_a_rotated_away_key() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "alice-password").await;
+    let bob = register(&server, "bob@example.com", "bob-password").await;
+    let carol = register(&server, "carol@example.com", "carol-password").await;
+    let (id, key) = server.create_secret(&alice, "Bank", &payload()).await;
+
+    // Bob joins and is then revoked, which rotates the key to version 1.
+    let invite: Created = server.invite(&alice, id, &key, "bob@example.com").await.json().await.unwrap();
+    server.accept(&bob, invite.id).await;
+    let (response, new_key) = server.revoke(&alice, id, bob.id, &payload()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(server.key_version(&alice, id).await, 1);
+
+    // An invite wrapping the superseded key is refused, and leaves nothing
+    // behind that Carol could accept into an unreadable secret.
+    let stale = InviteRequest {
+        key_version: 0,
+        email: "carol@example.com".into(),
+        fingerprint: carol.identity.public_key().fingerprint(),
+        wrapped_key: key.wrap_for(carol.identity.public_key()).unwrap(),
+        message: String::new(),
+    };
+    let response =
+        server.req(Method::POST, &format!("/secrets/{id}/invites"), &alice).json(&stale).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(server.access(&alice, id).await.invites.is_empty(), "a refused invite must not be stored");
+
+    // Against the current version the same invite works and Carol can read it.
+    let response = server.invite(&alice, id, &new_key, "carol@example.com").await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let invite: Created = response.json().await.unwrap();
+    server.accept(&carol, invite.id).await;
+    assert_eq!(decrypt(&server.list(&carol).await[0], &carol), payload());
+}
+
+#[tokio::test]
+async fn inviting_never_reveals_whether_an_address_has_an_account() {
+    // The lookup refuses to say who has an account. The invite path must
+    // refuse the same, or it simply answers the question instead.
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "alice-password").await;
+    let bob = register(&server, "bob@example.com", "bob-password").await;
+    let (id, key) = server.create_secret(&alice, "Bank", &payload()).await;
+    let wrong = Identity::generate().public_key().fingerprint();
+
+    let post = |email: &'_ str, fingerprint: &'_ str| {
+        let body = InviteRequest {
+            key_version: 0,
+            email: email.into(),
+            fingerprint: fingerprint.into(),
+            wrapped_key: key.wrap_for(bob.identity.public_key()).unwrap(),
+            message: String::new(),
+        };
+        server.req(Method::POST, &format!("/secrets/{id}/invites"), &alice).json(&body).send()
+    };
+
+    // Bob is registered and Carol is not. Without Bob's fingerprint the two
+    // answers are identical, so nothing can be read off the difference.
+    let registered = post("bob@example.com", &wrong).await.unwrap();
+    let unregistered = post("carol@example.com", &wrong).await.unwrap();
+    assert_eq!(registered.status(), StatusCode::NOT_FOUND);
+    assert_eq!(registered.status(), unregistered.status());
+    assert_eq!(registered.text().await.unwrap(), unregistered.text().await.unwrap());
+    assert!(server.access(&alice, id).await.invites.is_empty(), "a refused invite stores nothing");
+
+    // With the real fingerprint the invite goes through as normal.
+    let accepted = post("bob@example.com", &bob.identity.public_key().fingerprint()).await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn invite_edge_cases() {
     let server = spawn().await;
     let alice = register(&server, "alice@example.com", "alice-password").await;
@@ -680,25 +898,30 @@ async fn invite_edge_cases() {
     let mallory = register(&server, "mallory@example.com", "mallory-password").await;
     let (id, key) = server.create_secret(&alice, "Bank", &payload()).await;
 
+    let ghost_fp = server.fingerprint_of("ghost@example.com").await;
+    let alice_fp = alice.identity.public_key().fingerprint();
+    let bob_fp = bob.identity.public_key().fingerprint();
+
     // Unknown invitee, self-invite, and an oversized message.
-    let invite_body = |email: &str, message: String| InviteRequest {
+    let invite_body = |email: &str, fingerprint: &str, message: String| InviteRequest {
         key_version: 0,
         email: email.into(),
+        fingerprint: fingerprint.into(),
         wrapped_key: key.wrap_for(alice.identity.public_key()).unwrap(),
         message,
     };
     let post_invite =
         |body: InviteRequest| server.req(Method::POST, &format!("/secrets/{id}/invites"), &alice).json(&body).send();
     assert_eq!(
-        post_invite(invite_body("ghost@example.com", String::new())).await.unwrap().status(),
+        post_invite(invite_body("ghost@example.com", &ghost_fp, String::new())).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        post_invite(invite_body("alice@example.com", String::new())).await.unwrap().status(),
+        post_invite(invite_body("alice@example.com", &alice_fp, String::new())).await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        post_invite(invite_body("bob@example.com", "m".repeat(MAX_MESSAGE_LEN + 1))).await.unwrap().status(),
+        post_invite(invite_body("bob@example.com", &bob_fp, "m".repeat(MAX_MESSAGE_LEN + 1))).await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
 
@@ -766,8 +989,9 @@ async fn writes_with_a_stale_key_version_are_rejected() {
     assert_eq!(decrypt(&server.list(&alice).await[0], &alice), payload());
 
     // A stale invite (wrapping the old key) is refused too.
+    let carol_fp = server.fingerprint_of("carol@example.com").await;
     let lookup: PublicUser = server
-        .req(Method::GET, "/users/lookup?email=carol@example.com", &alice)
+        .req(Method::GET, &format!("/users/lookup?email=carol@example.com&fingerprint={carol_fp}"), &alice)
         .send()
         .await
         .unwrap()
@@ -777,6 +1001,7 @@ async fn writes_with_a_stale_key_version_are_rejected() {
     let stale_invite = InviteRequest {
         key_version: 0,
         email: "carol@example.com".into(),
+        fingerprint: carol_fp.clone(),
         wrapped_key: key.wrap_for(&lookup.public_key).unwrap(),
         message: String::new(),
     };
@@ -816,12 +1041,13 @@ async fn writes_with_a_stale_key_version_are_rejected() {
 }
 
 #[tokio::test]
-async fn owner_copies_must_be_self_wrapped_and_legacy_ones_can_be_upgraded() {
+async fn an_owner_copy_must_always_be_self_wrapped() {
     let server = spawn().await;
     let alice = register(&server, "alice@example.com", "alice-password").await;
     let bob = register(&server, "bob@example.com", "bob-password").await;
 
-    // A sealed box as the owner's copy is refused: anyone could have made it.
+    // A sealed box as the owner's copy is refused: anyone, the server
+    // included, could have made it, so it proves nothing about who did.
     let key = SecretKey::generate();
     let sealed_owner_copy = CreateSecretRequest {
         name: "Bank".into(),
@@ -831,35 +1057,9 @@ async fn owner_copies_must_be_self_wrapped_and_legacy_ones_can_be_upgraded() {
     let response = server.req(Method::POST, "/secrets", &alice).json(&sealed_owner_copy).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // A secret created before self-wrapping existed has a sealed-box owner row.
     let (id, key) = server.create_secret(&alice, "Bank", &payload()).await;
-    let legacy = serde_json::to_string(&key.wrap_for(alice.identity.public_key()).unwrap()).unwrap();
-    sqlx::query("UPDATE secret_keys SET wrapped_key = ? WHERE secret_id = ? AND user_id = ?")
-        .bind(legacy)
-        .bind(id)
-        .bind(alice.id)
-        .execute(&server.pool)
-        .await
-        .unwrap();
     let view = server.list(&alice).await.remove(0);
-    assert!(matches!(view.wrapped_key, WrappedKey::Shared(_)), "legacy rows still parse");
-    assert_eq!(decrypt(&view, &alice), payload());
-
-    // Upgrading: wrong kind 400, wrong owner 404, stale version 409, then 204.
-    let upgrade = |wrapped_key, key_version| UpgradeOwnerKeyRequest { key_version, wrapped_key };
-    let put = |account: &Account, body: &UpgradeOwnerKeyRequest| {
-        server.req(Method::PUT, &format!("/secrets/{id}/owner-key"), account).json(body).send()
-    };
-    let shared_again = upgrade(WrappedKey::Shared(key.wrap_for(alice.identity.public_key()).unwrap()), 0);
-    assert_eq!(put(&alice, &shared_again).await.unwrap().status(), StatusCode::BAD_REQUEST);
-    let self_wrapped = upgrade(WrappedKey::Owner(key.wrap_for_owner(&alice.self_wrap_key)), 0);
-    assert_eq!(put(&bob, &self_wrapped).await.unwrap().status(), StatusCode::NOT_FOUND);
-    let stale = upgrade(WrappedKey::Owner(key.wrap_for_owner(&alice.self_wrap_key)), 3);
-    assert_eq!(put(&alice, &stale).await.unwrap().status(), StatusCode::CONFLICT);
-    assert_eq!(put(&alice, &self_wrapped).await.unwrap().status(), StatusCode::NO_CONTENT);
-
-    let view = server.list(&alice).await.remove(0);
-    assert!(matches!(view.wrapped_key, WrappedKey::Owner(_)));
+    assert!(matches!(view.wrapped_key, WrappedKey::Owner(_)), "the owner's row is self-wrapped");
     assert_eq!(decrypt(&view, &alice), payload());
 
     // Rotation keeps the rule: the owner's entry must be self-wrapped.

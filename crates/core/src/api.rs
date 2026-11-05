@@ -80,10 +80,19 @@ pub struct PublicUser {
     pub public_key: PublicKey,
 }
 
+/// Looking someone up requires already knowing their fingerprint, confirmed
+/// out of band. Without that the directory would answer whether any address
+/// has an account, which is the one thing a stranger must not be able to ask.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LookupQuery {
     pub email: String,
+    /// The fingerprint the caller expects, in any spacing or case.
+    pub fingerprint: String,
 }
+
+/// Longest fingerprint string accepted before normalising; a real one is 29
+/// characters and this leaves room for whatever separators someone types.
+pub const MAX_FINGERPRINT_INPUT_LEN: usize = 128;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateSecretRequest {
@@ -108,8 +117,7 @@ pub struct SecretView {
     pub owner_email: String,
     pub is_owner: bool,
     pub payload: Sealed,
-    /// `Owner` for the owner's row, `Shared` for everyone else (legacy owner
-    /// rows may still be `Shared` until the owner's client upgrades them).
+    /// `Owner` for the owner's row, `Shared` for everyone else.
     pub wrapped_key: WrappedKey,
     pub updated_at: DateTime<Utc>,
     /// Incremented by every key rotation. Clients send it back with writes.
@@ -149,15 +157,6 @@ pub struct WrappedKeyFor {
     pub wrapped_key: WrappedKey,
 }
 
-/// Replace the owner's own wrapped copy with a self-wrapped one. Used once
-/// per secret to migrate copies stored as sealed boxes.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UpgradeOwnerKeyRequest {
-    pub key_version: i64,
-    /// Must be `WrappedKey::Owner`.
-    pub wrapped_key: WrappedKey,
-}
-
 /// Revoke one member and rotate the secret's key in the same request. The
 /// payload is re-encrypted under a fresh key and `wrapped_keys` must contain
 /// that key wrapped for every remaining member, including the owner.
@@ -182,6 +181,10 @@ pub struct InviteRequest {
     /// The key version the wrapped key was made from; a mismatch is a 409.
     pub key_version: i64,
     pub email: String,
+    /// The invitee's fingerprint, for the same reason the lookup needs one:
+    /// without it, which addresses have accounts could be read off this
+    /// endpoint instead.
+    pub fingerprint: String,
     /// The secret key wrapped for the invitee's public key.
     pub wrapped_key: SealedBox,
     #[serde(default)]

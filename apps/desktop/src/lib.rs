@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use credvault_core::aead::KEY_LEN;
 use credvault_core::api::*;
+use credvault_core::identity::{normalize_fingerprint, FINGERPRINT_HEX_LEN};
+use credvault_core::secret::CustomField;
 use credvault_core::{kdf, password, secret, Identity, MasterKey, PublicKey, SecretKey, SecretPayload, WrappedKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,10 +51,123 @@ struct SecretSummary {
     username: String,
     url: String,
     notes: String,
+    fields: Vec<FieldSummary>,
     is_owner: bool,
     owner_email: String,
     updated_at: chrono::DateTime<chrono::Utc>,
     error: Option<String>,
+}
+
+/// A custom field as the list shows it. The value of a field the user marked
+/// sensitive is withheld, exactly as the password is, and fetched only when
+/// they ask to see or copy that one field.
+#[derive(Clone, Serialize)]
+struct FieldSummary {
+    id: String,
+    label: String,
+    /// Whether a sensitive field has anything stored. The value itself is
+    /// withheld, but without this the editor cannot tell "hidden, with a
+    /// value you have not seen" from "hidden and empty", and would refuse
+    /// to un-hide the second on the grounds that it would erase something.
+    has_value: bool,
+    /// Empty for a sensitive field, whatever is stored otherwise.
+    value: String,
+    secret: bool,
+}
+
+/// A custom field as the edit form submits it. A `value` of `None` means
+/// "keep what is stored for this id", the way a blank password box means
+/// "keep the password". `id` is `None` only for a row the user just added.
+#[derive(Clone, Deserialize)]
+struct FieldInput {
+    #[serde(default)]
+    id: Option<String>,
+    label: String,
+    value: Option<String>,
+    #[serde(default)]
+    secret: bool,
+}
+
+/// Everything the new/edit form submits, in one piece so creating and editing
+/// take the same shape and neither grows an unreadable argument list.
+#[derive(Clone, Deserialize)]
+struct SecretForm {
+    name: String,
+    username: String,
+    /// Required when creating. On an edit, `None` keeps the stored password
+    /// without it ever passing through the UI.
+    password: Option<Zeroizing<String>>,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    fields: Vec<FieldInput>,
+}
+
+fn field_summaries(payload: &SecretPayload) -> Vec<FieldSummary> {
+    payload
+        .fields
+        .iter()
+        .map(|field| FieldSummary {
+            id: field.id.clone(),
+            label: field.label.clone(),
+            has_value: !field.value.is_empty(),
+            value: if field.secret { String::new() } else { field.value.clone() },
+            secret: field.secret,
+        })
+        .collect()
+}
+
+/// Turn submitted fields into the ones to store. A field submitted without a
+/// value keeps the value stored under the same id; if there is none to keep,
+/// that is an error rather than a field silently emptied of a recovery code
+/// the user believed was still there.
+fn resolve_fields(submitted: Vec<FieldInput>, stored: &[CustomField]) -> CommandResult<Vec<CustomField>> {
+    let mut resolved: Vec<CustomField> = Vec::with_capacity(submitted.len());
+    for field in submitted {
+        let kept = field.id.as_deref().and_then(|id| stored.iter().find(|f| f.id == id));
+        // Named by whatever it is stored as, because a row that lost its label
+        // may be standing for a value nobody can see and could not retype.
+        let label = secret::validate_label(&field.label).map_err(|error| match kept {
+            Some(kept) if field.label.trim().is_empty() => {
+                CommandError::new("crypto", format!("enter a label for the field stored as \"{}\"", kept.label))
+            }
+            _ => user_facing(error),
+        })?;
+        let value = match field.value {
+            Some(value) => value,
+            // Found by id: the only thing that still means the same field
+            // after another device has renamed or reordered the others.
+            None => match kept {
+                // Keeping a value only makes sense while it stays hidden. The
+                // editor cannot produce this pair, but the rule the whole
+                // design rests on should not be enforced only in the half
+                // that does not write the payload: copying an unseen value
+                // into a now-visible field would publish it to the list, and
+                // to everyone the secret is shared with.
+                Some(kept) if kept.secret && !field.secret && !kept.value.is_empty() => {
+                    return Err(CommandError::new(
+                        "field_value_required",
+                        format!(
+                        "enter a value for \"{label}\": it was never shown here, so it cannot be un-hidden without one"
+                    ),
+                    ))
+                }
+                Some(kept) => kept.value.clone(),
+                None => {
+                    return Err(CommandError::new("field_value_required", format!("enter a value for \"{label}\"")))
+                }
+            },
+        };
+        // A row the user just added has no id yet; an existing one keeps its own.
+        let id = field.id.unwrap_or_else(secret::new_field_id);
+        if resolved.iter().any(|f| f.id == id) {
+            return Err(CommandError::new("duplicate_field", format!("\"{label}\" was sent twice")));
+        }
+        resolved.push(CustomField { id, label, value, secret: field.secret });
+    }
+    Ok(resolved)
 }
 
 /// Result of looking someone up before inviting them. `public_key` is what the
@@ -104,6 +219,9 @@ struct UiConstants {
     min_password_length: usize,
     max_message_length: usize,
     generated_password_length: usize,
+    max_custom_fields: usize,
+    max_label_length: usize,
+    max_field_length: usize,
 }
 
 struct Session {
@@ -114,9 +232,6 @@ struct Session {
     /// Wraps our own copies of secret keys; only we can derive it, so the
     /// server cannot forge an owner copy.
     self_wrap_key: Zeroizing<[u8; KEY_LEN]>,
-    /// True until every owner copy on this server has been upgraded from the
-    /// sealed-box form; afterwards such a copy is refused as untrusted.
-    legacy_owner_copies_allowed: bool,
     /// Decrypted secret keys from the last list, so reveal/update need no re-unwrap.
     keys: HashMap<i64, LoadedKey>,
 }
@@ -208,6 +323,7 @@ impl From<ClientError> for CommandError {
         let code = match error {
             ClientError::Network(_) => "network",
             ClientError::Server(_) => "server",
+            ClientError::NotFound(_) => "not_found",
             ClientError::Conflict(_) => "conflict",
             ClientError::Unauthorized => "unauthorized",
             ClientError::InvalidUrl(_) => "invalid_url",
@@ -278,6 +394,9 @@ async fn register(
     registration_token: Option<String>,
 ) -> CommandResult<UserSummary> {
     let server_url = normalize_server_url(&server_url)?;
+    // The length floor applies here and nowhere else: logging in must keep
+    // working for an account created under an older, shorter floor.
+    kdf::validate_new_password(&password).map_err(user_facing)?;
     let master = derive_master(password, email.clone()).await?;
     let identity = Identity::generate();
     let api = ApiClient::new(&server_url)?;
@@ -342,12 +461,7 @@ fn install_session(
     identity: Identity,
     self_wrap_key: Zeroizing<[u8; KEY_LEN]>,
 ) -> CommandResult<UserSummary> {
-    let legacy_owner_copies_allowed = {
-        let known = state.known_keys.lock().map_err(|_| "key store lock poisoned".to_string())?;
-        !known.is_owner_keys_upgraded(api.base_url())
-    };
-    let session =
-        Session { api, user_id, email, identity, self_wrap_key, legacy_owner_copies_allowed, keys: HashMap::new() };
+    let session = Session { api, user_id, email, identity, self_wrap_key, keys: HashMap::new() };
     let summary = summary_of(&session);
     let mut guard = state.session.lock().map_err(|_| "session lock poisoned".to_string())?;
     *guard = Some(session);
@@ -388,6 +502,9 @@ fn ui_constants() -> UiConstants {
         min_password_length: kdf::MIN_PASSWORD_LEN,
         max_message_length: MAX_MESSAGE_LEN,
         generated_password_length: password::DEFAULT_LENGTH,
+        max_custom_fields: secret::MAX_CUSTOM_FIELDS,
+        max_label_length: secret::MAX_LABEL_LEN,
+        max_field_length: secret::MAX_FIELD_LEN,
     }
 }
 
@@ -395,33 +512,27 @@ fn ui_constants() -> UiConstants {
 
 /// Unwrap a secret's key, preferring the cached copy when it is from the same
 /// key version. A newer version on the server means another device rotated
-/// the key, so the wrapped key is unwrapped again. Returns whether the copy
-/// was a legacy owner copy that should be upgraded.
-fn key_for(session: &mut Session, view: &SecretView) -> CommandResult<bool> {
+/// the key, so the wrapped key is unwrapped again.
+fn key_for(session: &mut Session, view: &SecretView) -> CommandResult<()> {
     if session.keys.get(&view.id).is_some_and(|loaded| loaded.version == view.key_version) {
-        return Ok(false);
+        return Ok(());
     }
-    let (key, legacy) = unwrap_view_key(session, view)?;
+    let key = unwrap_view_key(session, view)?;
     session.keys.insert(view.id, LoadedKey { key, version: view.key_version });
-    Ok(legacy)
+    Ok(())
 }
 
 /// Which form of wrapped key is acceptable depends on who we are to the
-/// secret. Our own secrets must come self-wrapped, because a sealed box is
-/// something the server could have produced with a key it knows; a sealed box
-/// is tolerated only while legacy copies are still being upgraded. Secrets
-/// shared with us can only ever be sealed boxes.
-fn unwrap_view_key(session: &Session, view: &SecretView) -> CommandResult<(SecretKey, bool)> {
+/// secret. Our own secrets must come self-wrapped: only we can derive that
+/// key, so a sealed box is something the server could have produced with a
+/// key it knows, and is refused however plausible it looks. Secrets shared
+/// with us can only ever be sealed boxes.
+fn unwrap_view_key(session: &Session, view: &SecretView) -> CommandResult<SecretKey> {
     match (&view.wrapped_key, view.is_owner) {
         (WrappedKey::Owner(sealed), true) => {
-            Ok((SecretKey::unwrap_owner(&session.self_wrap_key, sealed).map_err(user_facing)?, false))
+            SecretKey::unwrap_owner(&session.self_wrap_key, sealed).map_err(user_facing)
         }
-        (WrappedKey::Shared(boxed), false) => {
-            Ok((SecretKey::unwrap_with(&session.identity, boxed).map_err(user_facing)?, false))
-        }
-        (WrappedKey::Shared(boxed), true) if session.legacy_owner_copies_allowed => {
-            Ok((SecretKey::unwrap_with(&session.identity, boxed).map_err(user_facing)?, true))
-        }
+        (WrappedKey::Shared(boxed), false) => SecretKey::unwrap_with(&session.identity, boxed).map_err(user_facing),
         (WrappedKey::Shared(_), true) => Err(CommandError::new(
             "untrusted_key",
             "the server returned a key copy for your own secret in a form it could have made itself; refusing it",
@@ -455,32 +566,24 @@ async fn refresh_key(state: &AppState, api: &ApiClient, id: i64) -> CommandResul
     let view = api.get_secret(id).await?;
     with_session(state, |session| {
         session.keys.remove(&id);
-        key_for(session, &view).map(|_legacy| ())
+        key_for(session, &view)
     })
 }
 
 #[tauri::command]
 async fn list_secrets(state: State<'_, AppState>) -> CommandResult<Vec<SecretSummary>> {
-    let api = api(&state)?;
-    let views = api.list_secrets().await?;
-    let (summaries, legacy) = with_session(&state, |session| {
+    let views = api(&state)?.list_secrets().await?;
+    with_session(&state, |session| {
         // Drop keys for secrets that are gone; keep the rest so a server-side
         // key rotation by us is not undone by a stale cache entry elsewhere.
         session.keys.retain(|id, _| views.iter().any(|v| v.id == *id));
         let mut summaries = Vec::with_capacity(views.len());
-        let mut legacy = Vec::new();
         for view in views {
             // One undecryptable item must not hide the whole vault, so the
             // failure is reported per item and the loop continues.
-            let outcome = key_for(session, &view)
-                .and_then(|is_legacy| decrypt_view(session, &view).map(|payload| (payload, is_legacy)));
+            let outcome = key_for(session, &view).and_then(|()| decrypt_view(session, &view));
             let (payload, error) = match outcome {
-                Ok((payload, is_legacy)) => {
-                    if is_legacy {
-                        legacy.push((view.id, view.key_version));
-                    }
-                    (payload, None)
-                }
+                Ok(payload) => (payload, None),
                 Err(error) => {
                     tracing::warn!(secret_id = view.id, %error, "cannot decrypt secret");
                     (SecretPayload::default(), Some(error.message))
@@ -492,57 +595,15 @@ async fn list_secrets(state: State<'_, AppState>) -> CommandResult<Vec<SecretSum
                 username: payload.username.clone(),
                 url: payload.url.clone(),
                 notes: payload.notes.clone(),
+                fields: field_summaries(&payload),
                 is_owner: view.is_owner,
                 owner_email: view.owner_email,
                 updated_at: view.updated_at,
                 error,
             });
         }
-        Ok((summaries, legacy))
-    })?;
-    upgrade_legacy_owner_copies(&state, &api, legacy).await;
-    Ok(summaries)
-}
-
-/// Owner copies stored as sealed boxes predate self-wrapping. Replace each one
-/// with a self-wrapped copy, and once none are left on this server refuse the
-/// sealed-box form for owned secrets from then on, so the server cannot
-/// reintroduce it. Failures are logged and retried on the next refresh.
-async fn upgrade_legacy_owner_copies(state: &AppState, api: &ApiClient, legacy: Vec<(i64, i64)>) {
-    let mut remaining = legacy.len();
-    for (id, key_version) in legacy {
-        let wrapped = with_session(state, |session| {
-            Ok(WrappedKey::Owner(loaded_key(session, id)?.key.wrap_for_owner(&session.self_wrap_key)))
-        });
-        let wrapped_key = match wrapped {
-            Ok(wrapped_key) => wrapped_key,
-            Err(error) => {
-                tracing::warn!(secret_id = id, %error, "cannot build the self-wrapped owner copy");
-                continue;
-            }
-        };
-        match api.upgrade_owner_key(id, &UpgradeOwnerKeyRequest { key_version, wrapped_key }).await {
-            Ok(()) => remaining -= 1,
-            Err(error) => {
-                tracing::warn!(secret_id = id, %error, "could not upgrade the owner key copy; will retry on refresh")
-            }
-        }
-    }
-    if remaining > 0 {
-        return;
-    }
-    let locked_down = with_session(state, |session| {
-        session.legacy_owner_copies_allowed = false;
-        Ok(())
+        Ok(summaries)
     })
-    .and_then(|()| {
-        let mut known = state.known_keys.lock().map_err(|_| "key store lock poisoned".to_string())?;
-        known.mark_owner_keys_upgraded(api.base_url());
-        known.save(&state.known_keys_path).map_err(|e| format!("cannot save known keys: {e}").into())
-    });
-    if let Err(error) = locked_down {
-        tracing::warn!(%error, "owner copies upgraded but the lock-down could not be recorded");
-    }
 }
 
 /// Fetch one secret and decrypt it with the cached key.
@@ -559,13 +620,45 @@ async fn reveal_password(state: State<'_, AppState>, id: i64) -> CommandResult<Z
 #[tauri::command]
 async fn copy_password(app: AppHandle, state: State<'_, AppState>, id: i64) -> CommandResult<u64> {
     let password = Zeroizing::new(load_payload(&state, id).await?.password.clone());
+    copy_secret_value(app, &state, password)
+}
+
+/// The value of one sensitive custom field, fetched only when the user asks
+/// for that field, so revealing a recovery code does not also decrypt and
+/// hand over everything else on the screen.
+async fn load_field_value(state: &AppState, id: i64, field_id: &str) -> CommandResult<Zeroizing<String>> {
+    let payload = load_payload(state, id).await?;
+    // By id, because several fields may share a label: matching on one would
+    // hand back the first of them whichever was asked for, putting the wrong
+    // secret on screen and on the clipboard.
+    payload
+        .fields
+        .iter()
+        .find(|field| field.id == field_id)
+        .map(|field| Zeroizing::new(field.value.clone()))
+        .ok_or_else(|| CommandError::new("field_missing", "that field has changed; refresh and try again"))
+}
+
+#[tauri::command]
+async fn reveal_field(state: State<'_, AppState>, id: i64, field_id: String) -> CommandResult<Zeroizing<String>> {
+    load_field_value(&state, id, &field_id).await
+}
+
+#[tauri::command]
+async fn copy_field(app: AppHandle, state: State<'_, AppState>, id: i64, field_id: String) -> CommandResult<u64> {
+    let value = load_field_value(&state, id, &field_id).await?;
+    copy_secret_value(app, &state, value)
+}
+
+/// Put a sensitive value on the clipboard and arrange for it to be wiped.
+fn copy_secret_value(app: AppHandle, state: &AppState, value: Zeroizing<String>) -> CommandResult<u64> {
     // write_secret marks the clip as sensitive (Android masks the preview, iOS
     // keeps it off Universal Clipboard, desktop managers skip their history).
-    app.clipboard().write_secret(password.as_str()).map_err(|e| format!("clipboard write failed: {e}"))?;
+    app.clipboard().write_secret(value.as_str()).map_err(|e| format!("clipboard write failed: {e}"))?;
     // Only a digest outlives this call: the clear task compares hashes, so the
     // plaintext is not kept alive for the whole timeout.
-    let digest: [u8; 32] = Sha256::digest(password.as_bytes()).into();
-    drop(password);
+    let digest: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+    drop(value);
     // A newer copy supersedes this one; its own task takes over the timer.
     let generation = state.clipboard_generation.fetch_add(1, Ordering::SeqCst) + 1;
     tokio::spawn(async move {
@@ -597,16 +690,21 @@ fn clear_clipboard_if_digest_matches(app: &AppHandle, expected: &[u8; 32]) {
 }
 
 #[tauri::command]
-async fn create_secret(
-    state: State<'_, AppState>,
-    name: String,
-    username: String,
-    password: Zeroizing<String>,
-    url: String,
-    notes: String,
-) -> CommandResult<i64> {
-    let name = secret::validate_name(&name).map_err(user_facing)?;
-    let payload = SecretPayload { username, password: password.to_string(), url, notes };
+async fn create_secret(state: State<'_, AppState>, form: SecretForm) -> CommandResult<i64> {
+    let name = secret::validate_name(&form.name).map_err(user_facing)?;
+    let password = form
+        .password
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| CommandError::from("enter a password or generate one"))?;
+    // Nothing is stored yet, so every field has to arrive with its value.
+    let fields = resolve_fields(form.fields, &[])?;
+    let payload = SecretPayload {
+        username: form.username,
+        password: password.to_string(),
+        url: form.url,
+        notes: form.notes,
+        fields,
+    };
     let key = SecretKey::generate();
     let request = with_session(&state, |session| {
         Ok(CreateSecretRequest {
@@ -623,25 +721,40 @@ async fn create_secret(
     Ok(created.id)
 }
 
-/// `password: None` keeps the current password without it ever leaving Rust.
-/// A 409 means another device rotated the key since we loaded it: the new key
-/// is fetched and the write re-encrypted once, never retried under the old one.
+/// `password: None` keeps the current password, and a field submitted without
+/// a value keeps the stored one; neither ever leaves Rust. A 409 means another
+/// device rotated the key since we loaded it: the new key is fetched and the
+/// write re-encrypted once, never retried under the old one.
+///
+/// Known window: `key_version` guards the key, not the payload. A kept value
+/// is resolved against the payload read at the start of this call, so if
+/// another device changes that field in between, this write puts the old
+/// value back. The same has always been true of the blank password box;
+/// keeping by id widens it from one field to all of them. Closing it needs a
+/// payload version echoed the way `key_version` is, which is worth doing if
+/// multi-device editing becomes common.
 #[tauri::command]
-async fn update_secret(
-    state: State<'_, AppState>,
-    id: i64,
-    name: String,
-    username: String,
-    password: Option<Zeroizing<String>>,
-    url: String,
-    notes: String,
-) -> CommandResult<()> {
-    let name = secret::validate_name(&name).map_err(user_facing)?;
-    let password = match password.filter(|p| !p.is_empty()) {
+async fn update_secret(state: State<'_, AppState>, id: i64, form: SecretForm) -> CommandResult<()> {
+    let name = secret::validate_name(&form.name).map_err(user_facing)?;
+    let password = form.password.filter(|p| !p.is_empty());
+    // One fetch covers both "keep the password" and "keep this field".
+    let keeps_a_field = form.fields.iter().any(|field| field.value.is_none());
+    let existing = if password.is_none() || keeps_a_field { Some(load_payload(&state, id).await?) } else { None };
+    let stored_fields: Vec<CustomField> = existing.as_ref().map(|p| p.fields.clone()).unwrap_or_default();
+    // `existing` is fetched exactly when the password was not given, so the
+    // two are never both absent.
+    let password = match password {
         Some(password) => password,
-        None => Zeroizing::new(load_payload(&state, id).await?.password.clone()),
+        None => Zeroizing::new(existing.as_ref().map(|p| p.password.clone()).unwrap_or_default()),
     };
-    let payload = SecretPayload { username, password: password.to_string(), url, notes };
+    let fields = resolve_fields(form.fields, &stored_fields)?;
+    let payload = SecretPayload {
+        username: form.username,
+        password: password.to_string(),
+        url: form.url,
+        notes: form.notes,
+        fields,
+    };
     let api = api(&state)?;
     for attempt in 0..2 {
         let request = with_session(&state, |session| {
@@ -682,13 +795,59 @@ async fn get_access(state: State<'_, AppState>, id: i64) -> CommandResult<Access
     Ok(api(&state)?.get_access(id).await?)
 }
 
-/// Step one of inviting: fetch the invitee's key and report its fingerprint
-/// and whether it matches what we pinned before. The UI shows this for the
-/// user to confirm out of band before `invite` is called.
+/// Step one of inviting: fetch the invitee's key and report whether it matches
+/// what we pinned before. The server only answers for a fingerprint we already
+/// know, so one must be supplied: the pinned one for someone we have shared
+/// with before, otherwise one the user got from them out of band.
+///
+/// `fingerprint` of `None` means "use the pin". With no pin and nothing typed
+/// there is nothing to ask the server with, and the UI is told to collect one
+/// rather than being handed a lookup that cannot be made.
 #[tauri::command]
-async fn lookup_invitee(state: State<'_, AppState>, email: String) -> CommandResult<InviteeInfo> {
+async fn lookup_invitee(
+    state: State<'_, AppState>,
+    email: String,
+    fingerprint: Option<String>,
+) -> CommandResult<InviteeInfo> {
     let api = api(&state)?;
-    let invitee = api.lookup_user(&email).await?;
+    let email = kdf::normalize_email(&email);
+    let typed = fingerprint.map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
+    let asked_with = match typed {
+        Some(typed) => typed,
+        None => pinned_fingerprint(&state, api.base_url(), &email)?.ok_or_else(|| {
+            CommandError::new(
+                "fingerprint_required",
+                "ask them to read the \"Your key\" fingerprint from the top of their credvault window, and enter it \
+                 here. You only need to do this the first time you share with someone.",
+            )
+        })?,
+    };
+
+    // A fingerprint that is not a whole one cannot match anything, and would
+    // otherwise be sent to the server as if it were a real check.
+    if normalize_fingerprint(&asked_with).len() != FINGERPRINT_HEX_LEN {
+        return Err(CommandError::new(
+            "fingerprint_required",
+            "that does not look like a full fingerprint; it is six groups of four hex digits",
+        ));
+    }
+
+    let invitee = api.lookup_user(&email, &asked_with).await.map_err(|error| match error {
+        // Only a genuine "no match" is answered by checking the fingerprint
+        // again. Everything else (throttled, malformed, server fault) keeps
+        // its own code, so the UI does not send the user back to retype
+        // something that was not the problem.
+        ClientError::NotFound(message) => CommandError::new("lookup_failed", message),
+        other => other.into(),
+    })?;
+
+    // The server checking the fingerprint is what stops it being asked who has
+    // an account. It is not what stops it substituting a key, because it is
+    // the party we are guarding against: a server that ignored the parameter
+    // and answered with its own key would otherwise be reported to the user as
+    // the key whose fingerprint they just read out. So check it here too.
+    check_served_key(&invitee.public_key, &asked_with)?;
+
     let status = {
         let known = state.known_keys.lock().map_err(|_| "key store lock poisoned".to_string())?;
         known.check(api.base_url(), &invitee.email, &invitee.public_key)
@@ -699,6 +858,36 @@ async fn lookup_invitee(state: State<'_, AppState>, email: String) -> CommandRes
         public_key: invitee.public_key.to_base64(),
         status,
     })
+}
+
+/// Whether two fingerprints are the same one, however each was typed. Not
+/// constant-time on purpose: a fingerprint is public, and both sides of this
+/// comparison are already in the caller's hands.
+fn fingerprint_matches(expected: &str, supplied: &str) -> bool {
+    normalize_fingerprint(expected) == normalize_fingerprint(supplied)
+}
+
+/// Check that the key the server served is the one whose fingerprint the user
+/// read out. This is the branch that separates an honest server from a hostile
+/// one: the server checks the fingerprint too, but that only stops it being
+/// asked who has an account, since it is the party being guarded against. A
+/// server that ignored the parameter and answered with its own key would
+/// otherwise be reported to the user as the key they just confirmed.
+fn check_served_key(served: &PublicKey, asked_with: &str) -> CommandResult<()> {
+    if !fingerprint_matches(&served.fingerprint(), asked_with) {
+        return Err(CommandError::new(
+            "key_changed",
+            "the server returned a key with a different fingerprint from the one you entered; do not share with \
+             this person until you have checked their fingerprint with them again",
+        ));
+    }
+    Ok(())
+}
+
+/// The fingerprint of the key pinned for `email` on this server, if any.
+fn pinned_fingerprint(state: &AppState, server: &str, email: &str) -> CommandResult<Option<String>> {
+    let known = state.known_keys.lock().map_err(|_| "key store lock poisoned".to_string())?;
+    Ok(known.pinned_key(server, email).map(|key| key.fingerprint()))
 }
 
 /// The key the UI showed and the user approved must be byte-for-byte the key
@@ -725,7 +914,11 @@ async fn invite(
     confirmed_public_key: String,
 ) -> CommandResult<()> {
     let api = api(&state)?;
-    let invitee = api.lookup_user(&email).await?;
+    // Ask with the fingerprint of the very key the user approved: if the
+    // server has since moved to another one, the lookup fails outright rather
+    // than handing us a key to check after the fact.
+    let confirmed = PublicKey::from_base64(confirmed_public_key.trim()).map_err(user_facing)?;
+    let invitee = api.lookup_user(&email, &confirmed.fingerprint()).await?;
     check_confirmed_key(&invitee.public_key, &confirmed_public_key)?;
     for attempt in 0..2 {
         let request = with_session(&state, |session| {
@@ -733,6 +926,7 @@ async fn invite(
             Ok(InviteRequest {
                 key_version: loaded.version,
                 email: invitee.email.clone(),
+                fingerprint: invitee.public_key.fingerprint(),
                 wrapped_key: loaded.key.wrap_for(&invitee.public_key).map_err(user_facing)?,
                 message: message.clone(),
             })
@@ -899,6 +1093,8 @@ pub fn run() {
             list_secrets,
             reveal_password,
             copy_password,
+            reveal_field,
+            copy_field,
             create_secret,
             update_secret,
             delete_secret,
@@ -949,7 +1145,6 @@ mod tests {
             email: "me@example.com".into(),
             identity,
             self_wrap_key: Zeroizing::new(credvault_core::aead::random_bytes()),
-            legacy_owner_copies_allowed: true,
             keys: HashMap::new(),
         }
     }
@@ -969,25 +1164,21 @@ mod tests {
     }
 
     #[test]
-    fn owner_copies_must_be_self_wrapped_once_the_server_is_upgraded() {
+    fn an_owner_copy_the_server_could_have_made_is_always_refused() {
         let mut session = test_session(Identity::generate());
         let key = SecretKey::generate();
         let mut view = view_for(&session, &key, 0, &payload());
+        // A sealed box to our own public key opens perfectly well, and is
+        // exactly what a server that wanted to choose our key would send. It
+        // is refused on the grounds of its form alone, from the first fetch.
         view.wrapped_key = WrappedKey::Shared(key.wrap_for(session.identity.public_key()).unwrap());
-
-        // Still migrating: accepted and flagged as legacy.
-        assert!(key_for(&mut session, &view).unwrap());
-        session.keys.clear();
-
-        // Locked down: the same copy is refused as something the server could have made.
-        session.legacy_owner_copies_allowed = false;
         let error = key_for(&mut session, &view).unwrap_err();
         assert_eq!(error.code, "untrusted_key");
-        assert!(!session.keys.contains_key(&7));
+        assert!(!session.keys.contains_key(&7), "a refused copy must not be cached");
 
-        // A genuine self-wrapped copy is fine and is not legacy.
+        // Only the self-wrapped form, which only we can produce, is accepted.
         let genuine = view_for(&session, &key, 0, &payload());
-        assert!(!key_for(&mut session, &genuine).unwrap());
+        assert!(key_for(&mut session, &genuine).is_ok());
         assert_eq!(decrypt_view(&mut session, &genuine).unwrap(), payload());
     }
 
@@ -1002,12 +1193,18 @@ mod tests {
         let error = key_for(&mut session, &shared).unwrap_err();
         assert_eq!(error.code, "untrusted_key");
         shared.wrapped_key = WrappedKey::Shared(key.wrap_for(session.identity.public_key()).unwrap());
-        assert!(!key_for(&mut session, &shared).unwrap());
+        assert!(key_for(&mut session, &shared).is_ok());
         assert_eq!(decrypt_view(&mut session, &shared).unwrap(), payload());
     }
 
     fn payload() -> SecretPayload {
-        SecretPayload { username: "u".into(), password: "p".into(), url: String::new(), notes: String::new() }
+        SecretPayload {
+            username: "u".into(),
+            password: "p".into(),
+            url: String::new(),
+            notes: String::new(),
+            fields: Vec::new(),
+        }
     }
 
     #[test]
@@ -1074,6 +1271,263 @@ mod tests {
         let swapped = [member(2, "bob@example.com", &bob_again)];
         let unconfirmed = plan_rewrap(&known, server, &swapped, 4, &[]).unwrap_err();
         assert_eq!(unconfirmed[0].status, KeyStatus::Changed { pinned_fingerprint: bob.public_key().fingerprint() });
+    }
+
+    fn stored_field_id(id: &str, label: &str, value: &str, secret: bool) -> CustomField {
+        CustomField { id: id.into(), label: label.into(), value: value.into(), secret }
+    }
+    fn stored_field(label: &str, value: &str, secret: bool) -> CustomField {
+        stored_field_id(&secret::new_field_id(), label, value, secret)
+    }
+    /// A row the user edited or added: it carries its own value.
+    fn submitted(label: &str, value: &str, secret: bool) -> FieldInput {
+        FieldInput { id: None, label: label.into(), value: Some(value.into()), secret }
+    }
+
+    /// A row standing for the stored field `id`, possibly renamed since.
+    fn kept(label: &str, id: &str, secret: bool) -> FieldInput {
+        FieldInput { id: Some(id.into()), label: label.into(), value: None, secret }
+    }
+
+    /// The payload the UI actually produces, read from a fixture that is
+    /// checked in and that `ui-tests/fields.test.js` compares against what
+    /// the editor emits. Shared rather than transcribed: a literal copied
+    /// across once would let either side rename a key while both suites
+    /// stayed green, and this is the only guard on a boundary the
+    /// custom-fields work created on purpose. Either suite fails on drift,
+    /// whichever runs first; regenerate with UPDATE_FIXTURES=1.
+    #[test]
+    fn the_payloads_the_ui_sends_deserialize_into_the_commands_that_receive_them() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            created: SecretForm,
+            edited: SecretForm,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../ui-tests/testdata/submitted_fields.json")).unwrap();
+
+        // Creating: every row carries its own value and has no id yet.
+        assert_eq!(fixture.created.name, "Email");
+        assert_eq!(fixture.created.password.as_deref().map(String::as_str), Some("brand-new-password"));
+        let created = resolve_fields(fixture.created.fields, &[]).unwrap();
+        assert_eq!(created[1].label, "PIN");
+        assert_eq!(created[1].value, "4321");
+        // The flag deciding whether a value is ever masked is part of the
+        // contract: `secret` defaults to false, so a renamed key on the JS
+        // side would silently unmask every field it touched.
+        assert!(created[1].secret && !created[0].secret, "the hidden flag must survive the crossing");
+        assert!(!created[0].id.is_empty() && created[0].id != created[1].id, "each new field gets its own id");
+
+        // Editing: a blank password box keeps the password, and the hidden row
+        // that survived deleting its same-named neighbour keeps its own value.
+        assert!(fixture.edited.password.is_none(), "a blank password box must arrive as None, not as \"\"");
+        let stored = [
+            stored_field_id("aa01", "Account number", "12345678", false),
+            stored_field_id("bb02", "Recovery code", "FIRST-code", true),
+            stored_field_id("cc03", "Recovery code", "SECOND-code", true),
+        ];
+        let edited = resolve_fields(fixture.edited.fields, &stored).unwrap();
+        // The two sides of the boundary: an empty string erases, null keeps.
+        assert_eq!(edited[0].value, "", "an emptied visible field is stored empty, not kept");
+        assert_eq!(edited[1].value, "SECOND-code", "the deleted row's value must not be the one kept");
+        assert_eq!(edited[1].id, "cc03");
+        assert!(edited[1].secret && !edited[0].secret);
+    }
+
+    #[test]
+    fn a_key_whose_fingerprint_is_not_the_one_asked_for_is_refused() {
+        // The check that separates an honest server from one that ignored the
+        // fingerprint and answered with a key of its own choosing.
+        let bob = Identity::generate();
+        let fp = bob.public_key().fingerprint();
+        assert!(check_served_key(bob.public_key(), &fp).is_ok());
+        assert!(check_served_key(bob.public_key(), &fp.to_uppercase()).is_ok());
+
+        let server_key = Identity::generate();
+        let error = check_served_key(server_key.public_key(), &fp).unwrap_err();
+        assert_eq!(error.code, "key_changed");
+        assert!(error.message.contains("different fingerprint"), "{error}");
+        // A partial entry must not be accepted as a match either.
+        assert!(check_served_key(bob.public_key(), &fp[..9]).is_err());
+    }
+
+    #[test]
+    fn a_fingerprint_matches_however_it_was_typed_but_not_a_different_key() {
+        let bob = Identity::generate();
+        let fp = bob.public_key().fingerprint();
+        for typed in [fp.clone(), fp.to_uppercase(), fp.replace('-', ""), format!("  {fp}  ")] {
+            assert!(fingerprint_matches(&bob.public_key().fingerprint(), &typed), "{typed:?}");
+        }
+        // The check that stops a server handing us a key we did not ask for.
+        let other = Identity::generate();
+        assert!(!fingerprint_matches(&other.public_key().fingerprint(), &fp));
+        // A partial entry must not match by being a prefix of the real one.
+        assert!(!fingerprint_matches(&bob.public_key().fingerprint(), &fp[..9]));
+        assert!(!fingerprint_matches(&bob.public_key().fingerprint(), ""));
+    }
+
+    /// Two fields deliberately sharing a label, which is the case every rule
+    /// about identity exists for.
+    fn two_recovery_codes() -> [CustomField; 3] {
+        [
+            stored_field_id("aa01", "Account number", "12345678", false),
+            stored_field_id("bb02", "Recovery code", "FIRST-code", true),
+            stored_field_id("cc03", "Recovery code", "SECOND-code", true),
+        ]
+    }
+
+    #[test]
+    fn a_field_submitted_without_a_value_keeps_the_stored_one() {
+        let stored = two_recovery_codes();
+        let resolved = resolve_fields(
+            vec![
+                submitted("Account", "87654321", false), // edited, so the new value wins
+                kept("Recovery code", "bb02", true),     // left untouched in the form
+                submitted("PIN", "1234", true),          // added in this edit
+            ],
+            &stored,
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].value, "87654321");
+        assert_eq!(resolved[1].value, "FIRST-code", "an untouched sensitive value must survive the edit");
+        assert_eq!(resolved[2].label, "PIN");
+        assert!(!resolved[2].id.is_empty(), "a new field is given an id of its own");
+        // Labels are stored trimmed.
+        assert_eq!(resolve_fields(vec![submitted("  PIN  ", "1", true)], &[]).unwrap()[0].label, "PIN");
+    }
+
+    #[test]
+    fn a_kept_row_names_its_own_value_however_the_others_move() {
+        // Both rows look identical in the form, because neither value is ever
+        // shown. Resolving by label would hand back the first match; resolving
+        // by position would survive a reorder on another device and hand back
+        // whatever now sits there.
+        let stored = two_recovery_codes();
+
+        let both =
+            resolve_fields(vec![kept("Recovery code", "bb02", true), kept("Recovery code", "cc03", true)], &stored)
+                .unwrap();
+        assert_eq!(both[0].value, "FIRST-code");
+        assert_eq!(both[1].value, "SECOND-code", "the second must not take the first's value");
+
+        // Delete the first row: what survives is the second one's value.
+        let survivor = resolve_fields(vec![kept("Recovery code", "cc03", true)], &stored).unwrap();
+        assert_eq!(survivor[0].value, "SECOND-code", "deleting the first row must not keep the first row's value");
+
+        // Another device reordered and renamed the others in the meantime.
+        // The id still means the same field, so the right value is kept.
+        let moved = [
+            stored_field_id("cc03", "Recovery code", "SECOND-code", true),
+            stored_field_id("bb02", "Primary code", "FIRST-code", true),
+        ];
+        let after = resolve_fields(vec![kept("Recovery code", "bb02", true)], &moved).unwrap();
+        assert_eq!(after[0].value, "FIRST-code", "identity must survive a reorder and a rename elsewhere");
+    }
+
+    #[test]
+    fn renaming_a_hidden_field_keeps_its_value() {
+        // The value was never shown, so demanding it be retyped to rename the
+        // row would push someone toward deleting an unrecoverable secret.
+        let stored = two_recovery_codes();
+        let renamed = resolve_fields(vec![kept("Backup code", "bb02", true)], &stored).unwrap();
+        assert_eq!(renamed[0].label, "Backup code");
+        assert_eq!(renamed[0].value, "FIRST-code");
+        assert_eq!(renamed[0].id, "bb02", "renaming does not change which field it is");
+    }
+
+    #[test]
+    fn a_kept_row_whose_label_was_blanked_is_refused_by_name_not_dropped() {
+        // The UI sends the row rather than filtering it out, so the value it
+        // still stands for is refused loudly instead of disappearing with it.
+        let stored = two_recovery_codes();
+        let blanked = FieldInput { id: Some("bb02".into()), label: String::new(), value: None, secret: true };
+        let error = resolve_fields(vec![blanked], &stored).unwrap_err();
+        assert_eq!(error.code, "crypto");
+        assert!(error.message.contains("label"), "{error}");
+    }
+
+    #[test]
+    fn an_unseen_value_cannot_be_kept_while_being_un_hidden() {
+        // Copying a value nobody has seen into a now-visible field would put
+        // it in the list in clear, for the owner and everyone it is shared
+        // with. The editor cannot ask for this; the rule is enforced anyway,
+        // because this is the half that writes the payload.
+        let stored = two_recovery_codes();
+        let unmask = FieldInput { id: Some("bb02".into()), label: "Recovery code".into(), value: None, secret: false };
+        let error = resolve_fields(vec![unmask], &stored).unwrap_err();
+        assert_eq!(error.code, "field_value_required");
+        assert!(error.message.contains("un-hidden"), "{error}");
+
+        // Keeping it hidden is fine, and so is un-hiding it with a new value.
+        assert!(resolve_fields(vec![kept("Recovery code", "bb02", true)], &stored).is_ok());
+        let retyped = FieldInput {
+            id: Some("bb02".into()),
+            label: "Recovery code".into(),
+            value: Some("x".into()),
+            secret: false,
+        };
+        assert_eq!(resolve_fields(vec![retyped], &stored).unwrap()[0].value, "x");
+        // A visible stored field may of course be kept visible.
+        assert!(resolve_fields(vec![kept("Account number", "aa01", false)], &stored).is_ok());
+    }
+
+    #[test]
+    fn keeping_a_value_that_was_never_stored_is_refused_rather_than_emptied() {
+        let stored = two_recovery_codes();
+
+        // An id that is not in the payload any more: the field was deleted on
+        // another device, so there is nothing to keep and saying so beats
+        // attaching the row to whatever else is there.
+        let error = resolve_fields(vec![kept("Recovery code", "gone", true)], &stored).unwrap_err();
+        assert_eq!(error.code, "field_value_required");
+        assert!(error.message.contains("Recovery code"), "{error}");
+
+        // A kept row with no id at all cannot be resolved either.
+        let orphan = FieldInput { id: None, label: "PIN".into(), value: None, secret: true };
+        assert!(resolve_fields(vec![orphan], &stored).is_err());
+        // Nor can one against an empty store.
+        assert!(resolve_fields(vec![kept("PIN", "bb02", true)], &[]).is_err());
+        // A blank label is refused wherever it came from.
+        assert!(resolve_fields(vec![submitted("   ", "x", false)], &stored).is_err());
+        // The same field may not be sent twice.
+        let twice = vec![kept("Recovery code", "bb02", true), kept("Recovery code", "bb02", true)];
+        assert!(resolve_fields(twice, &stored).is_err());
+    }
+
+    #[test]
+    fn the_list_withholds_sensitive_field_values_but_not_the_rest() {
+        let payload = SecretPayload {
+            username: "jude".into(),
+            password: "pw".into(),
+            url: String::new(),
+            notes: String::new(),
+            fields: vec![stored_field("Recovery code", "aaaa-bbbb", true), stored_field("Account", "12345678", false)],
+        };
+        let summaries = field_summaries(&payload);
+        assert_eq!(summaries[0].label, "Recovery code");
+        assert_eq!(summaries[0].value, "", "a sensitive value must not travel to the UI with the list");
+        assert!(summaries[0].secret);
+        assert_eq!(summaries[1].value, "12345678");
+        assert!(!summaries[1].secret);
+
+        // `has_value` is what lets the editor tell a withheld value from an
+        // absent one. It crosses to JavaScript by name, and the payload
+        // fixture only pins the other direction, so pin the name here: a
+        // rename would otherwise read as `undefined` in the editor and
+        // quietly reinstate the "an empty hidden field can never be
+        // un-hidden" dead end.
+        assert!(summaries[0].has_value, "a hidden field with a value says so");
+        // Built in full: SecretPayload zeroises on drop, so it cannot be
+        // moved out of with struct update syntax.
+        let mut empty = SecretPayload::default();
+        empty.fields =
+            vec![CustomField { id: "cc03".into(), label: "Note".into(), value: String::new(), secret: true }];
+        assert!(!field_summaries(&empty)[0].has_value, "a hidden field with nothing stored says so too");
+        let json = serde_json::to_string(&field_summaries(&empty)[0]).unwrap();
+        for key in ["\"id\"", "\"label\"", "\"value\"", "\"secret\"", "\"has_value\""] {
+            assert!(json.contains(key), "the editor reads {key} by name: {json}");
+        }
     }
 
     #[test]

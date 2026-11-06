@@ -16,7 +16,6 @@
   --text-heading: 1rem;       /* 16px: section headings (h3) */
   --text-title: 1.25rem;      /* 20px: pane titles (h2) */
   --text-display: 1.375rem;   /* 22px: auth title */
-  --text-hero: 1.625rem;      /* 26px: auth title on phones */
 
   --bg: #eef1f4;
   --surface: #ffffff;
@@ -48,6 +47,7 @@
   --focus: #0f766e; /* 4.6:1+ against every surface it crosses */
   --focus-ring: rgba(15, 118, 110, 0.3);
 
+  --accent-glow: rgba(15, 118, 110, 0.35); /* the compose button's halo */
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
   --shadow-md: 0 6px 20px rgba(16, 24, 40, 0.08), 0 1px 2px rgba(16, 24, 40, 0.06);
   --toast-bg: #15222b;
@@ -58,6 +58,8 @@
   /* avatar tint; the hue comes from the element via --h */
   --av-bg-s: 55%; --av-bg-l: 90%;
   --av-fg-s: 45%; --av-fg-l: 28%;
+
+  --ic: 16px; /* icon size; the phone layout raises it */
 
   --radius-sm: 8px;
   --radius: 10px;
@@ -101,6 +103,7 @@
     --focus: #3fd1bf;
     --focus-ring: rgba(63, 209, 191, 0.35);
 
+    --accent-glow: rgba(47, 196, 178, 0.3);
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
     --toast-bg: #e8eef2;
@@ -143,6 +146,7 @@
   --focus: #3fd1bf;
   --focus-ring: rgba(63, 209, 191, 0.35);
 
+  --accent-glow: rgba(47, 196, 178, 0.3);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
   --toast-bg: #e8eef2;
@@ -178,7 +182,7 @@ button { font: inherit; color: inherit; }
 .spacer { flex: 1; }
 .muted { color: var(--text-3); }
 .small { font-size: var(--text-small); }
-.ic { width: 16px; height: 16px; flex: none; }
+.ic { width: var(--ic); height: var(--ic); flex: none; }
 
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 input:focus-visible, textarea:focus-visible {
@@ -410,6 +414,9 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
 }
 @media (hover: hover) { .link-btn:hover { color: var(--accent-hover); } }
 .auth #auth-error:not(:empty) { margin: 2px 0 12px; }
+
+/* The phone layout swaps this in for the server field; see the phone block. */
+.server-summary { display: none; }
 
 .brand { display: flex; align-items: center; gap: 10px; }
 .brand-mark {
@@ -837,134 +844,325 @@ input.mono.mismatch { border-color: var(--danger); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ----- phone layout ------------------------------------------------------- */
-/* Below 720px the two columns become two screens (list and detail) that push
-   and pop, the New button becomes a floating action button, and the account
-   tools move into a bottom sheet. The desktop window never goes this narrow. */
+/* Below 720px this stops being a narrow desktop window and becomes a phone
+   app: one screen at a time behind a nav bar, inset grouped lists, a floating
+   compose button, the account tools in a bottom sheet, and every control sized
+   for a thumb. The desktop window never goes this narrow. */
 
 @media (hover: none) { .kv-actions { opacity: 1; } }
 
 @media (max-width: 720px) {
-  :root { --topbar-h: 52px; }
-  input:not([type="search"]), input[type="search"], textarea { font-size: var(--text-heading); min-height: 44px; } /* no iOS zoom on focus */
-  .btn { height: 44px; padding: 0 16px; font-size: var(--text-emphasis); }
-  .btn.sm { height: 36px; }
-  .icon-btn { width: 44px; height: 44px; }
-  .input-row > .icon-btn, .input-row > .btn { height: 44px; }
+  :root {
+    --topbar-h: 56px;
 
-  /* shell */
+    /* A phone is read at arm's length and tapped, not clicked: the whole
+       scale moves up a step, icons with it, so nothing stays cursor-sized. */
+    --text-caption: 0.8125rem;  /* 13px */
+    --text-small: 0.9375rem;    /* 15px */
+    --text-body: 1.0625rem;     /* 17px */
+    --text-emphasis: 1.0625rem; /* 17px */
+    --text-heading: 1.1875rem;  /* 19px */
+    --text-title: 1.5rem;       /* 24px */
+    --text-display: 1.75rem;    /* 28px */
+    --ic: 20px;
+
+    --radius-sm: 12px;
+    --radius: 14px;
+    --radius-lg: 18px;
+
+    --control-h: 52px; /* fields and buttons */
+    --tap: 48px;       /* bare icon buttons */
+  }
+
+  body { -webkit-tap-highlight-color: transparent; }
+  button, .item { -webkit-touch-callout: none; user-select: none; }
+
+  /* ----- controls ----- */
+  input:not([type="search"]), input[type="search"], textarea {
+    /* 17px: a field below 16px makes iOS zoom the page when it takes focus */
+    font-size: var(--text-body);
+    min-height: var(--control-h);
+    padding: 14px 16px;
+    border-radius: var(--radius);
+    background: var(--surface-2);
+  }
+  textarea { min-height: 112px; }
+  .field { margin-bottom: 18px; }
+  .field label, .field-label { font-size: var(--text-small); margin-bottom: 8px; }
+  .hint { margin-top: 8px; }
+
+  .btn {
+    height: var(--control-h);
+    padding: 0 20px;
+    gap: 8px;
+    border-radius: var(--radius);
+    font-size: var(--text-emphasis);
+    font-weight: 600;
+  }
+  .btn.sm { height: 44px; padding: 0 14px; font-size: var(--text-small); border-radius: 10px; }
+  .btn.block { height: 56px; font-size: var(--text-heading); }
+  .icon-btn { width: var(--tap); height: var(--tap); border-radius: var(--radius); }
+  .input-row { gap: 10px; }
+  .input-row > .icon-btn, .input-row > .btn { height: var(--control-h); }
+  .input-row > .icon-btn { width: var(--control-h); }
+  /* A row carrying a field and two buttons does not fit across a phone: the
+     field takes the first line and the buttons share the second. */
+  .input-row.stack { flex-wrap: wrap; }
+  .input-row.stack > input { flex: 1 1 100%; }
+  .input-row.stack > .btn { flex: 1; }
+
+  /* A press has to show on the element itself: there is no hover state to
+     lean on, and the finger covers whatever it touches. */
+  .btn:active, .icon-btn:active, .chip:active, .item:active,
+  .invites-banner:active, .segmented button:active, .theme-switch button:active {
+    transform: scale(0.97);
+    opacity: 0.9;
+  }
+
+  /* ----- shell ----- */
   /* minmax(0, 1fr): a bare 1fr track refuses to shrink below the longest nowrap item name */
   .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; height: 100dvh; }
   .topbar {
     grid-column: 1;
+    flex-wrap: nowrap;
     gap: 4px;
     min-height: calc(var(--topbar-h) + env(safe-area-inset-top));
-    padding: env(safe-area-inset-top) 8px 0;
+    padding: env(safe-area-inset-top) 10px 0;
   }
   .app[data-screen="detail"] .sidebar { display: none; }
   .app[data-screen="list"] .main { display: none; }
   .app[data-screen="list"] #btn-back { display: none; }
   .app[data-screen="detail"] .brand { display: none; }
   .app[data-screen="list"] #mobile-title { display: none; }
-  #btn-back { display: inline-flex; }
+  /* The back chevron is tinted and oversized, the way a phone draws the one
+     control that leaves the screen. */
+  #btn-back { display: inline-flex; width: 44px; height: 44px; margin-left: -8px; color: var(--accent); }
+  #btn-back .ic { width: 26px; height: 26px; }
   #mobile-title {
     display: block;
     flex: 1;
     min-width: 0;
     text-align: center;
     font-weight: 600;
-    font-size: var(--text-heading);
+    font-size: var(--text-emphasis);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .app[data-screen="detail"] .spacer { display: none; }
   .app[data-screen="detail"] #btn-account { visibility: hidden; } /* keeps the title centred */
-  .brand.compact { padding-left: 4px; }
+
+  /* On the list screen the nav bar is the app's home header, so the brand
+     sits at title size rather than shrunk to fit beside a sidebar. */
+  .brand.compact { gap: 12px; padding-left: 4px; }
+  .brand.compact .brand-mark { width: 36px; height: 36px; border-radius: 11px; }
+  .brand.compact .brand-mark svg { width: 21px; height: 21px; }
+  .brand.compact .brand-name { font-size: var(--text-title); font-weight: 700; }
+
   #btn-account {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 36px;
-    height: 36px;
-    margin: 0 4px;
+    width: 40px;
+    height: 40px;
+    margin: 0 2px;
     border: 0;
     border-radius: 999px;
     background: var(--accent-soft);
     color: var(--accent-soft-text);
     cursor: pointer;
   }
+  #btn-account .ic { width: 22px; height: 22px; }
 
-  /* list screen */
+  /* ----- list screen ----- */
   .sidebar { border-right: 0; background: var(--bg); }
-  .sidebar-tools { padding: 8px 16px 6px; }
-  .sidebar-count { padding: 0 20px 6px; }
-  .list { padding: 0 12px calc(96px + env(safe-area-inset-bottom)); }
-  .list-heading { padding: 14px 10px 6px; }
-  .item { min-height: 60px; padding: 10px 12px; border-radius: 14px; background: var(--surface); margin-bottom: 6px; box-shadow: var(--shadow-sm); }
+  .sidebar-tools { padding: 6px 16px 10px; }
+  .search .ic { left: 14px; width: 20px; height: 20px; }
+  /* The fill is almost the colour of the sidebar behind it (1.04:1 in light),
+     so the border stays: it is the only thing that marks the field out, and
+     this is the one control on the screen with no label but a placeholder. */
+  .search input { min-height: 46px; padding-left: 44px; background: var(--surface-3); }
+  .sidebar-count { padding: 2px 20px 8px; }
+  .list { padding: 0 16px calc(108px + env(safe-area-inset-bottom)); overscroll-behavior: contain; }
+  .list-heading { padding: 14px 16px 8px; letter-spacing: 0.08em; }
+
+  /* Each group is one inset card with hairlines between its rows, rather than
+     a stack of separately floating ones. */
+  .list-group {
+    margin-bottom: 20px;
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+  }
+  .item {
+    position: relative;
+    gap: 14px;
+    min-height: 68px;
+    margin: 0;
+    padding: 12px 14px;
+    border-radius: 0;
+    background: transparent;
+  }
+  .item + .item::before { /* hairline inset past the avatar */
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 72px;
+    right: 0;
+    height: 1px;
+    background: var(--border);
+  }
+  .item-name { font-size: var(--text-body); }
+  .item-sub .ic { width: 15px; height: 15px; }
   .item .chev { display: inline-flex; color: var(--text-3); }
-  .item.active { background: var(--surface); color: inherit; }
+  .item .chev .ic { width: 18px; height: 18px; }
+  .item.active { background: var(--surface-3); color: inherit; }
   .item.active .item-sub { color: var(--text-3); opacity: 1; }
-  .item.active .badge { background: var(--surface-3); color: var(--text-2); }
-  .list-empty { padding: 40px 16px; }
+  .item.active .badge { background: var(--surface-2); color: var(--text-2); }
+  .avatar { width: 44px; height: 44px; border-radius: 13px; font-size: var(--text-heading); }
+  .badge { height: 26px; padding: 0 10px; }
+  .badge .ic { width: 14px; height: 14px; }
+  .list-empty { padding: 48px 16px; font-size: var(--text-body); }
+
+  /* compose button */
   #btn-new {
     position: fixed;
     right: 20px;
-    bottom: calc(20px + env(safe-area-inset-bottom));
+    bottom: calc(24px + env(safe-area-inset-bottom));
     z-index: 5;
-    width: 56px;
-    height: 56px;
+    width: 64px;
+    height: 64px;
     padding: 0;
     border-radius: 999px;
-    box-shadow: var(--shadow-md);
+    box-shadow: 0 10px 24px var(--accent-glow), var(--shadow-md);
   }
-  #btn-new .ic { width: 24px; height: 24px; }
+  #btn-new .ic { width: 28px; height: 28px; }
   #btn-new .btn-text { display: none; }
+  #btn-new:active { transform: scale(0.94); }
+
   #invites-banner { display: block; }
   .invites-banner {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
     width: calc(100% - 32px);
-    margin: 4px 16px 8px;
-    padding: 12px 14px;
-    border: 1px solid var(--accent);
-    border-radius: 14px;
+    margin: 2px 16px 10px;
+    padding: 16px;
+    border: 0;
+    border-radius: var(--radius-lg);
     background: var(--accent-soft);
-    color: var(--text);
-    font-weight: 500;
+    color: var(--accent-soft-text);
+    font-size: var(--text-body);
+    font-weight: 600;
     text-align: left;
     cursor: pointer;
   }
-  .invites-banner > span { flex: 1; }
-  .invites-banner .ic:last-child { color: var(--text-3); }
+  .invites-banner > span:not(.count-pill) { flex: 1; }
+  .invites-banner .ic:last-child { color: currentColor; opacity: 0.75; }
 
-  /* detail screen */
-  .main { padding: 12px 16px calc(24px + env(safe-area-inset-bottom)); }
+  /* ----- detail screen ----- */
+  /* No bottom padding here: the form's action bar sticks to the foot of the
+     scrollport, so the breathing room goes inside the scrolled content. */
+  .main { padding: 8px 16px 0; overscroll-behavior: contain; }
+  .main-inner { padding-bottom: calc(28px + env(safe-area-inset-bottom)); }
   .main.has-invites .empty { display: none; }
-  .main.has-selection #invites { display: none; } /* invitations get their own screen */
-  .detail-meta { flex-direction: column; align-items: flex-start; gap: 2px; }
-  .dot { display: none; }
-  .card { padding: 16px; border-radius: 16px; margin-bottom: 12px; }
-  .detail-head { gap: 12px; }
-  .detail-head .actions { width: 100%; }
-  .detail-head .actions .btn { flex: 1; }
-  .kv-row { flex-direction: column; gap: 2px; padding: 10px 0; }
-  .kv-row dt { width: auto; padding-top: 0; font-size: var(--text-small); }
-  .kv-row dd { width: 100%; }
-  .kv-actions { opacity: 1; }
-  .value { font-size: var(--text-emphasis); }
-  .confirm-bar .actions { width: 100%; }
-  .confirm-bar .actions .btn { flex: 1; }
-  .invite-form { flex-direction: column; align-items: stretch; }
-  .invite-form .field, .invite-form .field.wide { flex: none; }
-  .invite-form .btn { height: 44px; }
-  .fp-compare { grid-template-columns: 1fr; }
-  .form-actions { flex-direction: column; align-items: stretch; }
-  .form-actions .muted { display: none; }
-  .people li { padding: 10px 0; }
-  .empty { padding: 48px 16px; }
+  /* invitations get their own screen */
+  .main.has-selection #invites, .main.has-form #invites { display: none; }
+  .card { padding: 18px 16px; border-radius: var(--radius-lg); margin-bottom: 14px; }
+  .card-title { font-size: var(--text-title); margin-bottom: 8px; }
+  .card-lead { margin-bottom: 18px; }
+  .sub-title { font-size: var(--text-body); margin: 24px 0 10px; }
+  .section-title { font-size: var(--text-display); margin-bottom: 14px; }
+  .count-pill { min-width: 24px; height: 24px; }
 
-  /* account sheet */
+  /* The head of a secret reads as a contact card: avatar, name, meta, then
+     the two actions as full-width buttons under them. */
+  .detail-head { flex-direction: column; align-items: center; gap: 10px; text-align: center; margin-bottom: 4px; }
+  .detail-title { flex: none; width: 100%; min-width: 0; }
+  .detail-title h2 { font-size: var(--text-display); }
+  .avatar.lg { width: 76px; height: 76px; border-radius: 24px; font-size: var(--text-display); }
+  .detail-meta { flex-direction: column; align-items: center; gap: 4px; margin-top: 8px; }
+  .detail-meta .ic { width: 15px; height: 15px; }
+  .dot { display: none; }
+  .detail-head .actions { width: 100%; gap: 10px; margin-top: 6px; }
+  .detail-head .actions .btn { flex: 1; }
+
+  .kv { margin-top: 16px; }
+  .kv-row { flex-direction: column; align-items: stretch; gap: 6px; padding: 14px 0; }
+  .kv-row dt { width: auto; padding-top: 0; font-weight: 600; color: var(--text-3); }
+  .kv-row dd { width: 100%; gap: 10px; }
+  .value { padding: 0; font-size: var(--text-body); }
+  /* Reveal and Copy are the only way to reach a value on a phone, so they get
+     a surface of their own instead of reading as decoration beside the text. */
+  .kv-actions { gap: 8px; opacity: 1; }
+  .kv-actions .icon-btn { width: 44px; height: 44px; border-radius: 999px; background: var(--surface-3); color: var(--text-2); }
+  .kv-actions .icon-btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-soft-text); }
+  .pw-timer { padding: 3px 10px; }
+
+  /* Action rows are pairs of buttons: let them fill the width rather than
+     huddle at the left with a cursor-sized footprint. */
+  .card .actions > .btn { flex: 1 1 auto; min-width: 0; }
+  .invite .actions { padding-left: 0; }
+  /* A fingerprint is 29 characters, and at 17px it runs past the field on a
+     phone. 16px is as small as it can go: below that iOS zooms the page when
+     the field takes focus, and dropping the letter-spacing buys the rest. On
+     a screen narrower than about 380px the field scrolls instead. */
+  input.mono { font-size: 1rem; letter-spacing: 0; }
+
+  .confirm-bar { padding: 14px; border-radius: var(--radius); }
+  .confirm-bar .actions { width: 100%; gap: 10px; }
+  .confirm-bar .actions .btn { flex: 1; }
+  .notice { padding: 14px; border-radius: var(--radius); }
+  .invite-form { flex-direction: column; align-items: stretch; gap: 0; }
+  .invite-form .field, .invite-form .field.wide { flex: none; }
+  .invite-form .btn { width: 100%; height: var(--control-h); }
+  .fp-compare { grid-template-columns: 1fr; }
+  .fp-box { padding: 14px; border-radius: var(--radius); }
+  .people li { gap: 12px; padding: 14px 0; }
+  .people .who { font-size: var(--text-body); }
+  .empty { padding: 56px 20px; }
+  .empty-icon { width: 72px; height: 72px; border-radius: 22px; }
+  .empty-icon .ic { width: 34px; height: 34px; }
+  .empty h2 { font-size: var(--text-display); }
+  .empty p { font-size: var(--text-body); }
+
+  /* ----- full-screen forms ----- */
+  /* A pane title names the whole screen, which the nav bar above it already
+     does. It stays for screen readers, which have no nav bar, but gives up
+     its space. Same recipe as `.sr-only`, which cannot be reused here: it
+     has to apply on phones only, and a class cannot be toggled by a media
+     query. Keep the two in step. */
+  .pane-title {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+  /* Save stays within reach of a thumb however long the form runs. One row,
+     so the bar costs a single button's worth of screen; row-reverse puts the
+     primary action under the writing hand. */
+  .form .form-actions {
+    position: sticky;
+    bottom: 0;
+    flex-direction: row-reverse;
+    flex-wrap: nowrap;
+    gap: 10px;
+    margin: 24px -16px -18px;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .form .form-actions .btn { flex: 1; height: 54px; font-size: var(--text-heading); }
+  .form .form-actions .btn.primary { flex: 1.6; }
+  .form-actions .muted { display: none; }
+
+  /* ----- account sheet ----- */
   .backdrop { position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, 0.45); }
   .app.account-open .backdrop { display: block; }
   .account-tools {
@@ -975,9 +1173,9 @@ input.mono.mismatch { border-color: var(--danger); }
     z-index: 20;
     flex-direction: column;
     align-items: stretch;
-    gap: 8px;
-    padding: 8px 16px calc(20px + env(safe-area-inset-bottom));
-    border-radius: 20px 20px 0 0;
+    gap: 10px;
+    padding: 10px 16px calc(24px + env(safe-area-inset-bottom));
+    border-radius: 24px 24px 0 0;
     background: var(--surface);
     box-shadow: var(--shadow-md);
     transform: translateY(105%);
@@ -985,36 +1183,142 @@ input.mono.mismatch { border-color: var(--danger); }
     transition: transform 220ms ease, visibility 0s linear 220ms;
   }
   .app.account-open .account-tools { transform: none; visibility: visible; transition-delay: 0s; }
-  .sheet-handle { display: block; width: 36px; height: 4px; margin: 2px auto 10px; border-radius: 2px; background: var(--border-strong); }
-  .account-tools .identity { align-items: flex-start; margin: 0 0 4px; }
-  .account-tools .identity-email { font-size: var(--text-heading); max-width: none; }
+  .sheet-handle { display: block; width: 40px; height: 5px; margin: 4px auto 14px; border-radius: 3px; background: var(--border-strong); }
+  .account-tools .identity { align-items: flex-start; margin: 0 0 6px; }
+  .account-tools .identity-email { font-size: var(--text-title); font-weight: 700; max-width: none; }
   .account-tools .identity-server { font-size: var(--text-small); max-width: none; }
-  .account-tools .chip { height: 48px; border-radius: 12px; font-size: var(--text-body); }
-  .account-tools .chip .fp { font-size: var(--text-body); }
-  .account-tools .chip-label { display: inline; }
-  .account-tools .theme-switch { border-radius: 12px; }
-  .account-tools .theme-switch button { flex: 1; height: 40px; border-radius: 9px; }
+  .account-tools .chip {
+    height: 56px;
+    gap: 12px;
+    padding: 0 16px;
+    justify-content: flex-start;
+    border-radius: var(--radius);
+    border-color: transparent;
+    background: var(--surface-2);
+    font-size: var(--text-body);
+  }
+  .account-tools .chip .ic { width: 22px; height: 22px; }
+  .account-tools .chip-label { display: inline; white-space: nowrap; }
+  /* The fingerprint is read out loud to compare it, so it gets its own line
+     under the label rather than being truncated to fit beside it. */
+  .account-tools #btn-fingerprint { flex-wrap: wrap; height: auto; padding: 12px 16px; }
+  .account-tools #btn-fingerprint .fp {
+    flex: 1 1 100%;
+    margin-left: 34px;
+    font-size: var(--text-small);
+    overflow: visible;
+    white-space: normal;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .account-tools .theme-switch { padding: 5px; border-radius: var(--radius); }
+  .account-tools .theme-switch button { flex: 1; height: 46px; border-radius: 11px; }
+  .account-tools .theme-switch .ic { width: 20px; height: 20px; }
   .account-tools .icon-btn {
     width: auto;
-    height: 48px;
+    height: 56px;
+    gap: 14px;
+    padding: 0 16px;
     justify-content: flex-start;
-    gap: 12px;
-    padding: 0 12px;
-    border-radius: 12px;
+    border-radius: var(--radius);
+    background: var(--surface-2);
     color: var(--text);
-    font-weight: 500;
+    font-weight: 600;
     font-size: var(--text-emphasis);
   }
+  .account-tools .icon-btn .ic { width: 22px; height: 22px; }
   .account-tools .btn-label { display: inline; }
+  .account-tools #btn-logout { color: var(--danger); }
 
-  /* toast above the FAB */
-  .toast { bottom: calc(92px + env(safe-area-inset-bottom)); }
+  /* toast above the compose button */
+  .toast {
+    bottom: calc(104px + env(safe-area-inset-bottom));
+    max-width: calc(100% - 40px);
+    padding: 14px 18px;
+    border-radius: var(--radius);
+    font-size: var(--text-body);
+  }
 
-  /* auth as a plain screen rather than a floating card */
-  .auth { justify-content: flex-start; padding: calc(40px + env(safe-area-inset-top)) 20px calc(24px + env(safe-area-inset-bottom)); }
+  /* ----- sign in ----- */
+  /* A plain screen rather than a card floating on a backdrop, and one that
+     fits between the notch and the home indicator without scrolling. The
+     budget on the phone this was sized for is 778px (874 tall, less a 62px
+     top inset and a 34px bottom one); sign-in leaves about 115px of that
+     spare and account creation, which carries two more rows, about 35px.
+     Anything added here spends that, and the rows below are already the
+     cheap version of themselves. Measure by reading the resolved
+     `margin-bottom` of `.auth-foot`, which is `auto` and so holds whatever
+     room is left over. That reads zero once the screen is over budget, so
+     to measure an overflow instead take `.auth-card`'s bottom edge against
+     `window.innerHeight`. */
+  .auth {
+    position: relative;
+    justify-content: flex-start;
+    padding: calc(20px + env(safe-area-inset-top)) 20px calc(16px + env(safe-area-inset-bottom));
+  }
   .auth-card { max-width: none; margin-top: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
-  .auth-title { font-size: var(--text-hero); }
-  .auth-foot { flex-direction: column; gap: 12px; margin-top: 8px; }
+  .auth .brand { gap: 12px; }
+  .auth .brand-mark { width: 44px; height: 44px; border-radius: 14px; }
+  .auth .brand-mark svg { width: 24px; height: 24px; }
+  .auth .brand-name { font-size: var(--text-heading); }
+  .auth-title { font-size: var(--text-display); margin-top: 16px; letter-spacing: -0.02em; }
+  /* The strapline in the footer makes the same promise in fewer words, so on
+     a phone the lead paragraph is the one that goes. The Google form's lead
+     is a different sentence and stays. */
+  .auth-card > .auth-lead { display: none; }
+  .auth .field { margin-bottom: 12px; }
+  .segmented { margin: 14px 0 12px; padding: 3px; border-radius: var(--radius); }
+  .segmented button { height: 44px; border-radius: 11px; font-size: var(--text-emphasis); }
+  .link-btn { margin: 0 0 6px; padding: 10px 0; } /* a row, not an inline link: a full target */
+  .btn.block { height: 52px; font-size: var(--text-emphasis); }
+
+  /* the server, as one line, until it is tapped */
+  .server-summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    margin-bottom: 12px;
+    padding: 10px 14px; /* 45px tall: a tap target, not a caption */
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+    font-size: var(--text-small);
+    text-align: left;
+    cursor: pointer;
+  }
+  .server-summary-label { flex: none; color: var(--text-3); }
+  .server-summary-value {
+    flex: 1;
+    min-width: 0;
+    direction: ltr;
+    unicode-bidi: isolate;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .server-summary-action { flex: none; color: var(--accent); font-weight: 600; }
+  #server-field { display: none; }
+  .auth.server-open .server-summary { display: none; }
+  .auth.server-open #server-field { display: block; }
+
+  .auth-alt { margin-top: 12px; }
+  .auth-divider { margin-bottom: 12px; }
+  /* What Google does and does not see is said again, at length, on the screen
+     that asks for the passphrase. */
+  .auth-alt .hint { display: none; }
+  .btn.google .ic { width: 22px; height: 22px; }
+  /* The strapline is the whole footer; the appearance control moves up beside
+     the brand, where the row is half empty. */
+  .auth-foot { flex-direction: row; gap: 10px; margin-top: 14px; font-size: var(--text-caption); }
+  .auth-foot .theme-switch {
+    position: absolute;
+    top: calc(22px + env(safe-area-inset-top)); /* centres on the 44px brand mark */
+    right: 20px;
+  }
+  .auth .theme-switch button { width: 44px; height: 44px; }
+  .theme-switch .ic { width: 19px; height: 19px; }
 }
 
 /* A startup warning stays until dismissed; the error slot below it is wiped

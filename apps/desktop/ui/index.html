@@ -27,7 +27,15 @@
     </div>
 
     <form id="auth-form" novalidate>
-      <div class="field">
+      <!-- On a phone the whole field is one line until it needs changing. The
+           address itself stays on screen either way: it is where the
+           credential is about to be sent. -->
+      <button type="button" class="server-summary" id="btn-server-change">
+        <span class="server-summary-label">Server</span>
+        <span class="server-summary-value" id="server-summary"></span>
+        <span class="server-summary-action">Change</span>
+      </button>
+      <div class="field" id="server-field">
         <label for="server">Server URL</label>
         <input id="server" type="url" autocomplete="off" spellcheck="false" inputmode="url">
         <p class="hint">Use https:// for any server that is not on this machine.</p>
@@ -207,6 +215,7 @@
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script src="fields.js"></script>
+<script src="screens.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

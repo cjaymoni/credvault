@@ -13,7 +13,7 @@ const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLen
 const THEME_KEY = "theme";
 const THEME_CHOICES = ["system", "light", "dark"];
 
-const state = { secrets: [], selected: null, editing: false, authMode: "login", inviteCount: 0, formFields: [],
+const state = { secrets: [], selected: null, editing: false, editTitle: "", authMode: "login", inviteCount: 0, formFields: [],
   // What the server at the URL in the box offers, and the Google sign-in
   // waiting for a passphrase, if there is one.
   capabilities: null, google: null, user: null,
@@ -22,13 +22,25 @@ const state = { secrets: [], selected: null, editing: false, authMode: "login", 
   incompatible: null };
 const MOBILE_QUERY = window.matchMedia("(max-width: 720px)");
 const isMobile = () => MOBILE_QUERY.matches;
+// Rotating a large phone crosses 720px, and the empty state names either a
+// keyboard shortcut or the button that replaces it. Registered once, here,
+// rather than from anything that runs more than once.
+//
+// It re-renders only when the empty state is what is on screen, which is
+// exactly `selected === null && !editing`. Everything else the detail pane
+// can hold — an edit in progress, the invite form, a fingerprint typed in
+// from another person's screen, a delete confirmation — would be thrown away
+// by a re-render, and none of it sets `editing`.
+MOBILE_QUERY.addEventListener("change", () => {
+  if (state.editing || state.selected !== null) return;
+  if ($("app").classList.contains("hidden")) return; // signed out: the pane is deliberately empty
+  renderDetail();
+});
 const timers = { toast: null };
 
 // ----- helpers ---------------------------------------------------------------
 
-function esc(text) {
-  return String(text ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
+const esc = Screens.esc;
 
 const ICONS = {
   lock: '<path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="4" y="11" width="16" height="10" rx="2"/>',
@@ -157,15 +169,18 @@ function togglePasswordInput(input, button) {
 // data-screen attribute picks one. Desktop CSS ignores it and shows both.
 
 function mobileTitle() {
-  if (state.editing) return state.selected === null ? "New secret" : "Edit secret";
+  if (state.editing) return state.editTitle;
   const secret = state.secrets.find((s) => s.id === state.selected);
   return secret ? secret.name : "Invitations";
 }
-function updateMobileTitle() {
+/// What the phone chrome has to agree on: the nav bar names the screen, and
+/// a screen that is a form keeps the invitations out of its way.
+function syncScreenChrome() {
   $("mobile-title").textContent = mobileTitle();
+  $("main").classList.toggle("has-form", state.editing);
 }
 function showDetailScreen() {
-  updateMobileTitle();
+  syncScreenChrome();
   $("app").dataset.screen = "detail";
   $("main").scrollTop = 0;
 }
@@ -266,6 +281,17 @@ function setAuthMode(mode) {
   setError("auth-error", "");
   // Switching tabs abandons a Google sign-in that was waiting for a passphrase.
   if (state.google) { state.google = null; showGoogleForm(false); }
+}
+
+/// The phone layout shows the server as one line and keeps the field folded
+/// behind it. Unfolding is one-way: once someone is editing the address they
+/// stay in the field until they leave the screen.
+function showServerField() {
+  $("auth").classList.add("server-open");
+  $("server").focus();
+}
+function syncServerSummary() {
+  $("server-summary").textContent = Screens.serverSummaryText($("server").value, DEFAULT_SERVER);
 }
 
 /// The registration token is only needed on servers that require one, so the
@@ -458,12 +484,13 @@ function renderGoogleLinkForm({ afterEviction = false } = {}) {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
+  const linked = state.user?.google_email || null;
+  state.editTitle = linked ? "Google sign-in" : "Link Google";
   renderList();
   showDetailScreen();
-  const linked = state.user?.google_email || null;
   $("detail").innerHTML = `
     <form class="card" id="google-link-form" novalidate aria-labelledby="google-link-title">
-      <h2 id="google-link-title" class="card-title">${icon("lock")} ${linked ? "Google sign-in" : "Link Google"}</h2>
+      <h2 id="google-link-title" class="card-title pane-title">${icon("lock")} ${esc(state.editTitle)}</h2>
       ${afterEviction
         ? `<p class="card-lead">
              Your other devices are signed out. If someone else added this sign-in, removing it
@@ -515,11 +542,12 @@ function renderSignOutOthersForm() {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
+  state.editTitle = "Sign out other devices";
   renderList();
   showDetailScreen();
   $("detail").innerHTML = `
     <form class="card" id="sign-out-others-form" novalidate aria-labelledby="sign-out-others-title">
-      <h2 id="sign-out-others-title" class="card-title">${icon("alert")} Sign out other devices</h2>
+      <h2 id="sign-out-others-title" class="card-title pane-title">${icon("alert")} ${esc(state.editTitle)}</h2>
       <p class="card-lead">
         Every other device signed in to this account is signed out. This one stays
         signed in. Your secrets are untouched and your passphrase does not change.
@@ -656,10 +684,13 @@ function showApp(user) {
 /// they used to each keep their own copy, which had already drifted apart.
 function resetToSignedOut() {
   clearReveals();
+  // The next person to use this app gets the folded server line back.
+  $("auth").classList.remove("server-open");
   // Dropped with the rest of it: the chip reads the signed-in account, and a
   // stale one would describe the last person to use this app.
   state.user = null;
   state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0;
+  syncScreenChrome();
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
   closeAccountSheet({ restoreFocus: false });
   setError("main-error", "");
@@ -761,10 +792,10 @@ function renderList() {
     list.innerHTML = `<p class="list-empty">${needle ? "No secrets match your search." : "Your vault is empty."}</p>`;
     return;
   }
-  const group = (title, items) => items.length
-    ? `<div role="group" aria-label="${title}"><div class="list-heading">${title}</div>${items.map(itemHtml).join("")}</div>`
-    : "";
-  list.innerHTML = shared.length ? group("Mine", mine) + group("Shared with me", shared) : mine.map(itemHtml).join("");
+  // Always wrapped, titled or not: the phone layout draws each group as one
+  // inset card with hairlines between its rows.
+  const group = (title, items) => Screens.listGroupHtml(title, items.map(itemHtml).join(""));
+  list.innerHTML = shared.length ? group("Mine", mine) + group("Shared with me", shared) : group(null, mine);
 
   const items = list.querySelectorAll(".item");
   if (!list.querySelector('.item[tabindex="0"]') && items.length) items[0].tabIndex = 0;
@@ -873,7 +904,9 @@ function emptyDetailHtml() {
     <div class="card empty">
       <div class="empty-icon">${icon("key")}</div>
       <h2>No secret selected</h2>
-      <p>Pick one from the list, or press <span class="kbd">⌘N</span> / <span class="kbd">Ctrl+N</span> to create a new one.</p>
+      <p>${isMobile()
+        ? "Pick one from your vault, or tap + to create a new one."
+        : `Pick one from the list, or press <span class="kbd">⌘N</span> / <span class="kbd">Ctrl+N</span> to create a new one.`}</p>
     </div>`;
 }
 
@@ -902,7 +935,7 @@ function customFieldRows(secret) {
 
 function renderDetail() {
   clearReveals();
-  updateMobileTitle();
+  syncScreenChrome();
   const s = state.secrets.find((x) => x.id === state.selected);
   $("main").classList.toggle("has-selection", Boolean(s));
   if (!s) {
@@ -1378,12 +1411,13 @@ function renderPassphraseForm() {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
+  state.editTitle = "Change passphrase";
   renderList();
   showDetailScreen();
   const isLogin = state.user?.password_login !== false;
   $("detail").innerHTML = `
     <form class="card" id="passphrase-form" novalidate aria-labelledby="passphrase-title">
-      <h2 id="passphrase-title" class="card-title">${icon("lock")} Change passphrase</h2>
+      <h2 id="passphrase-title" class="card-title pane-title">${icon("lock")} ${esc(state.editTitle)}</h2>
       <p class="card-lead">
         ${isLogin
           ? "This is what encrypts your vault and what you sign in with. Every other device is signed out."
@@ -1532,14 +1566,15 @@ function addFormField() {
 
 function renderForm(existing) {
   state.editing = true;
+  state.editTitle = existing ? "Edit secret" : "New secret";
   clearReveals();
   state.formFields = Fields.formFieldsFrom(existing);
-  updateMobileTitle();
+  syncScreenChrome();
   $("main").classList.add("has-selection");
   const s = existing || { name: "", username: "", url: "", notes: "" };
   $("detail").innerHTML = `
     <form class="card form" id="secret-form" novalidate aria-labelledby="form-title">
-      <h2 id="form-title" class="card-title pane-title">${existing ? icon("edit") : icon("plus")} ${existing ? "Edit secret" : "New secret"}</h2>
+      <h2 id="form-title" class="card-title pane-title">${existing ? icon("edit") : icon("plus")} ${esc(state.editTitle)}</h2>
       <p class="card-lead">${existing ? "Changes are re-encrypted on this device before they are saved." : "Everything except the name is encrypted on this device before it is saved."}</p>
       <div class="field">
         <label for="f-name">Name</label>
@@ -1551,7 +1586,7 @@ function renderForm(existing) {
       </div>
       <div class="field">
         <label for="f-password">Password</label>
-        <div class="input-row">
+        <div class="input-row stack">
           <input id="f-password" type="password" autocomplete="new-password" placeholder="${existing ? "Unchanged" : ""}">
           <button type="button" class="icon-btn bordered" id="btn-toggle-pw" aria-label="Show password" aria-pressed="false" title="Show password">${icon("eye")}</button>
           <button type="button" class="btn" id="btn-generate" title="Generate a strong ${UI.generatedPasswordLength}-character password">${icon("wand")} Generate</button>
@@ -1672,6 +1707,8 @@ $("btn-sign-out-others").onclick = () => renderSignOutOthersForm();
 // settles rather than on every keystroke.
 $("server").onchange = () => refreshCapabilities();
 $("server").onblur = () => refreshCapabilities();
+$("server").oninput = syncServerSummary;
+$("btn-server-change").onclick = showServerField;
 $("btn-logout").onclick = () => logout().catch((error) => setError("main-error", error));
 $("btn-refresh").onclick = () => { closeAccountSheet({ restoreFocus: false }); refresh(); };
 $("btn-back").onclick = goBack;
@@ -1698,6 +1735,7 @@ applyTheme(recall(THEME_KEY) || "system");
 
 $("server").value = recall("server") || DEFAULT_SERVER;
 $("server").placeholder = DEFAULT_SERVER;
+syncServerSummary();
 $("email").value = recall("email");
 setAuthMode("login");
 ($("email").value ? $("password") : $("email")).focus();

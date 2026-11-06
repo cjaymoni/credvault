@@ -586,9 +586,15 @@ async fn logout_invalidates_only_that_token_and_logout_everywhere_all() {
         login(&server, "alice@example.com", master.auth_hash(&server.address)).await.json().await.unwrap();
     let alice_third = with_token(&alice, third.token);
     let response = server.req(Method::DELETE, "/sessions", &alice_second).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK, "{}", response.text().await.unwrap());
+    let replacement: SessionResponse = response.json().await.unwrap();
+    // The token used to ask is gone with the rest; the one handed back is not.
+    // The caller keeps a way in so the request that takes away whatever let
+    // the other sessions exist can follow immediately.
     assert_eq!(server.req(Method::GET, "/me", &alice_second).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     assert_eq!(server.req(Method::GET, "/me", &alice_third).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let kept = with_token(&alice, replacement.token);
+    assert_eq!(server.req(Method::GET, "/me", &kept).send().await.unwrap().status(), StatusCode::OK);
 }
 
 /// The same user with a different session token. The identity is unused by

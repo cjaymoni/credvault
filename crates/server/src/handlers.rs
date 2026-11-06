@@ -288,10 +288,30 @@ pub async fn logout(State(state): State<AppState>, user: AuthUser) -> ApiResult<
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Invalidate every session for the caller, including the one making the request.
-pub async fn logout_everywhere(State(state): State<AppState>, user: AuthUser) -> ApiResult<StatusCode> {
+/// Invalidate every session for the caller except this one, which is replaced.
+///
+/// The caller keeps a way in on purpose. This is the first move against
+/// someone holding a session they should not have, and the second move is
+/// usually to take away whatever let them in — removing a Google link,
+/// changing the passphrase. Ending the caller's session too would send them
+/// back through a sign-in to do it, which on a slow derivation is seconds the
+/// evicted party can use to come back and start spending the per-account
+/// budgets again. Handing back a token makes the next request immediate, and
+/// an attacker needs a whole OAuth round trip to interfere with it.
+///
+/// Deliberately unrationed: every other per-account limit can be emptied by
+/// whoever is already signed in as that account, so the route that evicts them
+/// must not have one. It can afford to go without — it is authenticated, it is
+/// one indexed delete, there is no Argon2 and no outbound call, and flooding
+/// it costs the flooder their own session on the first request.
+///
+/// Both of the other handlers that end every session, [`change_password`] and
+/// [`oauth_unlink`], replace the caller's for the same reason.
+pub async fn logout_other_devices(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<SessionResponse>> {
     sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user.id).execute(&state.pool).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let token = issue_session(&state.pool, user.id).await?;
+    let profile = load_profile(&state.pool, user.id).await?;
+    Ok(Json(SessionResponse { token, user: profile }))
 }
 
 pub async fn me(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<UserProfile>> {

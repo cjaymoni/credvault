@@ -97,13 +97,15 @@ Argon2id on your device. The server stores no password for such an account.
   all. You stay signed in where you asked for the removal. An account created
   *through* Google cannot remove its link: it is the only thing that opens
   that account.
-- "Sign out everywhere" in the account panel ends every session for the
-  account, on every device including this one, and asks for nothing but the
-  button. That is deliberate. It is the move to make first if you think someone
+- "Sign out other devices" in the account panel ends every session for the
+  account except the one you are using, and asks for nothing but the button.
+  Both halves are deliberate. It is the move to make first if you think someone
   else is signed in as you: every other per-account limit can be used up by
-  whoever is already signed in, and this one cannot, so it still works when the
-  rest are refusing. Once their session is gone they cannot get in the way of
-  removing a Google sign-in they added.
+  whoever is already signed in, and this one has no limit at all, so it still
+  works when the rest are refusing. And you stay signed in here, so you can go
+  straight on to remove a Google sign-in they added — if this signed you out
+  too, you would be sitting through a sign-in while they came back. To sign out
+  this device as well, use "Log out" afterwards.
 - A first sign-in still needs the server's registration token, if it has one.
   A verified Google address is not by itself permission to have an account on
   someone else's server.
@@ -186,7 +188,8 @@ client it serves. The app reads both before it derives a key or sends a
 credential, and stops with a plain message when the two cannot work together.
 A server ahead of the app that still serves the app's protocol works normally.
 
-Protocol 2 added the passphrase proof on linking and the unlink route. This app
+Protocol 2 added the passphrase proof on linking, the unlink route, and the
+replacement session that signing out other devices hands back. This app
 will not talk to a protocol-1 server at all: that server would accept a link
 request, ignore the proof, and answer in a shape the app reads as failure —
 leaving a Google sign-in on the account that the app cannot show you and that

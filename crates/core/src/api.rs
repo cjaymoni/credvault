@@ -66,7 +66,9 @@ const REDACTED: &str = "<redacted>";
 /// 2: `/oauth/link` gained a required `current_auth_hash` and now answers with
 /// a profile where it answered `204`; `/oauth/unlink` is new and answers with
 /// a fresh session, because removing a link ends every session the link could
-/// have minted.
+/// have minted; `DELETE /sessions` answers with a fresh session too, and now
+/// spares the caller's rather than ending it, so the request that evicts
+/// someone can be followed immediately by the one that locks them out.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest server protocol a client built from this source will talk to.

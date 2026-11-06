@@ -489,64 +489,68 @@ function renderGoogleLinkForm() {
   $("gl-current").focus();
 }
 
-/// Confirmation for ending every session, including this one.
+/// Confirmation for ending every other session.
 ///
 /// Deliberately not behind the passphrase. Someone reaches for this because
 /// they think another session is open that should not be, and the whole value
 /// of the route is that nothing the other session does can block it — adding a
 /// derivation and a verify in front would hand it a way to.
-function renderSignOutEverywhereForm() {
+///
+/// This device keeps its session on purpose, so whatever the user does next
+/// about the party they just evicted goes out straight away rather than after
+/// a sign-in they would have to sit through.
+function renderSignOutOthersForm() {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
   renderList();
   showDetailScreen();
   $("detail").innerHTML = `
-    <form class="card" id="sign-out-all-form" novalidate aria-labelledby="sign-out-all-title">
-      <h2 id="sign-out-all-title" class="card-title">${icon("alert")} Sign out everywhere</h2>
+    <form class="card" id="sign-out-others-form" novalidate aria-labelledby="sign-out-others-title">
+      <h2 id="sign-out-others-title" class="card-title">${icon("alert")} Sign out other devices</h2>
       <p class="card-lead">
-        Every device signed in to this account is signed out, including this one.
-        Your secrets are untouched and your passphrase does not change &mdash;
-        you just sign in again.
+        Every other device signed in to this account is signed out. This one stays
+        signed in. Your secrets are untouched and your passphrase does not change.
       </p>
       <p class="card-lead">
         This is the thing to do first if you think someone else is signed in as you.
-        Nothing they can do stops it, and once their session is gone they cannot
-        interfere with removing a Google sign-in they added.
+        Nothing they can do stops it &mdash; and because you stay signed in here, you
+        can go straight on to remove a Google sign-in they added, before they have
+        time to come back.
       </p>
       <div class="error" id="soa-error" role="alert"></div>
       <div class="actions">
         <button type="submit" class="btn danger solid" id="btn-soa-save">
-          ${icon("check")} Sign out everywhere
+          ${icon("check")} Sign out other devices
         </button>
         <button type="button" class="btn" id="btn-soa-cancel">Cancel</button>
       </div>
     </form>`;
 
   $("btn-soa-cancel").onclick = () => { state.editing = false; renderDetail(); showListScreen(); };
-  $("sign-out-all-form").onsubmit = submitSignOutEverywhere;
+  $("sign-out-others-form").onsubmit = submitSignOutOthers;
   $("btn-soa-cancel").focus();
 }
 
-async function submitSignOutEverywhere(event) {
+async function submitSignOutOthers(event) {
   event.preventDefault();
   setError("soa-error", "");
   setBusy($("btn-soa-save"), true, "Signing out…");
   try {
-    await invoke("sign_out_everywhere");
-    // Reported rather than best-effort, so the local session is only dropped
-    // once the server has confirmed the rest are gone. Everything else the
-    // signed-out state needs is what `logout` already clears.
-    clearReveals();
-    state.user = null;
-    state.secrets = []; state.selected = null; state.editing = false;
-    $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
-    setError("main-error", "");
-    $("app").classList.add("hidden");
-    $("auth").classList.remove("hidden");
-    $("password").focus();
-    toast("Signed out on every device");
+    state.user = await invoke("sign_out_other_devices");
+    renderGoogleChip();
+    state.editing = false;
+    renderDetail();
+    showListScreen();
+    toast("Other devices signed out");
   } catch (error) {
+    // When the answer was lost the command signs this device out too, because
+    // whether the others went cannot be known. Follow it here rather than
+    // leaving a card over a vault this app no longer holds a session for.
+    if (String(error?.code ?? "") === "locked") {
+      signOutAfterAmbiguousChange(String(error?.message ?? error));
+      return;
+    }
     setError("soa-error", error);
   } finally {
     setBusy($("btn-soa-save"), false);
@@ -595,18 +599,27 @@ function showApp(user) {
   refresh();
 }
 
-async function logout() {
-  await invoke("logout");
+/// Everything the signed-out state needs cleared, in one place.
+///
+/// Three paths reach it — logging out, a passphrase change whose answer was
+/// lost, and signing out after an eviction that could not be confirmed — and
+/// they used to each keep their own copy, which had already drifted apart.
+function resetToSignedOut() {
   clearReveals();
   // Dropped with the rest of it: the chip reads the signed-in account, and a
   // stale one would describe the last person to use this app.
   state.user = null;
-  state.secrets = []; state.selected = null; state.editing = false;
+  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0;
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
   closeAccountSheet({ restoreFocus: false });
   setError("main-error", "");
   $("app").classList.add("hidden");
   $("auth").classList.remove("hidden");
+}
+
+async function logout() {
+  await invoke("logout");
+  resetToSignedOut();
   $("password").focus();
 }
 
@@ -1400,13 +1413,7 @@ async function submitPassphraseChange(event) {
 /// only resets what is on screen. A reload will land on the sign-in screen too,
 /// because `session_info` now has nothing to report.
 function signOutAfterAmbiguousChange(message) {
-  clearReveals();
-  state.secrets = []; state.selected = null; state.editing = false; state.user = null;
-  $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
-  closeAccountSheet({ restoreFocus: false });
-  setError("main-error", "");
-  $("app").classList.add("hidden");
-  $("auth").classList.remove("hidden");
+  resetToSignedOut();
   showStartupWarning(message);
   $("password").focus();
 }
@@ -1607,7 +1614,7 @@ $("btn-google-cancel").onclick = cancelGoogleSignIn;
 $("btn-google-toggle-pw").onclick = () => togglePasswordInput($("google-password"), $("btn-google-toggle-pw"));
 $("btn-link-google").onclick = () => renderGoogleLinkForm();
 $("btn-change-passphrase").onclick = () => renderPassphraseForm();
-$("btn-sign-out-everywhere").onclick = () => renderSignOutEverywhereForm();
+$("btn-sign-out-others").onclick = () => renderSignOutOthersForm();
 // The button belongs to whichever server is in the box, so re-ask when it
 // settles rather than on every keystroke.
 $("server").onchange = () => refreshCapabilities();

@@ -1004,20 +1004,29 @@ async fn the_unlink_budget_is_not_the_passphrase_budget() {
     assert_eq!(removed.json::<SessionResponse>().await.unwrap().user.google_email, None);
 }
 
-/// Ending every session answers even when every per-account budget is empty.
+/// The eviction route answers while the other budgets are empty, and leaves
+/// the caller able to use what it bought.
 ///
 /// This is what makes the F-13 remedy reachable. Whoever holds a session for
 /// an account can empty any budget keyed to that account simply by spending
 /// it — including the one in front of `/oauth/unlink`, with a malformed proof,
 /// for the cost of one request a minute. So the first move against them cannot
-/// be rationed that way. `DELETE /sessions` is not: it ends their session,
-/// after which they can spend nothing, and the unlink follows on a quiet
-/// bucket.
+/// be rationed that way, and `DELETE /sessions` is not.
+///
+/// Ending their session is no use if it ends the owner's with it: they would
+/// go back through a sign-in while the unlink bucket is still at zero, and the
+/// evicted party only has to re-enter and keep spending. So the route hands
+/// back a token.
+///
+/// What is pinned here is that behaviour while the other budgets are empty.
+/// It does not pin that `DELETE /sessions` has no budget of its own — it sends
+/// that route a single request, so a limiter added tomorrow would not fail it.
 #[tokio::test]
-async fn signing_out_everywhere_answers_when_every_account_budget_is_empty() {
+async fn the_eviction_route_answers_and_keeps_the_caller_signed_in() {
     let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
     let server = spawn(Arc::clone(&stub)).await;
     let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
     let limits = RateLimits::default();
 
     // Empty the passphrase budget, then the unlink budget, both the way
@@ -1047,11 +1056,18 @@ async fn signing_out_everywhere_answers_when_every_account_budget_is_empty() {
         "the unlink budget should be empty by now"
     );
 
-    // The one route that still answers.
+    // The one route that still answers, and it keeps the caller signed in.
     let response =
         server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&alice.token).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT, "{}", response.text().await.unwrap());
+    assert_eq!(response.status(), StatusCode::OK, "{}", response.text().await.unwrap());
+    let kept: SessionResponse = response.json().await.unwrap();
     assert_eq!(server.get_as("/me", &alice.token).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(server.get_as("/me", &kept.token).await.status(), StatusCode::OK);
+
+    // Keeping the session is the point. The unlink bucket is still empty, so
+    // without a token in hand the owner would be sitting through a sign-in
+    // while it refills at one token a minute and the evicted party re-enters.
+    assert_eq!(unlink(&server, &kept.token, &auth_hash).await.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// An account created through Google cannot link a second identity, and is

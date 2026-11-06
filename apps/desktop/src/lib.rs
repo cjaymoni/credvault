@@ -615,31 +615,48 @@ async fn logout(state: State<'_, AppState>) -> CommandResult<()> {
     Ok(())
 }
 
-/// End every session for this account, on every device, and sign out here.
+/// End every session for this account except this one, which is replaced.
 ///
-/// Unlike [`logout`] this is reported rather than best-effort: someone reaches
-/// for it because they believe another session exists that should not, and
-/// "signed out" when the server never heard is the wrong answer to that.
+/// The move to make first when someone else may be signed in. Every
+/// per-account budget can be emptied by whoever already holds a session for
+/// that account, so the route that evicts them carries no budget at all — it
+/// answers when the rest are refusing. This device keeps a token so the next
+/// thing the user does, usually removing the Google link that let the other
+/// party in, goes out immediately rather than after a sign-in; the evicted
+/// party needs a whole OAuth round trip to come back and interfere.
 ///
-/// It is also the move that comes first when a Google link was added without
-/// the account holder's knowledge. Whoever holds the unwanted session can
-/// empty any per-account budget — including the one in front of unlinking —
-/// just by spending it, but this route is rationed per address rather than per
-/// account, so it still answers. Once their session is gone they cannot spend
-/// anything, and the link can be removed.
+/// Unlike [`logout`] this is reported rather than best-effort, and a failure
+/// signs this device out too. Someone reaches for it believing another session
+/// exists that should not, and the one answer that must never be given
+/// wrongly is that it is gone. A lost answer is not a failed delete — the
+/// server may have purged everything and died on the way back — so the
+/// ambiguity is resolved toward the safe side and said out loud.
 ///
 /// # Errors
-/// Whatever the client reports if the server cannot be reached. The local
-/// session is kept in that case, because nothing has been ended.
+/// `locked` when the answer was lost, carrying what is and is not known.
 #[tauri::command]
-async fn sign_out_everywhere(state: State<'_, AppState>) -> CommandResult<()> {
-    let api = api(&state)?;
-    api.logout_everywhere().await?;
-    let mut guard = state.session.lock().map_err(|_| "session lock poisoned".to_string())?;
-    *guard = None;
-    drop(guard);
-    clear_pending_google(&state);
-    Ok(())
+async fn sign_out_other_devices(state: State<'_, AppState>) -> CommandResult<UserSummary> {
+    let (api, user_id) = with_session(&state, |session| Ok((session.api.clone(), session.user_id)))?;
+    let signed_in = match api.logout_other_devices().await {
+        Ok(signed_in) => signed_in,
+        Err(error) => {
+            clear_local_session(&state);
+            clear_pending_google(&state);
+            return Err(CommandError::new(
+                "locked",
+                format!(
+                    "{error}. It is not clear whether your other devices were signed out, so this one has been \
+                     signed out too. Sign in again and check."
+                ),
+            ));
+        }
+    };
+    with_same_session(&state, user_id, |session| {
+        session.api = api.clone().with_token(&signed_in.token);
+        session.google_email = signed_in.user.google_email.clone();
+        session.password_login = signed_in.user.password_login;
+        Ok(summary_of(session))
+    })
 }
 
 // ----- sign in with Google ----------------------------------------------------
@@ -1935,7 +1952,7 @@ pub fn run() {
             register,
             login,
             logout,
-            sign_out_everywhere,
+            sign_out_other_devices,
             server_capabilities,
             google_sign_in,
             google_unlock,

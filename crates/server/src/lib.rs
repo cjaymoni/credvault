@@ -257,7 +257,7 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
             post(handlers::oauth_unlink).layer(middleware::from_fn_with_state(oauth_unlink_limit, ratelimit::limit)),
         )
         .route("/logout", post(handlers::logout))
-        .route("/sessions", delete(handlers::logout_everywhere))
+        .route("/sessions", delete(handlers::logout_other_devices))
         .route("/me", get(handlers::me))
         .route("/password", post(handlers::change_password))
         .route("/users/lookup", get(handlers::lookup_user))

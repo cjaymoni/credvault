@@ -320,7 +320,27 @@ async function refreshCapabilities() {
   else if (wasIncompatible) setError("auth-error", "");
   const offered = Boolean(state.capabilities?.google_sign_in) && !state.google;
   $("google-block").classList.toggle("hidden", !offered);
-  $("btn-link-google").classList.toggle("hidden", !state.capabilities?.google_sign_in);
+  renderGoogleChip();
+}
+
+/// The chip says what the account actually has, not what the server offers.
+///
+/// Hidden for an account that signs in with Google already: its link is the
+/// only way in and cannot be removed, so there is nothing to offer. For a
+/// password account it reads "Link Google" or names the address that can sign
+/// in, which is what makes an unwanted link visible.
+function renderGoogleChip() {
+  const supported = Boolean(state.capabilities?.google_sign_in);
+  const user = state.user;
+  const canLink = supported && user?.password_login !== false;
+  const chip = $("btn-link-google");
+  chip.classList.toggle("hidden", !canLink);
+  if (!canLink) return;
+  const linked = user?.google_email || null;
+  chip.querySelector(".chip-label").textContent = linked || "Link Google";
+  chip.title = linked
+    ? `${linked} can sign in to this account. Click to review or remove it.`
+    : "Use your Google account to sign in to this server next time. Your passphrase is still what unlocks the vault.";
 }
 
 /// Swap the password form for the passphrase prompt, or back again.
@@ -405,15 +425,75 @@ function cancelGoogleSignIn() {
   setAuthMode(state.authMode);
 }
 
-async function linkGoogle() {
-  setBusy($("btn-link-google"), true);
+/// Review the Google link: add one, or remove the one that is there.
+///
+/// Both ask for the passphrase, because both change how this account can be
+/// signed into and a session alone must not be enough to do that. The server
+/// enforces it; asking here is what makes the rule visible and catches a typo
+/// before a trip through the browser.
+function renderGoogleLinkForm() {
+  closeAccountSheet({ restoreFocus: false });
+  state.selected = null;
+  state.editing = true;
+  renderList();
+  showDetailScreen();
+  const linked = state.user?.google_email || null;
+  $("detail").innerHTML = `
+    <form class="card" id="google-link-form" novalidate aria-labelledby="google-link-title">
+      <h2 id="google-link-title" class="card-title">${icon("lock")} ${linked ? "Google sign-in" : "Link Google"}</h2>
+      <p class="card-lead">
+        ${linked
+          ? `<strong>${esc(linked)}</strong> can sign in to this account without your passphrase.
+             Remove it if you did not add it, or if you no longer want to sign in that way.`
+          : `Sign in to this server with your Google account next time.
+             Your passphrase is still what unlocks the vault &mdash; Google only proves who you are.`}
+      </p>
+      <div class="field">
+        <label for="gl-current">Your passphrase</label>
+        <input id="gl-current" type="password" autocomplete="current-password" spellcheck="false">
+        <p class="hint">
+          ${linked
+            ? "Removing a way to sign in needs more than an unlocked app."
+            : "Adding a way to sign in needs more than an unlocked app."}
+        </p>
+      </div>
+      <div class="error" id="gl-error" role="alert"></div>
+      <div class="actions">
+        <button type="submit" class="btn ${linked ? "danger" : "primary"}" id="btn-gl-save">
+          ${linked ? `${icon("trash")} Remove link` : `${icon("check")} Link Google`}
+        </button>
+        <button type="button" class="btn" id="btn-gl-cancel">Cancel</button>
+      </div>
+    </form>`;
+
+  $("btn-gl-cancel").onclick = () => { state.editing = false; renderDetail(); showListScreen(); };
+  $("google-link-form").onsubmit = submitGoogleLinkChange;
+  $("gl-current").focus();
+}
+
+async function submitGoogleLinkChange(event) {
+  event.preventDefault();
+  setError("gl-error", "");
+  const current = $("gl-current").value;
+  if (!current) {
+    setError("gl-error", "Enter your passphrase.");
+    $("gl-current").focus();
+    return;
+  }
+  const linked = Boolean(state.user?.google_email);
+  setBusy($("btn-gl-save"), true, linked ? "Removing\u2026" : "Waiting for your browser\u2026");
   try {
-    await invoke("google_link");
-    toast("Google account linked");
+    const user = await invoke(linked ? "google_unlink" : "google_link", { current });
+    state.user = user;
+    renderGoogleChip();
+    toast(linked ? "Google sign-in removed" : "Google account linked");
+    state.editing = false;
+    renderDetail();
+    showListScreen();
   } catch (error) {
-    setError("main-error", error);
+    setError("gl-error", error);
   } finally {
-    setBusy($("btn-link-google"), false);
+    setBusy($("btn-gl-save"), false);
   }
 }
 
@@ -423,6 +503,7 @@ function showApp(user) {
   $("who-server").textContent = user.server_url;
   $("who-server").title = user.server_url;
   $("fingerprint").textContent = user.fingerprint;
+  renderGoogleChip();
   $("auth").classList.add("hidden");
   $("app").classList.remove("hidden");
   state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0;
@@ -435,6 +516,9 @@ function showApp(user) {
 async function logout() {
   await invoke("logout");
   clearReveals();
+  // Dropped with the rest of it: the chip reads the signed-in account, and a
+  // stale one would describe the last person to use this app.
+  state.user = null;
   state.secrets = []; state.selected = null; state.editing = false;
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
   closeAccountSheet({ restoreFocus: false });
@@ -1439,7 +1523,7 @@ $("btn-google").onclick = startGoogleSignIn;
 $("google-form").onsubmit = submitGooglePassphrase;
 $("btn-google-cancel").onclick = cancelGoogleSignIn;
 $("btn-google-toggle-pw").onclick = () => togglePasswordInput($("google-password"), $("btn-google-toggle-pw"));
-$("btn-link-google").onclick = () => linkGoogle();
+$("btn-link-google").onclick = () => renderGoogleLinkForm();
 $("btn-change-passphrase").onclick = () => renderPassphraseForm();
 // The button belongs to whichever server is in the box, so re-ask when it
 // settles rather than on every keystroke.

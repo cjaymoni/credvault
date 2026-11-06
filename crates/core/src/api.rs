@@ -186,6 +186,14 @@ pub struct UserProfile {
     /// whether a passphrase change should also change the login.
     #[serde(default = "yes")]
     pub password_login: bool,
+    /// The Google address linked to this account, if there is one.
+    ///
+    /// Carried so a link can be seen and removed. A sign-in credential that
+    /// nothing displays is one the account holder cannot notice has been
+    /// added, and this one outlives both a passphrase change and a
+    /// sign-out-everywhere.
+    #[serde(default)]
+    pub google_email: Option<String>,
 }
 
 fn yes() -> bool {
@@ -416,6 +424,45 @@ impl fmt::Debug for OAuthCallbackRequest {
             .field("app_secret", &REDACTED)
             .field("code", &REDACTED)
             .finish()
+    }
+}
+
+/// Finishing a link: the callback, plus proof of the account passphrase.
+///
+/// The proof is what separates this from every other authenticated call. A
+/// link is a second, standalone way into the account, so a session alone must
+/// not be enough to create one — for the same reason a session alone cannot
+/// change the passphrase. See [`ChangePasswordRequest::current_auth_hash`].
+#[derive(Serialize, Deserialize)]
+pub struct OAuthLinkRequest {
+    #[serde(flatten)]
+    pub callback: OAuthCallbackRequest,
+    /// Proof of the current passphrase, for an account that signs in with a
+    /// password. A Google account has no password login and so nothing the
+    /// server can check, and this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_auth_hash: Option<Zeroizing<String>>,
+}
+
+impl fmt::Debug for OAuthLinkRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthLinkRequest")
+            .field("callback", &self.callback)
+            .field("current_auth_hash", &self.current_auth_hash.as_ref().map(|_| REDACTED))
+            .finish()
+    }
+}
+
+/// Removing a link. Proof of the passphrase is required here too: removing a
+/// credential is as much a credential change as adding one.
+#[derive(Serialize, Deserialize)]
+pub struct OAuthUnlinkRequest {
+    pub current_auth_hash: Zeroizing<String>,
+}
+
+impl fmt::Debug for OAuthUnlinkRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthUnlinkRequest").field("current_auth_hash", &REDACTED).finish()
     }
 }
 

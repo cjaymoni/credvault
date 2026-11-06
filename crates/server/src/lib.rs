@@ -190,6 +190,10 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     // account can make the server fetch from Google is per-user and lives in
     // the handler; see `AppState::link_limiter`.
     let oauth_link_limit = limit_for(limits.login_burst, limits.login_refill);
+    // Removing a link verifies a passphrase, which is the same work a login
+    // does, so it gets an address bucket of the same shape. The per-account
+    // ceiling is `AppState::password_limiter`, which is what the handler spends.
+    let oauth_unlink_limit = limit_for(limits.login_burst, limits.login_refill);
     let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
     let password_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
     let link_limiter = Arc::new(RateLimiter::new(limits.link_burst, limits.link_refill));
@@ -218,6 +222,10 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .route(
             "/oauth/link",
             post(handlers::oauth_link).layer(middleware::from_fn_with_state(oauth_link_limit, ratelimit::limit)),
+        )
+        .route(
+            "/oauth/unlink",
+            post(handlers::oauth_unlink).layer(middleware::from_fn_with_state(oauth_unlink_limit, ratelimit::limit)),
         )
         .route("/logout", post(handlers::logout))
         .route("/sessions", delete(handlers::logout_everywhere))

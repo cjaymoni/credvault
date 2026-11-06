@@ -313,10 +313,19 @@ async fn parameters_generated_by_the_server_reach_the_provider() {
     assert_ne!(verifier, &issued.code_challenge);
 }
 
+/// The passphrase every `password_session` account is created with.
+const SESSION_PASSPHRASE: &str = "correct horse battery staple";
+
+/// The credential one of those accounts proves itself with. Linking and
+/// unlinking both ask for it, so the tests have to be able to produce it.
+fn session_auth_hash(server: &TestServer, email: &str) -> String {
+    MasterKey::derive(SESSION_PASSPHRASE, email).unwrap().auth_hash(&server.address).to_string()
+}
+
 /// A password account and a session for it, for the flows that need one.
 async fn password_session(server: &TestServer, email: &str) -> SessionResponse {
     let identity = Identity::generate();
-    let master = MasterKey::derive("correct horse battery staple", email).unwrap();
+    let master = MasterKey::derive(SESSION_PASSPHRASE, email).unwrap();
     server
         .post(
             "/register",
@@ -396,13 +405,18 @@ async fn a_link_cannot_be_finished_by_a_different_session() {
     let alice = password_session(&server, "alice@example.com").await;
     let mallory = password_session(&server, "mallory@example.com").await;
 
-    let link = async |started: &OAuthStartResponse, token: &str| {
+    // Each caller proves its own passphrase, so what is being tested is the
+    // session binding and not the new credential check.
+    let link = async |started: &OAuthStartResponse, token: &str, email: &str| {
         server
             .client
             .post(format!("{}/oauth/link", server.base))
             .bearer_auth(token)
             .json(&serde_json::json!({
-                "state": started.state, "app_secret": started.app_secret.as_str(), "code": "code-1"
+                "state": started.state,
+                "app_secret": started.app_secret.as_str(),
+                "code": "code-1",
+                "current_auth_hash": session_auth_hash(&server, email),
             }))
             .send()
             .await
@@ -410,11 +424,11 @@ async fn a_link_cannot_be_finished_by_a_different_session() {
     };
 
     let started = server.start_as("link", Some(&alice.token)).await;
-    assert_eq!(link(&started, &mallory.token).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(link(&started, &mallory.token, "mallory@example.com").await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(stub.exchanges().len(), 0, "a wrong session must not reach the provider");
 
     // The attempt survived the attempt to steal it, so Alice still finishes.
-    assert_eq!(link(&started, &alice.token).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(link(&started, &alice.token, "alice@example.com").await.status(), StatusCode::OK);
 }
 
 /// Starting a link says which account the identity will be bound to, so it
@@ -569,13 +583,17 @@ async fn linking_lets_a_password_account_use_the_button() {
         .await
         .unwrap();
 
+    let auth_hash = master.auth_hash(&server.address).to_string();
     let link = async |started: &OAuthStartResponse, code: &str, token: &str| {
         server
             .client
             .post(format!("{}/oauth/link", server.base))
             .bearer_auth(token)
             .json(&serde_json::json!({
-                "state": started.state, "app_secret": started.app_secret.as_str(), "code": code
+                "state": started.state,
+                "app_secret": started.app_secret.as_str(),
+                "code": code,
+                "current_auth_hash": auth_hash,
             }))
             .send()
             .await
@@ -588,7 +606,11 @@ async fn linking_lets_a_password_account_use_the_button() {
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
     let started = server.start_as("link", Some(&session.token)).await;
-    assert_eq!(link(&started, "code-1", &session.token).await.status(), StatusCode::NO_CONTENT);
+    let linked = link(&started, "code-1", &session.token).await;
+    assert_eq!(linked.status(), StatusCode::OK);
+    // The profile that comes back names the address that can now sign in, so
+    // the client can show it.
+    assert_eq!(linked.json::<UserProfile>().await.unwrap().google_email.as_deref(), Some("kat@example.com"));
 
     // The account email is untouched, because it is the key-derivation salt.
     let started = server.start("sign_in").await;
@@ -720,4 +742,145 @@ async fn a_google_session_alone_can_replace_the_vault_keys() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "a Google session is sufficient today");
+}
+
+/// Post to `/oauth/unlink` as `token`, with whatever credential is given.
+async fn unlink(server: &TestServer, token: &str, auth_hash: &str) -> reqwest::Response {
+    server
+        .client
+        .post(format!("{}/oauth/unlink", server.base))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "current_auth_hash": auth_hash }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A session token is not enough to add a way into the account.
+///
+/// A linked identity signs in on its own and survives both a passphrase change
+/// and "sign out everywhere", so whoever holds a stolen token for a moment must
+/// not be able to leave one behind. The passphrase is the thing a stolen token
+/// does not carry, and it is checked before the code is spent — so a caller
+/// who cannot prove it never reaches Google either.
+#[tokio::test]
+async fn a_stolen_session_cannot_leave_a_google_sign_in_behind() {
+    let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+
+    let link = async |body: serde_json::Value| {
+        server
+            .client
+            .post(format!("{}/oauth/link", server.base))
+            .bearer_auth(&alice.token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    };
+
+    // No proof at all.
+    let started = server.start_as("link", Some(&alice.token)).await;
+    let no_proof = link(serde_json::json!({
+        "state": started.state, "app_secret": started.app_secret.as_str(), "code": "code-1"
+    }))
+    .await;
+    assert_eq!(no_proof.status(), StatusCode::BAD_REQUEST);
+
+    // A wrong passphrase, correctly shaped.
+    let wrong = MasterKey::derive("not alice's passphrase", "alice@example.com")
+        .unwrap()
+        .auth_hash(&server.address)
+        .to_string();
+    let bad_proof = link(serde_json::json!({
+        "state": started.state,
+        "app_secret": started.app_secret.as_str(),
+        "code": "code-1",
+        "current_auth_hash": wrong,
+    }))
+    .await;
+    assert_eq!(bad_proof.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(stub.exchanges().len(), 0, "an unproven link must not reach the provider");
+
+    // Neither failure spent the attempt, so the account holder still finishes
+    // it with the passphrase they have.
+    let good = link(serde_json::json!({
+        "state": started.state,
+        "app_secret": started.app_secret.as_str(),
+        "code": "code-1",
+        "current_auth_hash": session_auth_hash(&server, "alice@example.com"),
+    }))
+    .await;
+    assert_eq!(good.status(), StatusCode::OK, "{}", good.text().await.unwrap());
+}
+
+/// A link can be taken back off, and once it is, it no longer signs in.
+#[tokio::test]
+async fn a_link_can_be_removed_and_then_no_longer_signs_in() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
+
+    let started = server.start_as("link", Some(&alice.token)).await;
+    let linked = server
+        .client
+        .post(format!("{}/oauth/link", server.base))
+        .bearer_auth(&alice.token)
+        .json(&serde_json::json!({
+            "state": started.state,
+            "app_secret": started.app_secret.as_str(),
+            "code": "code-1",
+            "current_auth_hash": auth_hash,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(linked.status(), StatusCode::OK);
+
+    // Removing it needs the passphrase too: taking a credential away is as
+    // much a credential change as adding one.
+    let wrong = MasterKey::derive("not alice's passphrase", "alice@example.com")
+        .unwrap()
+        .auth_hash(&server.address)
+        .to_string();
+    assert_eq!(unlink(&server, &alice.token, &wrong).await.status(), StatusCode::UNAUTHORIZED);
+
+    let removed = unlink(&server, &alice.token, &auth_hash).await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    assert_eq!(removed.json::<UserProfile>().await.unwrap().google_email, None);
+
+    // The identity that used to sign in is now a stranger: it is offered an
+    // account of its own rather than Alice's.
+    let started = server.start("sign_in").await;
+    let response = server.callback(&started, "code-1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    match response.json::<OAuthCallbackResponse>().await.unwrap() {
+        OAuthCallbackResponse::RegistrationRequired { email, .. } => assert_eq!(email, "kat@gmail.example"),
+        OAuthCallbackResponse::SignedIn(_) => panic!("the removed link still signs in"),
+    }
+
+    // And there is nothing left to remove.
+    assert_eq!(unlink(&server, &alice.token, &auth_hash).await.status(), StatusCode::NOT_FOUND);
+}
+
+/// An account created through Google has no password login, so its link is the
+/// only thing that opens it. Removing that would leave an account nobody can
+/// sign into and nothing can recover, because the server holds no plaintext.
+#[tokio::test]
+async fn a_google_only_account_cannot_remove_its_only_way_in() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let (session, email) = sign_up(&server, "code-1", "a long enough passphrase", None).await;
+
+    let presented = MasterKey::derive("a long enough passphrase", &email).unwrap().auth_hash(&server.address);
+    let refused = unlink(&server, &session.token, &presented).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("no way to sign in"));
+
+    // Still signs in afterwards.
+    let started = server.start("sign_in").await;
+    let response = server.callback(&started, "code-1").await;
+    assert!(matches!(response.json::<OAuthCallbackResponse>().await.unwrap(), OAuthCallbackResponse::SignedIn(_)));
 }

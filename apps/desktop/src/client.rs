@@ -191,8 +191,13 @@ impl ApiClient {
     }
 
     /// Bind a Google identity to the account this client is signed in as.
-    pub async fn oauth_link(&self, body: &OAuthCallbackRequest) -> Result<(), ClientError> {
+    pub async fn oauth_link(&self, body: &OAuthLinkRequest) -> Result<UserProfile, ClientError> {
         self.send(Method::POST, "/oauth/link", Some(body)).await
+    }
+
+    /// Remove the Google identity bound to this account.
+    pub async fn oauth_unlink(&self, body: &OAuthUnlinkRequest) -> Result<UserProfile, ClientError> {
+        self.send(Method::POST, "/oauth/unlink", Some(body)).await
     }
 
     /// The fingerprint is part of the query: the server only answers for a

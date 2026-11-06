@@ -86,12 +86,20 @@ Argon2id on your device. The server stores no password for such an account.
   automatically. Whoever controls that Google address today could otherwise
   claim an account created by whoever held it before. Linking starts from
   inside a signed-in session instead ("Link Google" in the account panel).
+- Linking asks for your passphrase, and so does removing a link. A linked
+  Google account signs in on its own and survives both a passphrase change and
+  signing out everywhere, so an unlocked app or a stolen session token is not
+  enough to add one. The account panel names the address that can sign in, and
+  removing it takes effect immediately. An account created *through* Google
+  cannot remove its link: it is the only thing that opens that account.
 - A first sign-in still needs the server's registration token, if it has one.
   A verified Google address is not by itself permission to have an account on
   someone else's server.
 - The sign-in page opens in your system browser, not in the app's window, so
-  you can see the URL you are typing a Google password into. The app listens
-  on a loopback port for the redirect and nothing else.
+  you can see the URL you are typing a Google password into. The app checks
+  that address before opening it and refuses anything that is not Google's own
+  authorization page over https, because the server is what composes it. The
+  app listens on a loopback port for the redirect and nothing else.
 - The client secret stays on the server, which performs the code exchange, so
   it is never shipped inside the app.
 

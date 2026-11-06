@@ -172,6 +172,24 @@ pub struct IdTokenClaims {
     pub nonce: Option<String>,
 }
 
+/// How an id token is checked once its signature verifies.
+///
+/// Expected values and *required* claims are two different settings, and both
+/// are needed. `set_audience` and `set_issuer` are checked only when the claim
+/// is present, so a token signed by a key in Google's keyset but carrying
+/// neither would pass both by omitting them; `required_spec_claims` is what
+/// makes their absence a rejection. `exp` is in the set by default and is
+/// named here so the whole set is visible in one place.
+fn id_token_validation(client_id: &str, issuer: &str) -> Validation {
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[client_id]);
+    validation.set_issuer(&[issuer, GOOGLE_ALT_ISSUER]);
+    validation.set_required_spec_claims(&["exp", "aud", "iss"]);
+    validation.leeway = CLOCK_SKEW_SECS;
+    validation.validate_exp = true;
+    validation
+}
+
 /// Check the claims a signature cannot: that this token answers *our* request,
 /// and that the address in it was actually verified by the provider.
 ///
@@ -334,11 +352,7 @@ impl GoogleProvider {
         let kid = header.kid.ok_or(ApiError::Unauthorized)?;
         let key = self.key_for(&kid).await?;
 
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_audience(&[self.config.client_id.as_str()]);
-        validation.set_issuer(&[self.config.issuer.as_str(), GOOGLE_ALT_ISSUER]);
-        validation.leeway = CLOCK_SKEW_SECS;
-        validation.validate_exp = true;
+        let validation = id_token_validation(&self.config.client_id, &self.config.issuer);
 
         let data = decode::<IdTokenClaims>(id_token, &key, &validation).map_err(|error| {
             tracing::warn!(%error, "id token rejected");
@@ -507,6 +521,20 @@ mod tests {
         assert_eq!(hash_opaque(&state), hash_opaque(&state));
         assert_ne!(hash_opaque(&state), state);
         assert_ne!(new_ticket(), new_ticket());
+    }
+
+    /// A token that simply leaves `aud` or `iss` out must not slip through the
+    /// gap between "this is the value I expect" and "this claim has to be
+    /// there". The claims struct does not carry either field, so nothing
+    /// downstream would notice their absence.
+    #[test]
+    fn audience_and_issuer_are_required_not_merely_expected() {
+        let validation = id_token_validation("client-id.apps.googleusercontent.com", GOOGLE_ISSUER);
+        for claim in ["exp", "aud", "iss"] {
+            assert!(validation.required_spec_claims.contains(claim), "{claim} must be required");
+        }
+        assert_eq!(validation.algorithms, vec![Algorithm::RS256]);
+        assert!(validation.validate_exp);
     }
 
     #[test]

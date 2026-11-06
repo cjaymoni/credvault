@@ -46,6 +46,9 @@ struct UserSummary {
     fingerprint: String,
     /// Whether changing the passphrase also changes how this account signs in.
     password_login: bool,
+    /// The linked Google address, if any, so the UI can show that a second
+    /// way into this account exists.
+    google_email: Option<String>,
 }
 
 /// A secret with everything except the password decrypted for display. If
@@ -245,6 +248,9 @@ struct Session {
     /// for an account created through Google, whose passphrase derives the
     /// vault keys but is not a login.
     password_login: bool,
+    /// The Google address that can sign in to this account, if one is linked.
+    /// Kept so the UI can show a second way in exists and offer to remove it.
+    google_email: Option<String>,
 }
 
 /// A secret's unwrapped key with the server's key version it came from. Writes
@@ -492,11 +498,9 @@ async fn register(
     install_session(
         &state,
         api.with_token(&session.token),
-        session.user.id,
-        session.user.email,
+        AccountFacts::of(&session.user),
         identity,
         master.self_wrap_key(),
-        session.user.password_login,
     )
 }
 
@@ -517,11 +521,9 @@ async fn login(
     install_session(
         &state,
         api.with_token(&session.token),
-        session.user.id,
-        session.user.email,
+        AccountFacts::of(&session.user),
         identity,
         master.self_wrap_key(),
-        session.user.password_login,
     )
 }
 
@@ -531,19 +533,41 @@ fn summary_of(session: &Session) -> UserSummary {
         server_url: session.api.base_url().to_string(),
         fingerprint: session.identity.public_key().fingerprint(),
         password_login: session.password_login,
+        google_email: session.google_email.clone(),
+    }
+}
+
+/// What the server says about an account, as a session needs it. Grouped so
+/// the four places that install a session pass one value they all have rather
+/// than a growing row of positional arguments.
+struct AccountFacts {
+    user_id: i64,
+    email: String,
+    password_login: bool,
+    google_email: Option<String>,
+}
+
+impl AccountFacts {
+    fn of(profile: &UserProfile) -> Self {
+        Self {
+            user_id: profile.id,
+            email: profile.email.clone(),
+            password_login: profile.password_login,
+            google_email: profile.google_email.clone(),
+        }
     }
 }
 
 fn install_session(
     state: &AppState,
     api: ApiClient,
-    user_id: i64,
-    email: String,
+    account: AccountFacts,
     identity: Identity,
     self_wrap_key: Zeroizing<[u8; KEY_LEN]>,
-    password_login: bool,
 ) -> CommandResult<UserSummary> {
-    let session = Session { api, user_id, email, identity, self_wrap_key, keys: HashMap::new(), password_login };
+    let AccountFacts { user_id, email, password_login, google_email } = account;
+    let session =
+        Session { api, user_id, email, identity, self_wrap_key, keys: HashMap::new(), password_login, google_email };
     let summary = summary_of(&session);
     let mut guard = state.session.lock().map_err(|_| "session lock poisoned".to_string())?;
     *guard = Some(session);
@@ -583,6 +607,42 @@ fn clear_pending_google(state: &AppState) {
     }
 }
 
+/// The only host this app will send someone to sign in at.
+const GOOGLE_AUTHORIZATION_HOST: &str = "accounts.google.com";
+
+/// Refuse to open anything but Google's own sign-in page.
+///
+/// The server composes this URL, and the server is the party this app guards
+/// against. Unchecked, it is a page of the server's choosing opened by a
+/// password manager that has just told the user the system browser is the safe
+/// place to type a Google password — and, because the string goes to the
+/// platform URL handler rather than to a browser, a scheme of the server's
+/// choosing too: `file://host/share/x` on Windows is a UNC path that
+/// authenticates outward to whoever answers.
+///
+/// Scheme and host are what matter. The query carries `state`, `nonce` and the
+/// PKCE challenge, which are the server's to choose and are checked when the
+/// callback comes back.
+///
+/// # Errors
+/// `oauth` if the URL does not parse, is not `https`, or is not Google's
+/// authorization host.
+fn check_authorization_url(url: &str) -> CommandResult<()> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| CommandError::new("oauth", format!("the server sent a sign-in address that is not a URL: {e}")))?;
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() != "https" || !host.eq_ignore_ascii_case(GOOGLE_AUTHORIZATION_HOST) {
+        return Err(CommandError::new(
+            "oauth",
+            format!(
+                "this server tried to send you to {host} to sign in, not to {GOOGLE_AUTHORIZATION_HOST}. \
+                 Nothing was opened. Do not trust this server with your Google password."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Run the browser half of a sign-in and hand back the code it produced.
 /// Shared by signing in and by linking, which differ only in purpose.
 async fn authorize_with_google(
@@ -598,6 +658,9 @@ async fn authorize_with_google(
 
     // The system browser, not the app webview: the user should be typing a
     // Google password into Google's own window, where they can see the URL.
+    // Which window that is, is checked here rather than taken on the server's
+    // word; see `check_authorization_url`.
+    check_authorization_url(&started.authorization_url)?;
     app.opener()
         .open_url(started.authorization_url.clone(), None::<&str>)
         .map_err(|e| CommandError::new("oauth", format!("could not open your browser: {e}")))?;
@@ -692,12 +755,12 @@ async fn google_unlock(state: State<'_, AppState>, password: Zeroizing<String>) 
         let identity =
             Identity::decrypt_private_key(&master.private_key_encryption_key(), &session.user.encrypted_private_key)
                 .map_err(|error| unlock_failure(error, "that passphrase does not unlock this vault"))?;
-        (api.clone(), session.user.id, session.user.email.clone(), identity, session.user.password_login)
+        (api.clone(), AccountFacts::of(&session.user), identity)
     };
 
     clear_pending_google(&state);
-    let (api, user_id, email, identity, password_login) = unlocked;
-    install_session(&state, api, user_id, email, identity, master.self_wrap_key(), password_login)
+    let (api, account, identity) = unlocked;
+    install_session(&state, api, account, identity, master.self_wrap_key())
 }
 
 /// Create the account a first Google sign-in asked for. The key pair is
@@ -736,11 +799,9 @@ async fn google_create_account(
     install_session(
         &state,
         api.with_token(&created.token),
-        created.user.id,
-        created.user.email.clone(),
+        AccountFacts::of(&created.user),
         identity,
         master.self_wrap_key(),
-        created.user.password_login,
     )
 }
 
@@ -749,16 +810,76 @@ async fn google_create_account(
 ///
 /// The account email is left as it is: it is the salt the vault key comes
 /// from, and changing it would make every stored secret undecryptable.
+/// The passphrase is required because a linked account is a second way in:
+/// it signs in on its own, and it survives both a passphrase change and
+/// signing out everywhere. A session token alone must not be able to leave one
+/// behind.
 #[tauri::command]
-async fn google_link(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
-    let api = api(&state)?;
+async fn google_link(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    current: Zeroizing<String>,
+) -> CommandResult<UserSummary> {
+    let (api, email, server_url, password_login) = with_session(&state, |session| {
+        Ok((session.api.clone(), session.email.clone(), session.api.base_url().to_string(), session.password_login))
+    })?;
+    if !password_login {
+        return Err(CommandError::new("oauth", "this account already signs in with Google"));
+    }
     let capabilities = api.capabilities().await?;
     if !capabilities.google_sign_in {
         return Err(CommandError::new("oauth", "this server does not offer sign in with Google"));
     }
+
+    // Checked here before the browser is opened, so a typo costs one local
+    // comparison instead of a trip through Google that then fails.
+    let server = normalize_server_url(&server_url)?;
+    let master = derive_master(current, email).await?;
+    let matches_session: bool = with_session(&state, |session| {
+        Ok(master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref()).into())
+    })?;
+    if !matches_session {
+        return Err(CommandError::new("locked", "that is not your current passphrase"));
+    }
+
     let callback = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
-    api.oauth_link(&callback).await?;
-    Ok(())
+    let profile =
+        api.oauth_link(&OAuthLinkRequest { callback, current_auth_hash: Some(master.auth_hash(&server)) }).await?;
+    remember_google_email(&state, profile.google_email)
+}
+
+/// Remove the linked Google account, so it can no longer sign in here.
+#[tauri::command]
+async fn google_unlink(state: State<'_, AppState>, current: Zeroizing<String>) -> CommandResult<UserSummary> {
+    let (api, email, server_url, password_login) = with_session(&state, |session| {
+        Ok((session.api.clone(), session.email.clone(), session.api.base_url().to_string(), session.password_login))
+    })?;
+    if !password_login {
+        return Err(CommandError::new(
+            "oauth",
+            "this account signs in with Google only; removing the link would leave no way to sign in",
+        ));
+    }
+    let server = normalize_server_url(&server_url)?;
+    let master = derive_master(current, email).await?;
+    let matches_session: bool = with_session(&state, |session| {
+        Ok(master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref()).into())
+    })?;
+    if !matches_session {
+        return Err(CommandError::new("locked", "that is not your current passphrase"));
+    }
+
+    let profile = api.oauth_unlink(&OAuthUnlinkRequest { current_auth_hash: master.auth_hash(&server) }).await?;
+    remember_google_email(&state, profile.google_email)
+}
+
+/// Record what the server now says is linked, and hand back the summary the
+/// UI redraws from.
+fn remember_google_email(state: &AppState, google_email: Option<String>) -> CommandResult<UserSummary> {
+    with_session(state, |session| {
+        session.google_email = google_email;
+        Ok(summary_of(session))
+    })
 }
 
 #[tauri::command]
@@ -855,6 +976,10 @@ async fn change_password(
         current.api = api.with_token(&session.token);
         current.self_wrap_key = new_master.self_wrap_key();
         current.keys.clear();
+        // A passphrase change does not remove a linked Google account, so this
+        // is taken from the profile the server just returned rather than
+        // assumed either way.
+        current.google_email = session.user.google_email.clone();
         Ok(())
     })
 }
@@ -1627,6 +1752,7 @@ pub fn run() {
             google_unlock,
             google_create_account,
             google_link,
+            google_unlink,
             change_password,
             session_info,
             startup_warnings,
@@ -1656,6 +1782,41 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server composes the sign-in URL, and the server is the party this
+    /// app guards against. Only Google's own authorization page over https is
+    /// opened; everything else is refused before the platform URL handler sees
+    /// the string.
+    #[test]
+    fn only_googles_own_sign_in_page_is_opened() {
+        let google = "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=y";
+        assert!(check_authorization_url(google).is_ok());
+        // Case and a different path or query are Google's business, not ours.
+        assert!(check_authorization_url("https://ACCOUNTS.GOOGLE.COM/anything?a=b").is_ok());
+
+        for refused in [
+            // The phishing shape: a host that merely reads like Google's.
+            "https://accounts.google.com.attacker.example/signin",
+            "https://accounts-google.com/o/oauth2/v2/auth",
+            // Credentials in the authority, which hide the real host.
+            "https://accounts.google.com@attacker.example/o/oauth2/v2/auth",
+            // A homograph host punycodes to something that is not Google.
+            "https://accounts.googlé.com/o/oauth2/v2/auth",
+            // Cleartext, even to the right host.
+            "http://accounts.google.com/o/oauth2/v2/auth",
+            // Schemes that are not a browser at all. The Windows one reaches
+            // ShellExecuteW as a UNC path and authenticates outward.
+            "file://attacker.example/share/payload.exe",
+            "smb://attacker.example/share",
+            "javascript:alert(1)",
+            // Not a URL.
+            "",
+            "not a url",
+        ] {
+            let error = check_authorization_url(refused).expect_err("{refused} must be refused");
+            assert_eq!(error.code, "oauth", "{refused}");
+        }
+    }
 
     #[test]
     fn server_url_requires_https_except_on_loopback() {
@@ -1765,6 +1926,7 @@ mod tests {
             self_wrap_key: Zeroizing::new(credvault_core::aead::random_bytes()),
             keys: HashMap::new(),
             password_login: true,
+            google_email: None,
         }
     }
 

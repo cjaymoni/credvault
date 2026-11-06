@@ -170,17 +170,33 @@ async fn issue_session(pool: &SqlitePool, user_id: i64) -> ApiResult<String> {
 }
 
 async fn load_profile(pool: &SqlitePool, user_id: i64) -> ApiResult<UserProfile> {
-    let (id, email, public_key, encrypted_private_key, password_login): (i64, String, String, String, bool) =
-        sqlx::query_as("SELECT id, email, public_key, encrypted_private_key, password_login FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_one(pool)
-            .await?;
+    // The join is a left join against an index that is unique on
+    // (provider, user_id), so it adds at most one row and the Google address
+    // is null when nothing is linked.
+    let (id, email, public_key, encrypted_private_key, password_login, google_email): (
+        i64,
+        String,
+        String,
+        String,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT u.id, u.email, u.public_key, u.encrypted_private_key, u.password_login, g.email \
+         FROM users u \
+         LEFT JOIN oauth_identities g ON g.user_id = u.id AND g.provider = ? \
+         WHERE u.id = ?",
+    )
+    .bind(oauth::PROVIDER_GOOGLE)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
     Ok(UserProfile {
         id,
         email,
         public_key: decode_stored_public_key(&public_key)?,
         encrypted_private_key: decode_stored(&encrypted_private_key)?,
         password_login,
+        google_email,
     })
 }
 
@@ -272,10 +288,38 @@ pub async fn logout(State(state): State<AppState>, user: AuthUser) -> ApiResult<
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Invalidate every session for the caller, including the one making the request.
-pub async fn logout_everywhere(State(state): State<AppState>, user: AuthUser) -> ApiResult<StatusCode> {
+/// Invalidate every session for the caller except this one, which is replaced.
+///
+/// The caller keeps a way in on purpose. This is the first move against
+/// someone holding a session they should not have, and the second move is
+/// usually to take away whatever let them in — removing a Google link,
+/// changing the passphrase. Ending the caller's session too would send them
+/// back through a sign-in to do it, which on a slow derivation is seconds the
+/// evicted party can use to come back and start spending the per-account
+/// budgets again. Handing back a token makes the next request immediate, and
+/// an attacker needs a whole OAuth round trip to interfere with it.
+///
+/// Rationed per address and deliberately never per account. Every per-account
+/// limit can be emptied by whoever is already signed in as that account, so a
+/// bucket keyed that way would let the party being evicted block their own
+/// eviction. An address bucket throttles a flooder at their own address and
+/// leaves the owner's alone, and the owner needs one request against a burst
+/// of ten.
+///
+/// A limiter of some kind is needed because handing back a token makes this
+/// route self-renewing: it costs the caller nothing, and each call takes the
+/// single write lock three times — the purge, the insert, and the expiry
+/// housekeeping inside [`issue_session`]. Before the replacement, the first
+/// request killed the caller's token and every further one had to go through
+/// `/login`, which was throttle enough on its own.
+///
+/// Both of the other handlers that end every session, [`change_password`] and
+/// [`oauth_unlink`], replace the caller's for the same reason.
+pub async fn logout_other_devices(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<SessionResponse>> {
     sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user.id).execute(&state.pool).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let token = issue_session(&state.pool, user.id).await?;
+    let profile = load_profile(&state.pool, user.id).await?;
+    Ok(Json(SessionResponse { token, user: profile }))
 }
 
 pub async fn me(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<UserProfile>> {
@@ -1300,6 +1344,43 @@ pub async fn oauth_register(
     Ok((StatusCode::CREATED, Json(SessionResponse { token, user })))
 }
 
+/// Check the account passphrase before a sign-in credential is added or removed.
+///
+/// A session is deliberately not enough. A linked identity signs in on its
+/// own, and it survives both `change_password` and "sign out everywhere" —
+/// the two things an account holder reaches for after a token leak. A
+/// credential that outlives the theft of the token that created it must cost
+/// more than that token to create, and the passphrase is the one thing a
+/// stolen session does not carry. This is the rule `change_password` already
+/// applies, for the same reason.
+///
+/// The caller has already established that this account signs in with a
+/// password. One that does not has no passphrase the server could check, and
+/// is refused by each caller with a message of its own before this is reached.
+///
+/// # Errors
+/// [`ApiError::Unauthorized`] if the passphrase is wrong;
+/// [`ApiError::BadRequest`] if it is malformed.
+async fn verify_account_passphrase(stored_credential: String, presented: Zeroizing<String>) -> ApiResult<()> {
+    validate_auth_hash(&presented)?;
+    let verified = tokio::task::spawn_blocking(move || auth::verify_credential(&presented, &stored_credential))
+        .await
+        .map_err(ApiError::internal)?;
+    if !verified {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// The stored credential and whether a passphrase is what opens this account.
+///
+/// One indexed lookup for both, because every caller of
+/// [`verify_account_passphrase`] needs to know the second before it can decide
+/// whether to ask the first.
+async fn load_credential(pool: &SqlitePool, user_id: i64) -> ApiResult<(String, bool)> {
+    Ok(sqlx::query_as("SELECT auth_hash, password_login FROM users WHERE id = ?").bind(user_id).fetch_one(pool).await?)
+}
+
 /// Bind a Google identity to the account already signed in, so that account
 /// can use the button next time.
 ///
@@ -1309,14 +1390,43 @@ pub async fn oauth_register(
 pub async fn oauth_link(
     State(state): State<AppState>,
     user: AuthUser,
-    ApiJson(body): ApiJson<OAuthCallbackRequest>,
-) -> ApiResult<StatusCode> {
+    ApiJson(body): ApiJson<OAuthLinkRequest>,
+) -> ApiResult<Json<UserProfile>> {
     spend_account_budget(&state.link_limiter, user.id, "google link")?;
+
+    // Both checks happen before the attempt is spent and before Google is
+    // called: a caller who cannot prove the passphrase has no business doing
+    // either. An account with no password login is refused outright rather
+    // than waved through — today its one identity row is all its unique index
+    // allows, so the insert below would fail anyway, but that is a schema
+    // invariant in another file and not something this route should rest on.
+    let (stored_credential, password_login) = load_credential(&state.pool, user.id).await?;
+    if !password_login {
+        return Err(ApiError::BadRequest("this account already signs in with Google".into()));
+    }
+    let presented = body.current_auth_hash.clone().ok_or_else(|| {
+        ApiError::BadRequest(
+            "the current passphrase is required to link a Google account; if this app never asked for it, it is \
+             older than this server and needs updating"
+                .into(),
+        )
+    })?;
+    // Spent here rather than at the top, because this is the only line below
+    // that costs an Argon2 pass: the two refusals above reject without one and
+    // should not burn the budget that bounds passphrase guessing. That budget
+    // is shared with `change_password` so that linking cannot be used to widen
+    // the guess rate — but deliberately not with `oauth_unlink`, which has to
+    // stay reachable while someone is spending this one; see
+    // `AppState::unlink_limiter`.
+    spend_account_budget(&state.password_limiter, user.id, "google link passphrase")?;
+    verify_account_passphrase(stored_credential, presented).await?;
+
     // The caller's id is part of what selects the attempt, so a link can only
     // be finished by the session that began it. Without that, any
     // authenticated caller holding a valid link state and secret could bind
     // that identity to their own account instead.
-    let (identity, _) = verified_identity_from_callback(&state, &body, OAuthPurpose::Link, Some(user.id)).await?;
+    let (identity, _) =
+        verified_identity_from_callback(&state, &body.callback(), OAuthPurpose::Link, Some(user.id)).await?;
 
     let linked = sqlx::query(
         "INSERT INTO oauth_identities (provider, subject, user_id, email, linked_at) VALUES (?, ?, ?, ?, ?)",
@@ -1330,12 +1440,81 @@ pub async fn oauth_link(
     .await;
 
     match linked {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        // The profile goes back so the client can show the address that can
+        // now sign in. A link nobody can see is a link nobody can revoke.
+        Ok(_) => Ok(Json(load_profile(&state.pool, user.id).await?)),
         Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
             Err(ApiError::Conflict("that Google account, or this credvault account, is already linked".into()))
         }
         Err(other) => Err(other.into()),
     }
+}
+
+/// Remove the Google identity bound to the account, so it can no longer be
+/// used to sign in.
+///
+/// Every session is ended with it, and the caller is handed a fresh one. A
+/// link that should not have been there has had up to a session lifetime to
+/// mint tokens, and those tokens do not mention where they came from; deleting
+/// the row alone would leave the credential removed and its issue still
+/// working for another month. This is the same reasoning, and the same
+/// transaction shape, as [`change_password`].
+///
+/// Refused for an account created through Google: that identity is its only
+/// credential, and removing it would leave an account with nothing that can
+/// open it and no way to recover, since the server holds no plaintext.
+///
+/// # Errors
+/// [`ApiError::Unauthorized`] if the passphrase is wrong;
+/// [`ApiError::BadRequest`] if this account signs in with Google only, or the
+/// passphrase proof is malformed;
+/// [`ApiError::NotFound`] if nothing is linked.
+pub async fn oauth_unlink(
+    State(state): State<AppState>,
+    user: AuthUser,
+    ApiJson(body): ApiJson<OAuthUnlinkRequest>,
+) -> ApiResult<Json<SessionResponse>> {
+    // Its own budget, so traffic on `/password` and `/oauth/link` cannot
+    // decide whether this route answers. It does not make the route
+    // unstarvable — nothing keyed by account can be, against someone holding a
+    // session for that account — and `AppState::unlink_limiter` says what to
+    // reach for instead.
+    spend_account_budget(&state.unlink_limiter, user.id, "google unlink")?;
+    // Read before the passphrase is checked, so a Google-only account is told
+    // why it cannot unlink rather than that it supplied a passphrase it has no
+    // business having. It also saves an Argon2 verify on a request that cannot
+    // succeed.
+    let (stored_credential, password_login) = load_credential(&state.pool, user.id).await?;
+    if !password_login {
+        return Err(ApiError::BadRequest(
+            "this account signs in with Google only; removing the link would leave no way to sign in".into(),
+        ));
+    }
+    verify_account_passphrase(stored_credential, body.current_auth_hash.clone()).await?;
+
+    let mut tx = begin_write(&state.pool).await?;
+    // The delete comes first on purpose. It takes the write lock, and when it
+    // matches nothing this returns before any other statement has run — so the
+    // early return below has nothing to undo rather than relying on the
+    // rollback. Adding a read above it would give up both properties.
+    let removed = sqlx::query("DELETE FROM oauth_identities WHERE user_id = ? AND provider = ?")
+        .bind(user.id)
+        .bind(oauth::PROVIDER_GOOGLE)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if removed == 0 {
+        return Err(ApiError::NotFound("no Google account is linked to this account".into()));
+    }
+    // In the same transaction as the delete: a crash between the two would
+    // otherwise leave the sessions the link minted alive with nothing left to
+    // explain where they came from.
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    let token = issue_session(&state.pool, user.id).await?;
+    let profile = load_profile(&state.pool, user.id).await?;
+    Ok(Json(SessionResponse { token, user: profile }))
 }
 
 #[cfg(test)]

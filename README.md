@@ -86,12 +86,35 @@ Argon2id on your device. The server stores no password for such an account.
   automatically. Whoever controls that Google address today could otherwise
   claim an account created by whoever held it before. Linking starts from
   inside a signed-in session instead ("Link Google" in the account panel).
+- Linking asks for your passphrase, and so does removing a link. A linked
+  Google account signs in on its own and survives both a passphrase change and
+  signing out everywhere, so an unlocked app or a stolen session token is not
+  enough to add one. The account panel names the address that can sign in, and
+  re-reads it from the server each time you open it, so a link added from
+  somewhere else shows up. Removing one also signs out every device, including
+  the ones that link had signed in: a token does not record where it came
+  from, so the only way to be sure none of its sessions survive is to end them
+  all. You stay signed in where you asked for the removal. An account created
+  *through* Google cannot remove its link: it is the only thing that opens
+  that account.
+- "Sign out other devices" in the account panel ends every session for the
+  account except the one you are using, and asks for nothing but the button.
+  Both halves are deliberate. It is the move to make first if you think someone
+  else is signed in as you: every other per-account limit can be used up by
+  whoever is already signed in, and this one is limited by where the request
+  comes from rather than by whose account it is, so it still works when the
+  rest are refusing. And you stay signed in here, so you can go
+  straight on to remove a Google sign-in they added — if this signed you out
+  too, you would be sitting through a sign-in while they came back. To sign out
+  this device as well, use "Log out" afterwards.
 - A first sign-in still needs the server's registration token, if it has one.
   A verified Google address is not by itself permission to have an account on
   someone else's server.
 - The sign-in page opens in your system browser, not in the app's window, so
-  you can see the URL you are typing a Google password into. The app listens
-  on a loopback port for the redirect and nothing else.
+  you can see the URL you are typing a Google password into. The app checks
+  that address before opening it and refuses anything that is not Google's own
+  authorization page over https, because the server is what composes it. The
+  app listens on a loopback port for the redirect and nothing else.
 - The client secret stays on the server, which performs the code exchange, so
   it is never shipped inside the app.
 
@@ -158,13 +181,20 @@ numbers and nothing else — not the build version, which would only tell a
 passer-by which advisories to look up.
 
 ```json
-{ "status": "ok", "protocol": 1, "min_client_protocol": 1 }
+{ "status": "ok", "protocol": 2, "min_client_protocol": 1 }
 ```
 
 `protocol` is what the server speaks; `min_client_protocol` is the oldest
 client it serves. The app reads both before it derives a key or sends a
 credential, and stops with a plain message when the two cannot work together.
 A server ahead of the app that still serves the app's protocol works normally.
+
+Protocol 2 added the passphrase proof on linking, the unlink route, and the
+replacement session that signing out other devices hands back. This app
+will not talk to a protocol-1 server at all: that server would accept a link
+request, ignore the proof, and answer in a shape the app reads as failure —
+leaving a Google sign-in on the account that the app cannot show you and that
+server cannot remove. Update the server, then the app.
 
 **The encryption scheme**, on every encrypted blob — your private key, each
 secret's key, each secret's contents. It covers the key derivation behind the

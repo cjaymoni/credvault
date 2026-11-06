@@ -70,6 +70,14 @@ pub struct RateLimits {
     /// behind one NAT would share a budget none of them spent.
     pub link_burst: u32,
     pub link_refill: Duration,
+    /// Also per authenticated user, and deliberately not the password budget
+    /// even though the work is the same. The two protect different things and
+    /// must be able to move apart: tightening the passphrase budget to harden
+    /// against guessing would otherwise tighten the route that removes an
+    /// unwanted sign-in method, which is the opposite of what the operator
+    /// doing the tightening wants. See `AppState::unlink_limiter`.
+    pub unlink_burst: u32,
+    pub unlink_refill: Duration,
 }
 
 impl Default for RateLimits {
@@ -98,6 +106,8 @@ impl Default for RateLimits {
             password_refill: Duration::from_secs(60),
             link_burst: 5,
             link_refill: Duration::from_secs(60),
+            unlink_burst: 10,
+            unlink_refill: Duration::from_secs(60),
         }
     }
 }
@@ -152,6 +162,23 @@ pub struct AppState {
     /// Throttles Google links per account, bounding the outbound requests one
     /// account can make the server perform.
     pub link_limiter: Arc<RateLimiter<i64>>,
+    /// Throttles unlinking per account, in a bucket of its own.
+    ///
+    /// Unlinking verifies a passphrase, so sharing `password_limiter` with
+    /// `change_password` and `oauth_link` is the obvious thing. It is the
+    /// wrong thing: `/password` spends a token before it does any work, so
+    /// traffic on those two routes would decide whether this one answers.
+    ///
+    /// Separation is all this buys, and it is worth saying what it does not.
+    /// Every per-account budget is spendable by whoever holds a session for
+    /// that account, which is exactly the attacker F-13 describes — they can
+    /// empty this bucket by calling `/oauth/unlink` with a malformed proof,
+    /// one request a minute, for nothing. No per-account limit can prevent
+    /// that. The eviction path that does not depend on a budget is
+    /// `DELETE /sessions`, which has none: ending the attacker's session stops
+    /// them spending anything, and the unlink follows on a quiet bucket. That
+    /// is the order the app offers in the account panel.
+    pub unlink_limiter: Arc<RateLimiter<i64>>,
 }
 
 /// Open (creating if needed) the SQLite database and apply migrations.
@@ -186,13 +213,26 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     let oauth_callback_limit = limit_for(limits.login_burst, limits.login_refill);
     let oauth_register_limit = limit_for(limits.register_burst, limits.register_refill);
     // An address bucket in front of the link route, to absorb floods before a
-    // session is even resolved. The ceiling that actually bounds what one
-    // account can make the server fetch from Google is per-user and lives in
-    // the handler; see `AppState::link_limiter`.
+    // session is even resolved. The ceilings that actually bound one account
+    // are per-user and live in the handler: `AppState::link_limiter` for how
+    // often it may make the server fetch from Google, and `password_limiter`
+    // for the passphrase verify, shared with logging in and changing it.
     let oauth_link_limit = limit_for(limits.login_burst, limits.login_refill);
+    // Removing a link verifies a passphrase, which is the same work a login
+    // does, so it gets an address bucket of the same shape. The per-account
+    // ceiling is `AppState::unlink_limiter`, which is what the handler spends.
+    let oauth_unlink_limit = limit_for(limits.login_burst, limits.login_refill);
+    // Ending other sessions hands the caller a replacement, so it no longer
+    // costs the caller their own token and is no longer self-limiting: an
+    // authenticated caller could loop it, and each pass takes SQLite's single
+    // write lock three times. Per address, deliberately, and never per
+    // account — the party this route evicts holds a session for the victim's
+    // account and could empty an account bucket to block their own eviction.
+    let sessions_limit = limit_for(limits.login_burst, limits.login_refill);
     let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
     let password_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
     let link_limiter = Arc::new(RateLimiter::new(limits.link_burst, limits.link_refill));
+    let unlink_limiter = Arc::new(RateLimiter::new(limits.unlink_burst, limits.unlink_refill));
 
     let api = Router::new()
         .route(
@@ -219,8 +259,16 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
             "/oauth/link",
             post(handlers::oauth_link).layer(middleware::from_fn_with_state(oauth_link_limit, ratelimit::limit)),
         )
+        .route(
+            "/oauth/unlink",
+            post(handlers::oauth_unlink).layer(middleware::from_fn_with_state(oauth_unlink_limit, ratelimit::limit)),
+        )
         .route("/logout", post(handlers::logout))
-        .route("/sessions", delete(handlers::logout_everywhere))
+        .route(
+            "/sessions",
+            delete(handlers::logout_other_devices)
+                .layer(middleware::from_fn_with_state(sessions_limit, ratelimit::limit)),
+        )
         .route("/me", get(handlers::me))
         .route("/password", post(handlers::change_password))
         .route("/users/lookup", get(handlers::lookup_user))
@@ -240,7 +288,14 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .nest("/api", api)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState { pool, config: Arc::new(config), lookup_limiter, password_limiter, link_limiter })
+        .with_state(AppState {
+            pool,
+            config: Arc::new(config),
+            lookup_limiter,
+            password_limiter,
+            link_limiter,
+            unlink_limiter,
+        })
 }
 
 /// Convenience for callers that want the connect-info service type spelled out.

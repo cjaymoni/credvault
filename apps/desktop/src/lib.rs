@@ -46,6 +46,9 @@ struct UserSummary {
     fingerprint: String,
     /// Whether changing the passphrase also changes how this account signs in.
     password_login: bool,
+    /// The linked Google address, if any, so the UI can show that a second
+    /// way into this account exists.
+    google_email: Option<String>,
 }
 
 /// A secret with everything except the password decrypted for display. If
@@ -245,6 +248,9 @@ struct Session {
     /// for an account created through Google, whose passphrase derives the
     /// vault keys but is not a login.
     password_login: bool,
+    /// The Google address that can sign in to this account, if one is linked.
+    /// Kept so the UI can show a second way in exists and offer to remove it.
+    google_email: Option<String>,
 }
 
 /// A secret's unwrapped key with the server's key version it came from. Writes
@@ -339,11 +345,25 @@ fn load_known_keys_or_recover(path: &Path) -> std::io::Result<(KnownKeys, Option
 pub struct CommandError {
     pub code: &'static str,
     pub message: String,
+    /// How long until a throttled request is worth retrying. Carried so the
+    /// UI can compose its own sentence from the number instead of quoting the
+    /// server's, which in this threat model is a string the adversary chooses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 impl CommandError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), retry_after_secs: None }
+    }
+
+    /// The one code that carries a wait. A constructor rather than a builder
+    /// on the general type, so a wait cannot be attached to a code that does
+    /// not mean one, and nothing raises `throttled` without going through
+    /// here. `new("throttled", …)` would still compile; this makes the right
+    /// thing the easy one rather than the only one.
+    fn throttled(message: impl Into<String>, retry_after_secs: Option<u64>) -> Self {
+        Self { code: "throttled", message: message.into(), retry_after_secs }
     }
 }
 
@@ -367,12 +387,18 @@ impl From<&str> for CommandError {
 
 impl From<ClientError> for CommandError {
     fn from(error: ClientError) -> Self {
+        if let ClientError::TooManyRequests { retry_after_secs, .. } = &error {
+            let retry_after_secs = *retry_after_secs;
+            return Self::throttled(error.to_string(), retry_after_secs);
+        }
         let code = match error {
             ClientError::Network(_) => "network",
             ClientError::Server(_) => "server",
             ClientError::NotFound(_) => "not_found",
             ClientError::Conflict(_) => "conflict",
             ClientError::Unauthorized => "unauthorized",
+            // Handled above, where the wait travels with the code.
+            ClientError::TooManyRequests { .. } => "throttled",
             ClientError::InvalidUrl(_) => "invalid_url",
             ClientError::Incompatible(_) => "incompatible",
         };
@@ -416,6 +442,30 @@ fn with_session<T>(state: &AppState, f: impl FnOnce(&mut Session) -> CommandResu
     let mut guard = state.session.lock().map_err(|_| "session lock poisoned".to_string())?;
     let session = guard.as_mut().ok_or_else(|| "not logged in".to_string())?;
     f(session)
+}
+
+/// [`with_session`], but only if the open session is still `user_id`'s.
+///
+/// Every command that reads the session, awaits something slow, and then
+/// writes the answer back goes through this. The session can be replaced while
+/// the slow part runs — a browser round trip, a passphrase change that
+/// re-wraps a large vault — and writing one account's answer onto another
+/// account's session ranges from a wrong label to a wrap key that locks an
+/// account out of its own secrets.
+///
+/// # Errors
+/// `locked` if nothing is unlocked, or if the session is now someone else's.
+fn with_same_session<T>(
+    state: &AppState,
+    user_id: i64,
+    f: impl FnOnce(&mut Session) -> CommandResult<T>,
+) -> CommandResult<T> {
+    with_session(state, |session| {
+        if session.user_id != user_id {
+            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
+        }
+        f(session)
+    })
 }
 
 /// Open a client for `server` and refuse to go on if this build and that
@@ -492,11 +542,9 @@ async fn register(
     install_session(
         &state,
         api.with_token(&session.token),
-        session.user.id,
-        session.user.email,
+        AccountFacts::of(&session.user),
         identity,
         master.self_wrap_key(),
-        session.user.password_login,
     )
 }
 
@@ -517,11 +565,9 @@ async fn login(
     install_session(
         &state,
         api.with_token(&session.token),
-        session.user.id,
-        session.user.email,
+        AccountFacts::of(&session.user),
         identity,
         master.self_wrap_key(),
-        session.user.password_login,
     )
 }
 
@@ -531,19 +577,41 @@ fn summary_of(session: &Session) -> UserSummary {
         server_url: session.api.base_url().to_string(),
         fingerprint: session.identity.public_key().fingerprint(),
         password_login: session.password_login,
+        google_email: session.google_email.clone(),
+    }
+}
+
+/// What the server says about an account, as a session needs it. Grouped so
+/// the four places that install a session pass one value they all have rather
+/// than a growing row of positional arguments.
+struct AccountFacts {
+    user_id: i64,
+    email: String,
+    password_login: bool,
+    google_email: Option<String>,
+}
+
+impl AccountFacts {
+    fn of(profile: &UserProfile) -> Self {
+        Self {
+            user_id: profile.id,
+            email: profile.email.clone(),
+            password_login: profile.password_login,
+            google_email: profile.google_email.clone(),
+        }
     }
 }
 
 fn install_session(
     state: &AppState,
     api: ApiClient,
-    user_id: i64,
-    email: String,
+    account: AccountFacts,
     identity: Identity,
     self_wrap_key: Zeroizing<[u8; KEY_LEN]>,
-    password_login: bool,
 ) -> CommandResult<UserSummary> {
-    let session = Session { api, user_id, email, identity, self_wrap_key, keys: HashMap::new(), password_login };
+    let AccountFacts { user_id, email, password_login, google_email } = account;
+    let session =
+        Session { api, user_id, email, identity, self_wrap_key, keys: HashMap::new(), password_login, google_email };
     let summary = summary_of(&session);
     let mut guard = state.session.lock().map_err(|_| "session lock poisoned".to_string())?;
     *guard = Some(session);
@@ -567,6 +635,80 @@ async fn logout(state: State<'_, AppState>) -> CommandResult<()> {
     Ok(())
 }
 
+/// End every session for this account except this one, which is replaced.
+///
+/// The move to make first when someone else may be signed in. Every
+/// per-account budget can be emptied by whoever already holds a session for
+/// that account, so the route that evicts them carries no per-account budget —
+/// only one keyed by address, which the evicted party cannot spend on the
+/// owner's behalf. It answers when the rest are refusing. This device keeps a
+/// token so the next thing the user does, usually removing the Google link
+/// that let the other party in, goes out immediately rather than after a
+/// sign-in; the evicted party needs a whole OAuth round trip to come back and
+/// interfere.
+///
+/// Unlike [`logout`] this is reported rather than best-effort, and a failure
+/// signs this device out too. Someone reaches for it believing another session
+/// exists that should not, and the one answer that must never be given wrongly
+/// is that it is gone.
+///
+/// Three kinds of failure, told apart because they mean different things to
+/// the person reading them. A lost answer or a server error is genuinely
+/// ambiguous: the purge commits before the replacement is issued, so a `500`
+/// can mean it happened, and this device is signed out on the safe side. A
+/// `401` or a refusal means the request did not run and this token is already
+/// worthless, so it goes too, but saying "it is not clear" would invent a
+/// doubt. Being throttled also means nothing ran — and there the session is
+/// still good, so it is kept and the user waits a few seconds instead of
+/// losing the head start this route exists to give them.
+///
+/// # Errors
+/// `ambiguous` when the answer was lost and the outcome is unknown, and
+/// `signed-out` when the request plainly did not run: both mean this device is
+/// no longer signed in. `throttled` leaves it signed in.
+#[tauri::command]
+async fn sign_out_other_devices(state: State<'_, AppState>) -> CommandResult<UserSummary> {
+    let (api, user_id) = with_session(&state, |session| Ok((session.api.clone(), session.user_id)))?;
+    let signed_in = match api.logout_other_devices().await {
+        Ok(signed_in) => signed_in,
+        // A throttled call is refused by middleware before the handler ever
+        // runs, so nothing was purged and the token in hand is still good.
+        // Keeping it is the point: this route exists to buy the user a few
+        // seconds, and throwing their session away to wait those seconds out
+        // spends exactly what it was meant to save — worse, on a shared egress
+        // address the evicted party can hold the bucket empty and turn this
+        // button into one that only logs the owner out.
+        Err(error @ ClientError::TooManyRequests { .. }) => return Err(error.into()),
+        Err(error) => {
+            clear_local_session(&state);
+            clear_pending_google(&state);
+            // The rest all end this device's session, because either the
+            // outcome is unknown or this token is already gone. Only the
+            // sentence differs, and telling someone their other devices might
+            // be signed out when they are not is the one answer this command
+            // must never give wrongly.
+            let ambiguous = matches!(error, ClientError::Network(_) | ClientError::Server(_));
+            return Err(if ambiguous {
+                CommandError::new(
+                    "ambiguous",
+                    format!(
+                        "{error}. It is not clear whether your other devices were signed out, so this one has \
+                         been signed out too. Sign in again and check."
+                    ),
+                )
+            } else {
+                CommandError::new("signed-out", format!("{error}. Nothing was signed out. Sign in again."))
+            });
+        }
+    };
+    with_same_session(&state, user_id, |session| {
+        session.api = api.clone().with_token(&signed_in.token);
+        session.google_email = signed_in.user.google_email.clone();
+        session.password_login = signed_in.user.password_login;
+        Ok(summary_of(session))
+    })
+}
+
 // ----- sign in with Google ----------------------------------------------------
 
 // Google proves who someone is; it never produces key material. Every path
@@ -581,6 +723,57 @@ fn clear_pending_google(state: &AppState) {
     if let Ok(mut guard) = state.pending_google.lock() {
         *guard = None;
     }
+}
+
+/// The only host this app will send someone to sign in at.
+const GOOGLE_AUTHORIZATION_HOST: &str = "accounts.google.com";
+
+/// Refuse to open anything but Google's own sign-in page.
+///
+/// The server composes this URL, and the server is the party this app guards
+/// against. Unchecked, it is a page of the server's choosing opened by a
+/// password manager that has just told the user the system browser is the safe
+/// place to type a Google password — and, because the string goes to the
+/// platform URL handler rather than to a browser, a scheme of the server's
+/// choosing too: `file://host/share/x` on Windows is a UNC path that
+/// authenticates outward to whoever answers.
+///
+/// Scheme, host and port are what matter. The query carries `state`, `nonce`
+/// and the PKCE challenge, which are the server's to choose and are checked
+/// when the callback comes back.
+///
+/// # Errors
+/// `oauth` if the URL does not parse, is not `https`, names a port, or is not
+/// Google's authorization host.
+fn check_authorization_url(url: &str) -> CommandResult<()> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| CommandError::new("oauth", format!("the server sent a sign-in address that is not a URL: {e}")))?;
+    // Google's sign-in page is on the default port. Nothing is gained by
+    // allowing another, and `accounts.google.com:8443` in a warning is worth
+    // naming rather than passing over.
+    let is_googles_page = parsed.scheme() == "https"
+        && parsed.port().is_none()
+        && parsed.host_str().is_some_and(|host| host.eq_ignore_ascii_case(GOOGLE_AUTHORIZATION_HOST));
+    if !is_googles_page {
+        // `javascript:` and `mailto:` have no host at all, and a sentence with
+        // a hole where the destination should be is the last thing this
+        // particular warning can afford.
+        let destination = match parsed.host_str() {
+            Some(host) => match parsed.port() {
+                Some(port) => format!("{host} on port {port}"),
+                None => host.to_string(),
+            },
+            None => format!("a {} address naming no host", parsed.scheme()),
+        };
+        return Err(CommandError::new(
+            "oauth",
+            format!(
+                "this server tried to send you to {destination} to sign in, not to {GOOGLE_AUTHORIZATION_HOST}. \
+                 Nothing was opened. Do not trust this server with your Google password."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Run the browser half of a sign-in and hand back the code it produced.
@@ -598,6 +791,9 @@ async fn authorize_with_google(
 
     // The system browser, not the app webview: the user should be typing a
     // Google password into Google's own window, where they can see the URL.
+    // Which window that is, is checked here rather than taken on the server's
+    // word; see `check_authorization_url`.
+    check_authorization_url(&started.authorization_url)?;
     app.opener()
         .open_url(started.authorization_url.clone(), None::<&str>)
         .map_err(|e| CommandError::new("oauth", format!("could not open your browser: {e}")))?;
@@ -692,12 +888,12 @@ async fn google_unlock(state: State<'_, AppState>, password: Zeroizing<String>) 
         let identity =
             Identity::decrypt_private_key(&master.private_key_encryption_key(), &session.user.encrypted_private_key)
                 .map_err(|error| unlock_failure(error, "that passphrase does not unlock this vault"))?;
-        (api.clone(), session.user.id, session.user.email.clone(), identity, session.user.password_login)
+        (api.clone(), AccountFacts::of(&session.user), identity)
     };
 
     clear_pending_google(&state);
-    let (api, user_id, email, identity, password_login) = unlocked;
-    install_session(&state, api, user_id, email, identity, master.self_wrap_key(), password_login)
+    let (api, account, identity) = unlocked;
+    install_session(&state, api, account, identity, master.self_wrap_key())
 }
 
 /// Create the account a first Google sign-in asked for. The key pair is
@@ -736,11 +932,9 @@ async fn google_create_account(
     install_session(
         &state,
         api.with_token(&created.token),
-        created.user.id,
-        created.user.email.clone(),
+        AccountFacts::of(&created.user),
         identity,
         master.self_wrap_key(),
-        created.user.password_login,
     )
 }
 
@@ -749,16 +943,187 @@ async fn google_create_account(
 ///
 /// The account email is left as it is: it is the salt the vault key comes
 /// from, and changing it would make every stored secret undecryptable.
+/// The passphrase is required because a linked account is a second way in:
+/// it signs in on its own, and it survives both a passphrase change and
+/// signing out everywhere. A session token alone must not be able to leave one
+/// behind.
 #[tauri::command]
-async fn google_link(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
-    let api = api(&state)?;
-    let capabilities = api.capabilities().await?;
+async fn google_link(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    current: Zeroizing<String>,
+) -> CommandResult<UserSummary> {
+    let password_login = with_session(&state, |session| Ok(session.password_login))?;
+    if !password_login {
+        return Err(CommandError::new("oauth", "this account already signs in with Google"));
+    }
+    // Asked before the passphrase, because its answer does not depend on what
+    // the user typed. Otherwise someone on a server with Google turned off
+    // pays a full key derivation to be told it was never on offer — and, with
+    // a typo as well, is told the passphrase is wrong, which invites a retry
+    // that cannot work.
+    let capabilities = api(&state)?.capabilities().await?;
     if !capabilities.google_sign_in {
         return Err(CommandError::new("oauth", "this server does not offer sign in with Google"));
     }
+
+    let PassphraseProof { user_id, api, auth_hash, master, .. } = prove_current_passphrase(&state, current).await?;
+    // Nothing below needs the vault key, and what comes next waits on the user
+    // reading a consent screen in a browser. Dropped rather than held for it.
+    drop(master);
+
     let callback = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
-    api.oauth_link(&callback).await?;
-    Ok(())
+    let profile =
+        api.oauth_link(&OAuthLinkRequest::new(callback, Some(auth_hash))).await.map_err(passphrase_rejected)?;
+    remember_google_email(&state, user_id, profile.google_email)
+}
+
+/// Remove the linked Google account, so it can no longer sign in here.
+///
+/// The server ends every session as it goes, including this one, and answers
+/// with a replacement. Installing that replacement is what keeps this device
+/// signed in while every other is signed out.
+#[tauri::command]
+async fn google_unlink(state: State<'_, AppState>, current: Zeroizing<String>) -> CommandResult<UserSummary> {
+    let password_login = with_session(&state, |session| Ok(session.password_login))?;
+    if !password_login {
+        return Err(CommandError::new(
+            "oauth",
+            "this account signs in with Google only; removing the link would leave no way to sign in",
+        ));
+    }
+    let PassphraseProof { user_id, api, auth_hash, .. } = prove_current_passphrase(&state, current).await?;
+    let signed_in =
+        api.oauth_unlink(&OAuthUnlinkRequest { current_auth_hash: auth_hash }).await.map_err(passphrase_rejected)?;
+
+    with_same_session(&state, user_id, |session| {
+        session.api = api.clone().with_token(&signed_in.token);
+        session.google_email = signed_in.user.google_email.clone();
+        Ok(summary_of(session))
+    })
+}
+
+/// Say what a `401` from the link routes actually means.
+///
+/// Everywhere else a `401` means the token is gone, and the client says so.
+/// On these two it cannot: the passphrase was already checked locally and
+/// passed, so reaching the server's own check at all means this session's wrap
+/// key is stale — the passphrase was changed on another device. Signing in
+/// again is still the fix, but "your session has expired" names the wrong
+/// cause for someone trying to work out what happened to their account.
+fn passphrase_rejected(error: ClientError) -> CommandError {
+    match error {
+        ClientError::Unauthorized => CommandError::new(
+            "locked",
+            "the server did not accept that passphrase. If you changed it on another device, \
+             sign out here and sign in with the new one.",
+        ),
+        other => other.into(),
+    }
+}
+
+/// A passphrase proved against the session that is open, and the account it
+/// was proved for.
+struct PassphraseProof {
+    /// Who the proof is for. Carried so a slow round trip cannot write its
+    /// answer onto whatever session happens to be open when it returns.
+    user_id: i64,
+    /// The client the proof was read from, so everything that follows speaks
+    /// to the session it was proved against rather than re-reading the lock.
+    api: ApiClient,
+    /// The address both hashes are bound to. Read once here, so a caller
+    /// deriving a second hash cannot bind it to a different server than the
+    /// first — which would rebind the account's credential to an address the
+    /// user never signs in at.
+    server: ServerAddress,
+    /// The account address, which is the key-derivation salt. On the proof
+    /// for the same reason as `server`: a caller deriving a second key must
+    /// derive it from the same salt as the first, or it re-wraps the vault
+    /// under a key the passphrase cannot reproduce.
+    email: String,
+    /// Whether a passphrase is also this account's server credential, so a
+    /// caller does not have to re-read it after an await.
+    password_login: bool,
+    /// Bound to [`PassphraseProof::server`], so it is useless to any other.
+    auth_hash: Zeroizing<String>,
+    /// The key the passphrase derived. Handed back because deriving it is the
+    /// expensive part and a caller that re-wraps needs it; callers that only
+    /// needed the proof drop it, and should do so before anything slow.
+    master: MasterKey,
+}
+
+/// Derive the master key from `current` and check it opens the session that is
+/// already unlocked, returning the proof to send to the server.
+///
+/// The comparison is local and against the session's own wrap key, so a typo
+/// costs one Argon2 pass here instead of a round trip — and, for linking, a
+/// whole trip out through Google that then fails at the end.
+///
+/// # Errors
+/// `locked` if nothing is unlocked or the passphrase is not this session's.
+async fn prove_current_passphrase(state: &AppState, current: Zeroizing<String>) -> CommandResult<PassphraseProof> {
+    // One read of the session for everything that has to agree: the account,
+    // the client, the salt and the address the hashes bind to. Each of these
+    // read separately could observe a different session, and a command that
+    // mixed two accounts' values would write one account's key material over
+    // the other's.
+    let (email, api, user_id, password_login) = with_session(state, |session| {
+        Ok((session.email.clone(), session.api.clone(), session.user_id, session.password_login))
+    })?;
+    let server = normalize_server_url(api.base_url())?;
+    let master = derive_master(current, email.clone()).await?;
+    let matches_session: bool = with_session(state, |session| {
+        Ok(session.user_id == user_id
+            && bool::from(master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref())))
+    })?;
+    if !matches_session {
+        return Err(CommandError::new("locked", "that is not your current passphrase"));
+    }
+    let auth_hash = master.auth_hash(&server);
+    Ok(PassphraseProof { user_id, api, server, email, password_login, auth_hash, master })
+}
+
+/// Record what the server now says is linked, and hand back the summary the
+/// UI redraws from.
+///
+/// `user_id` is the account the answer was about. Linking blocks on a browser
+/// round trip of unbounded length, and the session can be replaced while it
+/// runs; without this check the first account's Google address could land on
+/// the second account's summary.
+fn remember_google_email(state: &AppState, user_id: i64, google_email: Option<String>) -> CommandResult<UserSummary> {
+    with_same_session(state, user_id, |session| {
+        session.google_email = google_email;
+        Ok(summary_of(session))
+    })
+}
+
+/// Re-read what the server says about this account and update what the
+/// session caches.
+///
+/// The Google address is the field worth re-reading: it can change from
+/// another device, and the account panel is where an unwanted link is supposed
+/// to become visible. Nothing secret is touched — this replaces facts the
+/// server already told us, not key material.
+///
+/// `password_login` is taken from the server too, which was fixed at sign-in
+/// before. A hostile server flipping it gains nothing: false makes
+/// `change_password` send no hashes, which the server's own check rejects for
+/// a password account, and true makes a Google account send hashes rejected
+/// for the opposite reason. Both fail closed, and a server that wants to hide
+/// the chip can already do it by returning no `google_email`.
+///
+/// # Errors
+/// `locked` if nothing is unlocked or the session changed while this ran;
+/// whatever the client reports if the server cannot be reached.
+#[tauri::command]
+async fn refresh_account(state: State<'_, AppState>) -> CommandResult<UserSummary> {
+    let (api, user_id) = with_session(&state, |session| Ok((session.api.clone(), session.user_id)))?;
+    let profile = api.me().await?;
+    with_same_session(&state, user_id, |session| {
+        session.password_login = profile.password_login;
+        session.google_email = profile.google_email.clone();
+        Ok(summary_of(session))
+    })
 }
 
 #[tauri::command]
@@ -805,20 +1170,27 @@ async fn change_password(
     new_password: Zeroizing<String>,
 ) -> CommandResult<()> {
     kdf::validate_new_password(&new_password).map_err(user_facing)?;
-    let (api, email, server_url) = with_session(&state, |session| {
-        Ok((session.api.clone(), session.email.clone(), session.api.base_url().to_string()))
-    })?;
-    let server = normalize_server_url(&server_url)?;
 
-    let old_master = derive_master(current, email.clone()).await?;
-    // Checked here rather than left to the server, so a typo costs one local
-    // comparison instead of a round trip that also re-wraps every key.
-    let matches_session: bool = with_session(&state, |session| {
-        Ok(old_master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref()).into())
-    })?;
-    if !matches_session {
-        return Err(CommandError::new("locked", "that is not your current passphrase"));
-    }
+    // Proved locally rather than left to the server, so a typo costs one
+    // Argon2 pass instead of a round trip that also re-wraps every key. The
+    // derived key comes back with the proof, because re-wrapping needs it and
+    // deriving it twice would double the one slow step on this path.
+    //
+    // Everything else this command sends comes off the proof too, from its one
+    // guarded read of the session. Both keys derive from the same salt, so the
+    // vault cannot be re-wrapped under a key the passphrase will not reproduce,
+    // and both hashes bind to the same address, so the credential cannot be
+    // rebound to a server the user never signs in at. Either would be a vault
+    // nobody can open again.
+    let PassphraseProof {
+        user_id,
+        api,
+        server,
+        email,
+        password_login,
+        auth_hash: current_auth_hash,
+        master: old_master,
+    } = prove_current_passphrase(&state, current).await?;
     let new_master = derive_master(new_password, email).await?;
 
     // Keys without payloads: re-wrapping never looks at a payload, and at the
@@ -828,12 +1200,14 @@ async fn change_password(
     let keys = api.list_secret_keys().await?;
     let rewrapped_keys = rewrap_owned(&keys, &old_master, &new_master)?;
 
-    let identity_key = with_session(&state, |session| {
+    // Guarded on the account: this uploads a private key, and uploading one
+    // account's key to another would replace that account's key pair and break
+    // every secret shared with it.
+    let identity_key = with_same_session(&state, user_id, |session| {
         Ok(session.identity.encrypt_private_key(&new_master.private_key_encryption_key()))
     })?;
-    let password_login = with_session(&state, |session| Ok(session.password_login))?;
     let request = ChangePasswordRequest {
-        current_auth_hash: password_login.then(|| old_master.auth_hash(&server)),
+        current_auth_hash: password_login.then_some(current_auth_hash),
         new_auth_hash: password_login.then(|| new_master.auth_hash(&server)),
         encrypted_private_key: identity_key,
         rewrapped_keys,
@@ -851,10 +1225,16 @@ async fn change_password(
     // Every other device was signed out, and this one holds a new token and a
     // new self-wrap key. Cached secret keys stay valid — they did not change —
     // but they are dropped rather than reasoned about.
-    with_session(&state, |current| {
+    // Guarded on the account: this takes minutes on a large vault, long enough
+    // for the session to have been replaced underneath it.
+    with_same_session(&state, user_id, |current| {
         current.api = api.with_token(&session.token);
         current.self_wrap_key = new_master.self_wrap_key();
         current.keys.clear();
+        // A passphrase change does not remove a linked Google account, so this
+        // is taken from the profile the server just returned rather than
+        // assumed either way.
+        current.google_email = session.user.google_email.clone();
         Ok(())
     })
 }
@@ -1622,12 +2002,15 @@ pub fn run() {
             register,
             login,
             logout,
+            sign_out_other_devices,
             server_capabilities,
             google_sign_in,
             google_unlock,
             google_create_account,
             google_link,
+            google_unlink,
             change_password,
+            refresh_account,
             session_info,
             startup_warnings,
             ui_constants,
@@ -1656,6 +2039,61 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server composes the sign-in URL, and the server is the party this
+    /// app guards against. Only Google's own authorization page over https is
+    /// opened; everything else is refused before the platform URL handler sees
+    /// the string.
+    #[test]
+    fn only_googles_own_sign_in_page_is_opened() {
+        let google = "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=y";
+        assert!(check_authorization_url(google).is_ok());
+        // Case and a different path or query are Google's business, not ours.
+        assert!(check_authorization_url("https://ACCOUNTS.GOOGLE.COM/anything?a=b").is_ok());
+
+        for refused in [
+            // The phishing shape: a host that merely reads like Google's.
+            "https://accounts.google.com.attacker.example/signin",
+            "https://accounts-google.com/o/oauth2/v2/auth",
+            // Credentials in the authority, which hide the real host.
+            "https://accounts.google.com@attacker.example/o/oauth2/v2/auth",
+            // A homograph host punycodes to something that is not Google.
+            "https://accounts.googlé.com/o/oauth2/v2/auth",
+            // Cleartext, even to the right host.
+            "http://accounts.google.com/o/oauth2/v2/auth",
+            // Schemes that are not a browser at all. The Windows one reaches
+            // ShellExecuteW as a UNC path and authenticates outward.
+            "file://attacker.example/share/payload.exe",
+            "smb://attacker.example/share",
+            "javascript:alert(1)",
+            "mailto:someone@attacker.example",
+            // The right host on a port Google's sign-in page is not on.
+            "https://accounts.google.com:8443/o/oauth2/v2/auth",
+            // Not a URL.
+            "",
+            "not a url",
+        ] {
+            let error = check_authorization_url(refused).expect_err("{refused} must be refused");
+            assert_eq!(error.code, "oauth", "{refused}");
+        }
+    }
+
+    /// The message is the whole product of this check: nothing is opened, so
+    /// all the user gets is the sentence. It has to name where the server
+    /// tried to send them, including for the schemes that have no host.
+    #[test]
+    fn the_refusal_names_where_the_server_tried_to_send_you() {
+        let host = check_authorization_url("https://accounts.google.com.attacker.example/x").unwrap_err();
+        assert!(host.message.contains("accounts.google.com.attacker.example"), "{}", host.message);
+
+        let port = check_authorization_url("https://accounts.google.com:8443/x").unwrap_err();
+        assert!(port.message.contains("port 8443"), "{}", port.message);
+
+        // No host at all: the sentence must not come out with a hole in it.
+        let hostless = check_authorization_url("javascript:alert(1)").unwrap_err();
+        assert!(hostless.message.contains("javascript"), "{}", hostless.message);
+        assert!(!hostless.message.contains("send you to  "), "{}", hostless.message);
+    }
 
     #[test]
     fn server_url_requires_https_except_on_loopback() {
@@ -1756,6 +2194,33 @@ mod tests {
         assert!(malformed.message.contains("32 bytes"), "{malformed:?}");
     }
 
+    /// A throttled request is the one failure that leaves the caller's session
+    /// intact, so the UI has to be able to tell it apart and say how long to
+    /// wait. Both halves travel on the error.
+    #[test]
+    fn a_throttled_error_carries_its_own_code_and_the_wait() {
+        let throttled = CommandError::from(ClientError::TooManyRequests {
+            message: "too many requests; try again in 6 seconds".into(),
+            retry_after_secs: Some(6),
+        });
+        assert_eq!(throttled.code, "throttled");
+        assert_eq!(throttled.retry_after_secs, Some(6));
+
+        // A server that sends no usable Retry-After still classifies, and the
+        // UI falls back to "in a few seconds".
+        let no_hint =
+            CommandError::from(ClientError::TooManyRequests { message: "slow down".into(), retry_after_secs: None });
+        assert_eq!(no_hint.code, "throttled");
+        assert_eq!(no_hint.retry_after_secs, None);
+
+        // Nothing else claims a wait.
+        for other in [ClientError::Network("down".into()), ClientError::Server("boom".into())] {
+            let error = CommandError::from(other);
+            assert_ne!(error.code, "throttled");
+            assert_eq!(error.retry_after_secs, None);
+        }
+    }
+
     fn test_session(identity: Identity) -> Session {
         Session {
             api: ApiClient::new("http://localhost:1").unwrap(),
@@ -1765,6 +2230,7 @@ mod tests {
             self_wrap_key: Zeroizing::new(credvault_core::aead::random_bytes()),
             keys: HashMap::new(),
             password_login: true,
+            google_email: None,
         }
     }
 

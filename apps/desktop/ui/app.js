@@ -204,6 +204,24 @@ function openAccountSheet() {
   sheet.setAttribute("aria-modal", "true");
   sheet.setAttribute("aria-label", "Account and settings");
   $("btn-fingerprint").focus();
+  // The chip is how an unwanted Google link becomes visible, so what it shows
+  // is re-read from the server each time this opens rather than left at
+  // whatever sign-in put there. A link added from another device would
+  // otherwise stay invisible for the life of this session.
+  refreshAccountFacts();
+}
+
+/// Re-read the signed-in account from the server and redraw what depends on
+/// it. Silent on failure: this runs on opening a panel, and a chip showing
+/// slightly stale text is better than an error over a screen the user opened
+/// to do something else.
+async function refreshAccountFacts() {
+  try {
+    state.user = await invoke("refresh_account");
+    renderGoogleChip();
+  } catch (error) {
+    console.warn("could not refresh the account panel", error);
+  }
 }
 function closeAccountSheet({ restoreFocus = true } = {}) {
   const app = $("app");
@@ -320,7 +338,27 @@ async function refreshCapabilities() {
   else if (wasIncompatible) setError("auth-error", "");
   const offered = Boolean(state.capabilities?.google_sign_in) && !state.google;
   $("google-block").classList.toggle("hidden", !offered);
-  $("btn-link-google").classList.toggle("hidden", !state.capabilities?.google_sign_in);
+  renderGoogleChip();
+}
+
+/// The chip says what the account actually has, not what the server offers.
+///
+/// Hidden for an account that signs in with Google already: its link is the
+/// only way in and cannot be removed, so there is nothing to offer. For a
+/// password account it reads "Link Google" or names the address that can sign
+/// in, which is what makes an unwanted link visible.
+function renderGoogleChip() {
+  const supported = Boolean(state.capabilities?.google_sign_in);
+  const user = state.user;
+  const canLink = supported && user?.password_login !== false;
+  const chip = $("btn-link-google");
+  chip.classList.toggle("hidden", !canLink);
+  if (!canLink) return;
+  const linked = user?.google_email || null;
+  chip.querySelector(".chip-label").textContent = linked || "Link Google";
+  chip.title = linked
+    ? `${linked} can sign in to this account. Click to review or remove it.`
+    : "Use your Google account to sign in to this server next time. Your passphrase is still what unlocks the vault.";
 }
 
 /// Swap the password form for the passphrase prompt, or back again.
@@ -405,16 +443,194 @@ function cancelGoogleSignIn() {
   setAuthMode(state.authMode);
 }
 
-async function linkGoogle() {
-  setBusy($("btn-link-google"), true);
+/// Review the Google link: add one, or remove the one that is there.
+///
+/// Both ask for the passphrase, because both change how this account can be
+/// signed into and a session alone must not be enough to do that. The server
+/// enforces it; asking here is what makes the rule visible and catches a typo
+/// before a trip through the browser.
+///
+/// `afterEviction` means the user has just signed out their other devices and
+/// was brought straight here. It adds the two things they need and cannot
+/// infer: that the eviction worked, and that "too many requests" on the
+/// removal means wait and try again rather than it failed.
+function renderGoogleLinkForm({ afterEviction = false } = {}) {
+  closeAccountSheet({ restoreFocus: false });
+  state.selected = null;
+  state.editing = true;
+  renderList();
+  showDetailScreen();
+  const linked = state.user?.google_email || null;
+  $("detail").innerHTML = `
+    <form class="card" id="google-link-form" novalidate aria-labelledby="google-link-title">
+      <h2 id="google-link-title" class="card-title">${icon("lock")} ${linked ? "Google sign-in" : "Link Google"}</h2>
+      ${afterEviction
+        ? `<p class="card-lead">
+             Your other devices are signed out. If someone else added this sign-in, removing it
+             now is what keeps them out &mdash; they would have to go through Google again to
+             get back.
+           </p>`
+        : ""}
+      <p class="card-lead">
+        ${linked
+          ? `<strong>${esc(linked)}</strong> can sign in to this account without your passphrase.
+             Remove it if you did not add it, or if you no longer want to sign in that way.`
+          : `Sign in to this server with your Google account next time.
+             Your passphrase is still what unlocks the vault &mdash; Google only proves who you are.`}
+      </p>
+      <div class="field">
+        <label for="gl-current">Your passphrase</label>
+        <input id="gl-current" type="password" autocomplete="current-password" spellcheck="false">
+        <p class="hint">
+          ${linked
+            ? "Removing a way to sign in needs more than an unlocked app."
+            : "Adding a way to sign in needs more than an unlocked app."}
+        </p>
+      </div>
+      <div class="error" id="gl-error" role="alert"></div>
+      <div class="actions">
+        <button type="submit" class="btn ${linked ? "danger" : "primary"}" id="btn-gl-save">
+          ${linked ? `${icon("trash")} Remove link` : `${icon("check")} Link Google`}
+        </button>
+        <button type="button" class="btn" id="btn-gl-cancel">Cancel</button>
+      </div>
+    </form>`;
+
+  $("btn-gl-cancel").onclick = () => { state.editing = false; renderDetail(); showListScreen(); };
+  $("google-link-form").onsubmit = submitGoogleLinkChange;
+  $("gl-current").focus();
+}
+
+/// Confirmation for ending every other session.
+///
+/// Deliberately not behind the passphrase. Someone reaches for this because
+/// they think another session is open that should not be, and the whole value
+/// of the route is that nothing the other session does can block it — adding a
+/// derivation and a verify in front would hand it a way to.
+///
+/// This device keeps its session on purpose, so whatever the user does next
+/// about the party they just evicted goes out straight away rather than after
+/// a sign-in they would have to sit through.
+function renderSignOutOthersForm() {
+  closeAccountSheet({ restoreFocus: false });
+  state.selected = null;
+  state.editing = true;
+  renderList();
+  showDetailScreen();
+  $("detail").innerHTML = `
+    <form class="card" id="sign-out-others-form" novalidate aria-labelledby="sign-out-others-title">
+      <h2 id="sign-out-others-title" class="card-title">${icon("alert")} Sign out other devices</h2>
+      <p class="card-lead">
+        Every other device signed in to this account is signed out. This one stays
+        signed in. Your secrets are untouched and your passphrase does not change.
+      </p>
+      <p class="card-lead">
+        This is the thing to do first if you think someone else is signed in as you.
+        Nothing they can do stops it &mdash; and because you stay signed in here, you
+        can go straight on to remove a Google sign-in they added, before they have
+        time to come back.
+      </p>
+      <div class="error" id="soa-error" role="alert"></div>
+      <div class="actions">
+        <button type="submit" class="btn danger solid" id="btn-soa-save">
+          ${icon("check")} Sign out other devices
+        </button>
+        <button type="button" class="btn" id="btn-soa-cancel">Cancel</button>
+      </div>
+    </form>`;
+
+  $("btn-soa-cancel").onclick = () => { state.editing = false; renderDetail(); showListScreen(); };
+  $("sign-out-others-form").onsubmit = submitSignOutOthers;
+  $("btn-soa-cancel").focus();
+}
+
+async function submitSignOutOthers(event) {
+  event.preventDefault();
+  setError("soa-error", "");
+  setBusy($("btn-soa-save"), true, "Signing out…");
   try {
-    await invoke("google_link");
-    toast("Google account linked");
+    state.user = await invoke("sign_out_other_devices");
+    renderGoogleChip();
+    toast("Other devices signed out");
+    // The few seconds this just bought are the whole point, so spend them on
+    // the thing it bought them for rather than leaving the user to find the
+    // chip themselves. Only when there is a link to remove: otherwise the list
+    // is where they should land.
+    if (state.user?.google_email) {
+      renderGoogleLinkForm({ afterEviction: true });
+      return;
+    }
+    state.editing = false;
+    renderDetail();
+    showListScreen();
   } catch (error) {
-    setError("main-error", error);
+    // Both failure codes mean this device is signed out as well, so follow it
+    // here rather than leaving a card over a vault this app no longer holds a
+    // session for. The message says which of the two it was.
+    const code = String(error?.code ?? "");
+    if (code === "ambiguous" || code === "signed-out") {
+      signOutAfterAmbiguousChange(String(error?.message ?? error));
+      return;
+    }
+    setError("soa-error", code === "throttled" ? retryLater(error) : error);
   } finally {
-    setBusy($("btn-link-google"), false);
+    // The success path replaces `#detail`, so this button may be gone. Checked
+    // rather than left to `setBusy` to absorb, matching `submitPassphraseChange`.
+    if ($("btn-soa-save")?.isConnected) setBusy($("btn-soa-save"), false);
   }
+}
+
+async function submitGoogleLinkChange(event) {
+  event.preventDefault();
+  setError("gl-error", "");
+  const current = $("gl-current").value;
+  if (!current) {
+    setError("gl-error", "Enter your passphrase.");
+    $("gl-current").focus();
+    return;
+  }
+  const linked = Boolean(state.user?.google_email);
+  setBusy($("btn-gl-save"), true, linked ? "Removing\u2026" : "Waiting for your browser\u2026");
+  try {
+    const user = await invoke(linked ? "google_unlink" : "google_link", { current });
+    state.user = user;
+    renderGoogleChip();
+    toast(linked ? "Google sign-in removed" : "Google account linked");
+    state.editing = false;
+    renderDetail();
+    showListScreen();
+  } catch (error) {
+    // Throttling is not failure, and the difference matters most to someone
+    // trying to remove a sign-in that should not be there. Say what to do.
+    setError("gl-error", String(error?.code ?? "") === "throttled" ? retryLater(error) : error);
+  } finally {
+    setBusy($("btn-gl-save"), false);
+  }
+}
+
+/// Past this, the server's suggested wait is reported as "later" rather than
+/// relayed as a number. Five minutes is already far longer than any bucket
+/// here refills in.
+const RETRY_HINT_CEILING_SECS = 300;
+
+/// Turn a throttled error into an instruction rather than a verdict.
+///
+/// Written here from the number the server sent rather than built on the
+/// sentence it sent. That sentence is a string a hostile server chooses, and
+/// appending "nothing was changed" to it would read as this app vouching for
+/// it. The wait is a fact we can state ourselves.
+function retryLater(error) {
+  const secs = Number(error?.retry_after_secs);
+  // The number is the server's, and the server is the party this app guards
+  // against. It cannot do anything worse here than keep refusing, but relaying
+  // "try again in thirty-one years" would turn an instruction into nonsense,
+  // so anything past a few minutes is reported as a few minutes.
+  const when = !Number.isFinite(secs) || secs <= 0
+    ? "in a few seconds"
+    : secs > RETRY_HINT_CEILING_SECS
+      ? "later"
+      : `in ${Math.ceil(secs)} ${Math.ceil(secs) === 1 ? "second" : "seconds"}`;
+  return `Nothing was changed. The server is limiting how often this can be asked — try again ${when}.`;
 }
 
 function showApp(user) {
@@ -423,6 +639,7 @@ function showApp(user) {
   $("who-server").textContent = user.server_url;
   $("who-server").title = user.server_url;
   $("fingerprint").textContent = user.fingerprint;
+  renderGoogleChip();
   $("auth").classList.add("hidden");
   $("app").classList.remove("hidden");
   state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0;
@@ -432,15 +649,27 @@ function showApp(user) {
   refresh();
 }
 
-async function logout() {
-  await invoke("logout");
+/// Everything the signed-out state needs cleared, in one place.
+///
+/// Three paths reach it — logging out, a passphrase change whose answer was
+/// lost, and signing out after an eviction that could not be confirmed — and
+/// they used to each keep their own copy, which had already drifted apart.
+function resetToSignedOut() {
   clearReveals();
-  state.secrets = []; state.selected = null; state.editing = false;
+  // Dropped with the rest of it: the chip reads the signed-in account, and a
+  // stale one would describe the last person to use this app.
+  state.user = null;
+  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0;
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
   closeAccountSheet({ restoreFocus: false });
   setError("main-error", "");
   $("app").classList.add("hidden");
   $("auth").classList.remove("hidden");
+}
+
+async function logout() {
+  await invoke("logout");
+  resetToSignedOut();
   $("password").focus();
 }
 
@@ -1220,7 +1449,10 @@ async function submitPassphraseChange(event) {
       signOutAfterAmbiguousChange(error.message);
       return;
     }
-    setError("pp-error", error);
+    // This form's two neighbouring failures are "changed but unconfirmed" and
+    // "changed but unknown", so red here reads as "my vault may have a new
+    // passphrase". Throttling means the request never ran; say so.
+    setError("pp-error", error?.code === "throttled" ? retryLater(error) : error);
     if (error?.code === "locked") $("pp-current").focus();
   } finally {
     if ($("btn-pp-save")?.isConnected) setBusy($("btn-pp-save"), false);
@@ -1234,13 +1466,7 @@ async function submitPassphraseChange(event) {
 /// only resets what is on screen. A reload will land on the sign-in screen too,
 /// because `session_info` now has nothing to report.
 function signOutAfterAmbiguousChange(message) {
-  clearReveals();
-  state.secrets = []; state.selected = null; state.editing = false; state.user = null;
-  $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
-  closeAccountSheet({ restoreFocus: false });
-  setError("main-error", "");
-  $("app").classList.add("hidden");
-  $("auth").classList.remove("hidden");
+  resetToSignedOut();
   showStartupWarning(message);
   $("password").focus();
 }
@@ -1439,8 +1665,9 @@ $("btn-google").onclick = startGoogleSignIn;
 $("google-form").onsubmit = submitGooglePassphrase;
 $("btn-google-cancel").onclick = cancelGoogleSignIn;
 $("btn-google-toggle-pw").onclick = () => togglePasswordInput($("google-password"), $("btn-google-toggle-pw"));
-$("btn-link-google").onclick = () => linkGoogle();
+$("btn-link-google").onclick = () => renderGoogleLinkForm();
 $("btn-change-passphrase").onclick = () => renderPassphraseForm();
+$("btn-sign-out-others").onclick = () => renderSignOutOthersForm();
 // The button belongs to whichever server is in the box, so re-ask when it
 // settles rather than on every keystroke.
 $("server").onchange = () => refreshCapabilities();

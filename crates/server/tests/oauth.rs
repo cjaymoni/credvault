@@ -14,7 +14,7 @@ use credvault_core::{Identity, MasterKey};
 use credvault_server::api::*;
 use credvault_server::error::ApiError;
 use credvault_server::oauth::{AuthorizationRequest, BoxFuture, ExchangeRequest, OAuthProvider, VerifiedIdentity};
-use credvault_server::{RegistrationPolicy, ServerConfig};
+use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use reqwest::{Client, StatusCode};
 use sqlx::SqlitePool;
 
@@ -148,6 +148,11 @@ impl TestServer {
             serde_json::json!({ "state": started.state, "app_secret": started.app_secret.as_str(), "code": code }),
         )
         .await
+    }
+
+    /// A GET as a particular session. Used to ask whether a token still works.
+    async fn get_as(&self, path: &str, token: &str) -> reqwest::Response {
+        self.client.get(format!("{}{path}", self.base)).bearer_auth(token).send().await.unwrap()
     }
 
     async fn capabilities(&self) -> Capabilities {
@@ -313,10 +318,19 @@ async fn parameters_generated_by_the_server_reach_the_provider() {
     assert_ne!(verifier, &issued.code_challenge);
 }
 
+/// The passphrase every `password_session` account is created with.
+const SESSION_PASSPHRASE: &str = "correct horse battery staple";
+
+/// The credential one of those accounts proves itself with. Linking and
+/// unlinking both ask for it, so the tests have to be able to produce it.
+fn session_auth_hash(server: &TestServer, email: &str) -> String {
+    MasterKey::derive(SESSION_PASSPHRASE, email).unwrap().auth_hash(&server.address).to_string()
+}
+
 /// A password account and a session for it, for the flows that need one.
 async fn password_session(server: &TestServer, email: &str) -> SessionResponse {
     let identity = Identity::generate();
-    let master = MasterKey::derive("correct horse battery staple", email).unwrap();
+    let master = MasterKey::derive(SESSION_PASSPHRASE, email).unwrap();
     server
         .post(
             "/register",
@@ -396,13 +410,18 @@ async fn a_link_cannot_be_finished_by_a_different_session() {
     let alice = password_session(&server, "alice@example.com").await;
     let mallory = password_session(&server, "mallory@example.com").await;
 
-    let link = async |started: &OAuthStartResponse, token: &str| {
+    // Each caller proves its own passphrase, so what is being tested is the
+    // session binding and not the new credential check.
+    let link = async |started: &OAuthStartResponse, token: &str, email: &str| {
         server
             .client
             .post(format!("{}/oauth/link", server.base))
             .bearer_auth(token)
             .json(&serde_json::json!({
-                "state": started.state, "app_secret": started.app_secret.as_str(), "code": "code-1"
+                "state": started.state,
+                "app_secret": started.app_secret.as_str(),
+                "code": "code-1",
+                "current_auth_hash": session_auth_hash(&server, email),
             }))
             .send()
             .await
@@ -410,11 +429,11 @@ async fn a_link_cannot_be_finished_by_a_different_session() {
     };
 
     let started = server.start_as("link", Some(&alice.token)).await;
-    assert_eq!(link(&started, &mallory.token).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(link(&started, &mallory.token, "mallory@example.com").await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(stub.exchanges().len(), 0, "a wrong session must not reach the provider");
 
     // The attempt survived the attempt to steal it, so Alice still finishes.
-    assert_eq!(link(&started, &alice.token).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(link(&started, &alice.token, "alice@example.com").await.status(), StatusCode::OK);
 }
 
 /// Starting a link says which account the identity will be bound to, so it
@@ -569,13 +588,17 @@ async fn linking_lets_a_password_account_use_the_button() {
         .await
         .unwrap();
 
+    let auth_hash = master.auth_hash(&server.address).to_string();
     let link = async |started: &OAuthStartResponse, code: &str, token: &str| {
         server
             .client
             .post(format!("{}/oauth/link", server.base))
             .bearer_auth(token)
             .json(&serde_json::json!({
-                "state": started.state, "app_secret": started.app_secret.as_str(), "code": code
+                "state": started.state,
+                "app_secret": started.app_secret.as_str(),
+                "code": code,
+                "current_auth_hash": auth_hash,
             }))
             .send()
             .await
@@ -588,7 +611,11 @@ async fn linking_lets_a_password_account_use_the_button() {
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
     let started = server.start_as("link", Some(&session.token)).await;
-    assert_eq!(link(&started, "code-1", &session.token).await.status(), StatusCode::NO_CONTENT);
+    let linked = link(&started, "code-1", &session.token).await;
+    assert_eq!(linked.status(), StatusCode::OK);
+    // The profile that comes back names the address that can now sign in, so
+    // the client can show it.
+    assert_eq!(linked.json::<UserProfile>().await.unwrap().google_email.as_deref(), Some("kat@example.com"));
 
     // The account email is untouched, because it is the key-derivation salt.
     let started = server.start("sign_in").await;
@@ -720,4 +747,398 @@ async fn a_google_session_alone_can_replace_the_vault_keys() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "a Google session is sufficient today");
+}
+
+/// Finish a link as `token`, presenting `proof` as the passphrase — or none,
+/// for the callers checking what happens without one.
+async fn link(
+    server: &TestServer,
+    started: &OAuthStartResponse,
+    code: &str,
+    token: &str,
+    proof: Option<&str>,
+) -> reqwest::Response {
+    let mut body = serde_json::json!({
+        "state": started.state, "app_secret": started.app_secret.as_str(), "code": code
+    });
+    if let Some(proof) = proof {
+        body["current_auth_hash"] = serde_json::Value::String(proof.to_string());
+    }
+    server.client.post(format!("{}/oauth/link", server.base)).bearer_auth(token).json(&body).send().await.unwrap()
+}
+
+/// Post to `/oauth/unlink` as `token`, with whatever credential is given.
+async fn unlink(server: &TestServer, token: &str, auth_hash: &str) -> reqwest::Response {
+    server
+        .client
+        .post(format!("{}/oauth/unlink", server.base))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "current_auth_hash": auth_hash }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A session token is not enough to add a way into the account.
+///
+/// A linked identity signs in on its own and survives both a passphrase change
+/// and "sign out everywhere", so whoever holds a stolen token for a moment must
+/// not be able to leave one behind. The passphrase is the thing a stolen token
+/// does not carry, and it is checked before the code is spent — so a caller
+/// who cannot prove it never reaches Google either.
+#[tokio::test]
+async fn a_stolen_session_cannot_leave_a_google_sign_in_behind() {
+    let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+
+    // No proof at all.
+    let started = server.start_as("link", Some(&alice.token)).await;
+    let no_proof = link(&server, &started, "code-1", &alice.token, None).await;
+    assert_eq!(no_proof.status(), StatusCode::BAD_REQUEST);
+
+    // A wrong passphrase, correctly shaped.
+    let wrong = MasterKey::derive("not alice's passphrase", "alice@example.com")
+        .unwrap()
+        .auth_hash(&server.address)
+        .to_string();
+    let bad_proof = link(&server, &started, "code-1", &alice.token, Some(&wrong)).await;
+    assert_eq!(bad_proof.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(stub.exchanges().len(), 0, "an unproven link must not reach the provider");
+
+    // Neither failure spent the attempt, so the account holder still finishes
+    // it with the passphrase they have.
+    let proof = session_auth_hash(&server, "alice@example.com");
+    let good = link(&server, &started, "code-1", &alice.token, Some(&proof)).await;
+    assert_eq!(good.status(), StatusCode::OK, "{}", good.text().await.unwrap());
+}
+
+/// A link can be taken back off, and once it is, it no longer signs in.
+#[tokio::test]
+async fn a_link_can_be_removed_and_then_no_longer_signs_in() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
+
+    let started = server.start_as("link", Some(&alice.token)).await;
+    let linked = link(&server, &started, "code-1", &alice.token, Some(&auth_hash)).await;
+    assert_eq!(linked.status(), StatusCode::OK);
+
+    // Removing it needs the passphrase too: taking a credential away is as
+    // much a credential change as adding one.
+    let wrong = MasterKey::derive("not alice's passphrase", "alice@example.com")
+        .unwrap()
+        .auth_hash(&server.address)
+        .to_string();
+    assert_eq!(unlink(&server, &alice.token, &wrong).await.status(), StatusCode::UNAUTHORIZED);
+
+    let removed = unlink(&server, &alice.token, &auth_hash).await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let after: SessionResponse = removed.json().await.unwrap();
+    assert_eq!(after.user.google_email, None);
+    assert_eq!(after.user.id, alice.user.id);
+
+    // The identity that used to sign in is now a stranger: it is offered an
+    // account of its own rather than Alice's.
+    let started = server.start("sign_in").await;
+    let response = server.callback(&started, "code-1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    match response.json::<OAuthCallbackResponse>().await.unwrap() {
+        OAuthCallbackResponse::RegistrationRequired { email, .. } => assert_eq!(email, "kat@gmail.example"),
+        OAuthCallbackResponse::SignedIn(_) => panic!("the removed link still signs in"),
+    }
+
+    // And there is nothing left to remove. Asked with the token the unlink
+    // handed back, because the one used to make the request is gone with every
+    // other session; see the test below.
+    assert_eq!(unlink(&server, &after.token, &auth_hash).await.status(), StatusCode::NOT_FOUND);
+}
+
+/// Removing a link ends every session, including the ones the link itself
+/// minted.
+///
+/// This is what makes the remedy a remedy. A link that should not have been
+/// there has had up to a session lifetime to sign in and collect tokens, and
+/// nothing on a token records where it came from — so deleting the identity
+/// row alone would take the credential away and leave its issue working for
+/// another month: secret names, member addresses, deletes, revokes.
+#[tokio::test]
+async fn removing_a_link_ends_the_sessions_it_minted() {
+    let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
+
+    let started = server.start_as("link", Some(&alice.token)).await;
+    assert_eq!(link(&server, &started, "code-1", &alice.token, Some(&auth_hash)).await.status(), StatusCode::OK);
+
+    // The session the link can mint: this is the one that has to die.
+    stub.add_code("code-2", "sub", "mallory@gmail.example");
+    let started = server.start("sign_in").await;
+    let through_google = match server.callback(&started, "code-2").await.json::<OAuthCallbackResponse>().await.unwrap()
+    {
+        OAuthCallbackResponse::SignedIn(signed_in) => signed_in.token,
+        OAuthCallbackResponse::RegistrationRequired { .. } => panic!("the link should sign in"),
+    };
+    assert_eq!(server.get_as("/me", &through_google).await.status(), StatusCode::OK);
+
+    let removed = unlink(&server, &alice.token, &auth_hash).await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let after: SessionResponse = removed.json().await.unwrap();
+
+    assert_eq!(
+        server.get_as("/me", &through_google).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "a session the removed link minted is still working"
+    );
+    // The session that asked for the removal goes too, and is replaced, the
+    // same way a passphrase change replaces it.
+    assert_eq!(server.get_as("/me", &alice.token).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(server.get_as("/me", &after.token).await.status(), StatusCode::OK);
+}
+
+/// Changing the passphrase deliberately leaves a linked Google account where
+/// it is.
+///
+/// This is a decision, not an oversight, so it is pinned: silently removing
+/// someone's second sign-in method every time they rotate a passphrase trades
+/// one surprise for another, and with linking now gated on the passphrase the
+/// only person who can create a link is someone who already knows it. The
+/// remedy for an unwanted link is `/oauth/unlink`, which is explicit about
+/// what it does.
+#[tokio::test]
+async fn changing_the_passphrase_leaves_a_linked_google_account_alone() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
+
+    let started = server.start_as("link", Some(&alice.token)).await;
+    assert_eq!(link(&server, &started, "code-1", &alice.token, Some(&auth_hash)).await.status(), StatusCode::OK);
+
+    let old = MasterKey::derive(SESSION_PASSPHRASE, "alice@example.com").unwrap();
+    let new = MasterKey::derive("a different passphrase entirely", "alice@example.com").unwrap();
+    let identity =
+        Identity::decrypt_private_key(&old.private_key_encryption_key(), &alice.user.encrypted_private_key).unwrap();
+    let body = ChangePasswordRequest {
+        current_auth_hash: Some(old.auth_hash(&server.address)),
+        new_auth_hash: Some(new.auth_hash(&server.address)),
+        encrypted_private_key: identity.encrypt_private_key(&new.private_key_encryption_key()),
+        rewrapped_keys: Vec::new(),
+    };
+    let response = server
+        .client
+        .post(format!("{}/password", server.base))
+        .bearer_auth(&alice.token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{}", response.text().await.unwrap());
+    let rotated: SessionResponse = response.json().await.unwrap();
+    assert_eq!(
+        rotated.user.google_email.as_deref(),
+        Some("kat@gmail.example"),
+        "a passphrase change must not quietly remove a sign-in method"
+    );
+
+    // And it still signs in, which is the part that actually matters.
+    stub.add_code("code-2", "sub", "kat@gmail.example");
+    let started = server.start("sign_in").await;
+    match server.callback(&started, "code-2").await.json::<OAuthCallbackResponse>().await.unwrap() {
+        OAuthCallbackResponse::SignedIn(signed_in) => assert_eq!(signed_in.user.id, alice.user.id),
+        OAuthCallbackResponse::RegistrationRequired { .. } => panic!("the link did not survive the rotation"),
+    }
+}
+
+/// Unlinking draws on its own budget, not the one the passphrase routes share.
+///
+/// Unlinking verifies a passphrase, so putting it on `password_limiter` with
+/// `change_password` and `oauth_link` looks right and is not: `/password`
+/// spends a token before it does any work at all, so traffic on those routes
+/// would decide whether this one answers.
+///
+/// Separation is all this proves. It does not make unlinking unstarvable —
+/// nothing keyed by account can be, against someone holding a session for that
+/// account, who can empty this bucket from `/oauth/unlink` itself. The
+/// eviction path that does not depend on a budget is the one in
+/// `signing_out_everywhere_answers_when_every_account_budget_is_empty`.
+#[tokio::test]
+async fn the_unlink_budget_is_not_the_passphrase_budget() {
+    let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
+
+    let started = server.start_as("link", Some(&alice.token)).await;
+    assert_eq!(link(&server, &started, "code-1", &alice.token, Some(&auth_hash)).await.status(), StatusCode::OK);
+
+    // Empty the shared budget. Each of these is refused for its own reason,
+    // and each costs a token before the refusal — which is the whole point.
+    let mut starved = false;
+    for _ in 0..RateLimits::default().password_burst + 1 {
+        let response = server
+            .client
+            .post(format!("{}/password", server.base))
+            .bearer_auth(&alice.token)
+            .json(&serde_json::json!({
+                "current_auth_hash": "not a credential",
+                "new_auth_hash": "not a credential either",
+                "encrypted_private_key": alice.user.encrypted_private_key,
+                "rewrapped_keys": [],
+            }))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            starved = true;
+            break;
+        }
+    }
+    assert!(starved, "the passphrase budget should run out within its burst");
+
+    // The remedy still works on its own budget.
+    let removed = unlink(&server, &alice.token, &auth_hash).await;
+    assert_eq!(removed.status(), StatusCode::OK, "{}", removed.text().await.unwrap());
+    assert_eq!(removed.json::<SessionResponse>().await.unwrap().user.google_email, None);
+}
+
+/// The eviction route answers while the other budgets are empty, and leaves
+/// the caller able to use what it bought.
+///
+/// This is what makes the F-13 remedy reachable. Whoever holds a session for
+/// an account can empty any budget keyed to that account simply by spending
+/// it — including the one in front of `/oauth/unlink`, with a malformed proof,
+/// for the cost of one request a minute. So the first move against them cannot
+/// be rationed that way, and `DELETE /sessions` is not.
+///
+/// Ending their session is no use if it ends the owner's with it: they would
+/// go back through a sign-in while the unlink bucket is still at zero, and the
+/// evicted party only has to re-enter and keep spending. So the route hands
+/// back a token.
+///
+/// What is pinned here is that behaviour while the other budgets are empty.
+/// It does not pin that `DELETE /sessions` has no budget of its own — it sends
+/// that route a single request, so a limiter added tomorrow would not fail it.
+#[tokio::test]
+async fn the_eviction_route_answers_and_keeps_the_caller_signed_in() {
+    let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
+    let limits = RateLimits::default();
+
+    // Empty the passphrase budget, then the unlink budget, both the way
+    // someone holding this session would: cheap requests that are refused
+    // after the token is taken.
+    for _ in 0..limits.password_burst {
+        server
+            .client
+            .post(format!("{}/password", server.base))
+            .bearer_auth(&alice.token)
+            .json(&serde_json::json!({
+                "current_auth_hash": "not a credential",
+                "new_auth_hash": "not a credential either",
+                "encrypted_private_key": alice.user.encrypted_private_key,
+                "rewrapped_keys": [],
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+    for _ in 0..limits.unlink_burst {
+        unlink(&server, &alice.token, "not a credential").await;
+    }
+    assert_eq!(
+        unlink(&server, &alice.token, "not a credential").await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the unlink budget should be empty by now"
+    );
+
+    // The one route that still answers, and it keeps the caller signed in.
+    let response =
+        server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&alice.token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{}", response.text().await.unwrap());
+    let kept: SessionResponse = response.json().await.unwrap();
+    assert_eq!(server.get_as("/me", &alice.token).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(server.get_as("/me", &kept.token).await.status(), StatusCode::OK);
+
+    // Keeping the session is the point. The unlink bucket is still empty, so
+    // without a token in hand the owner would be sitting through a sign-in
+    // while it refills at one token a minute and the evicted party re-enters.
+    assert_eq!(unlink(&server, &kept.token, &auth_hash).await.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// An account created through Google cannot link a second identity, and is
+/// told so before anything is spent.
+///
+/// Today the unique index on `(provider, user_id)` would refuse the insert
+/// anyway, so this looks like belt and braces. It is not: the gate that makes
+/// a session insufficient is the passphrase check, and an account with no
+/// password login has no passphrase to check. Without this the route would
+/// fall through to Google on a session alone, and the safety of it would rest
+/// on a schema invariant in another file — one that a second provider would
+/// quietly remove.
+#[tokio::test]
+async fn a_google_only_account_cannot_link_on_a_session_alone() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let (session, _) = sign_up(&server, "code-1", "a long enough passphrase", None).await;
+    let exchanges_before = stub.exchanges().len();
+
+    stub.add_code("code-2", "other-sub", "kat.work@gmail.example");
+    let started = server.start_as("link", Some(&session.token)).await;
+    let refused = link(&server, &started, "code-2", &session.token, None).await;
+
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("already signs in with Google"));
+    assert_eq!(stub.exchanges().len(), exchanges_before, "a refused link must not reach the provider");
+}
+
+/// A proof of the wrong shape is refused as a bad request, and never becomes
+/// an Argon2 verify or a trip to Google.
+#[tokio::test]
+async fn a_malformed_passphrase_proof_is_refused_on_both_routes() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    // Long enough to be past any length floor, and not a credential shape.
+    let malformed = "x".repeat(4096);
+
+    let started = server.start_as("link", Some(&alice.token)).await;
+    let refused = link(&server, &started, "code-1", &alice.token, Some(&malformed)).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    // Named, so this keeps testing the credential check rather than passing
+    // because some length or body-size cap rejected it earlier.
+    assert!(refused.text().await.unwrap().contains("auth hash"));
+    assert_eq!(stub.exchanges().len(), 0, "a malformed proof must not reach the provider");
+
+    let refused = unlink(&server, &alice.token, &malformed).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("auth hash"));
+    // Nothing was consumed: the attempt still finishes with the real proof.
+    let proof = session_auth_hash(&server, "alice@example.com");
+    let good = link(&server, &started, "code-1", &alice.token, Some(&proof)).await;
+    assert_eq!(good.status(), StatusCode::OK, "{}", good.text().await.unwrap());
+}
+
+/// An account created through Google has no password login, so its link is the
+/// only thing that opens it. Removing that would leave an account nobody can
+/// sign into and nothing can recover, because the server holds no plaintext.
+#[tokio::test]
+async fn a_google_only_account_cannot_remove_its_only_way_in() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let (session, email) = sign_up(&server, "code-1", "a long enough passphrase", None).await;
+
+    let presented = MasterKey::derive("a long enough passphrase", &email).unwrap().auth_hash(&server.address);
+    let refused = unlink(&server, &session.token, &presented).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("no way to sign in"));
+
+    // Still signs in afterwards.
+    let started = server.start("sign_in").await;
+    let response = server.callback(&started, "code-1").await;
+    assert!(matches!(response.json::<OAuthCallbackResponse>().await.unwrap(), OAuthCallbackResponse::SignedIn(_)));
 }

@@ -568,8 +568,59 @@ async fn expired_sessions_are_rejected_and_pruned() {
     assert_eq!(count, 1);
 }
 
+/// Ending other sessions is throttled per address, because handing the caller
+/// a replacement took away the throttle it used to have.
+///
+/// Before the replacement, the first call killed the caller's token, so a
+/// flood had to go back through `/login` for every iteration. Now it costs the
+/// caller nothing, and each call takes SQLite's single write lock three times
+/// — the purge, the insert, and the expiry housekeeping — which on a
+/// single-writer database is a usable denial of service against every other
+/// write.
+///
+/// Per address and never per account: the party this route exists to evict
+/// holds a session for the victim's account, so an account bucket would let
+/// them block their own eviction.
+///
+/// What this pins is that the route is throttled at all, which is the thing
+/// the replacement token took away. It cannot see *which* bucket: every
+/// request here comes from 127.0.0.1, so swapping the layer for a per-account
+/// budget would leave it passing. That buckets are keyed by address and
+/// independent of each other is pinned a layer down, in
+/// `ratelimit::tests::burst_then_refill`.
 #[tokio::test]
-async fn logout_invalidates_only_that_token_and_logout_everywhere_all() {
+async fn ending_other_sessions_is_rate_limited_per_address() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "alice-password").await;
+
+    // Each call answers with a fresh token, so the flood can keep going; that
+    // is exactly why the bucket is needed.
+    let mut token = alice.token.clone();
+    let mut statuses = Vec::new();
+    for _ in 0..11 {
+        let response =
+            server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&token).send().await.unwrap();
+        let status = response.status();
+        statuses.push(status);
+        if status == StatusCode::OK {
+            token = response.json::<SessionResponse>().await.unwrap().token;
+        }
+    }
+    // Not pinned at index 10: the refill is six seconds of wall clock and this
+    // suite runs in parallel against a single-writer database, contending for
+    // the very lock this route takes three times a call. That one of eleven is
+    // refused carries the whole meaning without the flake.
+    assert!(statuses.contains(&StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
+
+    let response = server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("retry-after").is_some(), "a throttled caller is told how long to wait");
+}
+
+/// `/logout` ends one session; `DELETE /sessions` ends the others and replaces
+/// the caller's, so the person who asked can carry straight on.
+#[tokio::test]
+async fn logout_invalidates_one_token_and_sessions_delete_spares_the_caller() {
     let server = spawn().await;
     let alice = register(&server, "alice@example.com", "alice-password").await;
     let master = MasterKey::derive("alice-password", "alice@example.com").unwrap();
@@ -586,9 +637,15 @@ async fn logout_invalidates_only_that_token_and_logout_everywhere_all() {
         login(&server, "alice@example.com", master.auth_hash(&server.address)).await.json().await.unwrap();
     let alice_third = with_token(&alice, third.token);
     let response = server.req(Method::DELETE, "/sessions", &alice_second).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK, "{}", response.text().await.unwrap());
+    let replacement: SessionResponse = response.json().await.unwrap();
+    // The token used to ask is gone with the rest; the one handed back is not.
+    // The caller keeps a way in so the request that takes away whatever let
+    // the other sessions exist can follow immediately.
     assert_eq!(server.req(Method::GET, "/me", &alice_second).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     assert_eq!(server.req(Method::GET, "/me", &alice_third).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let kept = with_token(&alice, replacement.token);
+    assert_eq!(server.req(Method::GET, "/me", &kept).send().await.unwrap().status(), StatusCode::OK);
 }
 
 /// The same user with a different session token. The identity is unused by

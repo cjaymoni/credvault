@@ -62,16 +62,46 @@ const REDACTED: &str = "<redacted>";
 /// whose meaning moved, an endpoint whose contract changed, a response an
 /// older client would misread. A field that older peers can ignore safely is
 /// additive and needs no bump.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 is this branch and has not been released — no tag, and `main` serves 1 —
+/// so the three contract changes below are one version rather than three.
+/// Once a build serving 2 reaches anyone, the next change is a 3.
+///
+/// 2: `/oauth/link` gained a required `current_auth_hash` and now answers with
+/// a profile where it answered `204`; `/oauth/unlink` is new and answers with
+/// a fresh session, because removing a link ends every session the link could
+/// have minted; `DELETE /sessions` answers with a fresh session too, and now
+/// spares the caller's rather than ending it, so the request that evicts
+/// someone can be followed immediately by the one that locks them out.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest server protocol a client built from this source will talk to.
-pub const MIN_SERVER_PROTOCOL: u32 = 1;
+///
+/// 2, because a protocol-1 server answers the link request *successfully* and
+/// this client cannot tell. The old handler takes the callback fields and
+/// ignores the `current_auth_hash` it does not know about, writes the identity
+/// row, and answers `204`; the client then fails to read a profile out of an
+/// empty body and reports that linking failed. The link exists, the account
+/// holder believes it does not, that server returns no `google_email` so
+/// nothing displays it, and it has no `/oauth/unlink` to remove it with —
+/// which is the invisible, unremovable, standalone credential F-13 exists to
+/// prevent, reached by nothing worse than updating the app before the server.
+///
+/// Refusing at `check_protocol` says so before any credential is sent, which
+/// is what that path is for.
+pub const MIN_SERVER_PROTOCOL: u32 = 2;
 
 /// The oldest client protocol a server built from this source still serves.
 ///
 /// Raising this locks out installed clients, so it moves only when serving
-/// them would be wrong rather than merely inconvenient.
+/// them would be wrong rather than merely inconvenient. Still 1: a protocol-1
+/// client is refused when it tries to link, and works for everything else.
 pub const MIN_CLIENT_PROTOCOL: u32 = 1;
+
+// A build where either minimum has overtaken the version it was raised
+// alongside is a build that refuses its own counterpart from the same tree.
+const _: () = assert!(MIN_SERVER_PROTOCOL <= PROTOCOL_VERSION, "this client could not talk to its own server");
+const _: () = assert!(MIN_CLIENT_PROTOCOL <= PROTOCOL_VERSION, "this server would refuse its own client");
 
 /// The body of `GET /health`.
 ///
@@ -186,6 +216,14 @@ pub struct UserProfile {
     /// whether a passphrase change should also change the login.
     #[serde(default = "yes")]
     pub password_login: bool,
+    /// The Google address linked to this account, if there is one.
+    ///
+    /// Carried so a link can be seen and removed. A sign-in credential that
+    /// nothing displays is one the account holder cannot notice has been
+    /// added, and this one outlives both a passphrase change and a
+    /// sign-out-everywhere.
+    #[serde(default)]
+    pub google_email: Option<String>,
 }
 
 fn yes() -> bool {
@@ -419,6 +457,70 @@ impl fmt::Debug for OAuthCallbackRequest {
     }
 }
 
+/// Finishing a link: the callback, plus proof of the account passphrase.
+///
+/// The proof is what separates this from every other authenticated call. A
+/// link is a second, standalone way into the account, so a session alone must
+/// not be enough to create one — for the same reason a session alone cannot
+/// change the passphrase. See [`ChangePasswordRequest::current_auth_hash`].
+///
+/// The callback's three fields are spelled out here rather than flattened in
+/// from [`OAuthCallbackRequest`]. `#[serde(flatten)]` deserializes through
+/// serde's buffering path, which collects every field it did not match by
+/// name into a plain `String` first — so `app_secret` and `code` would each
+/// get an un-zeroized heap copy on the way in, on the one route that also
+/// carries a passphrase proof. The JSON on the wire is identical either way.
+#[derive(Serialize, Deserialize)]
+pub struct OAuthLinkRequest {
+    pub state: String,
+    /// The `app_secret` from [`OAuthStartResponse`].
+    pub app_secret: Zeroizing<String>,
+    /// Single-use, but still a credential until it is spent.
+    pub code: Zeroizing<String>,
+    /// Proof of the current passphrase, for an account that signs in with a
+    /// password. A Google account has no password login and so nothing the
+    /// server can check, and this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_auth_hash: Option<Zeroizing<String>>,
+}
+
+impl OAuthLinkRequest {
+    /// Finish a link begun by [`OAuthStartRequest`], proving the passphrase.
+    pub fn new(callback: OAuthCallbackRequest, current_auth_hash: Option<Zeroizing<String>>) -> Self {
+        let OAuthCallbackRequest { state, app_secret, code } = callback;
+        Self { state, app_secret, code, current_auth_hash }
+    }
+
+    /// The callback half, for the code path that redeems it.
+    pub fn callback(&self) -> OAuthCallbackRequest {
+        OAuthCallbackRequest { state: self.state.clone(), app_secret: self.app_secret.clone(), code: self.code.clone() }
+    }
+}
+
+impl fmt::Debug for OAuthLinkRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthLinkRequest")
+            .field("state", &self.state)
+            .field("app_secret", &REDACTED)
+            .field("code", &REDACTED)
+            .field("current_auth_hash", &self.current_auth_hash.as_ref().map(|_| REDACTED))
+            .finish()
+    }
+}
+
+/// Removing a link. Proof of the passphrase is required here too: removing a
+/// credential is as much a credential change as adding one.
+#[derive(Serialize, Deserialize)]
+pub struct OAuthUnlinkRequest {
+    pub current_auth_hash: Zeroizing<String>,
+}
+
+impl fmt::Debug for OAuthUnlinkRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthUnlinkRequest").field("current_auth_hash", &REDACTED).finish()
+    }
+}
+
 /// Either the identity is already bound to an account, or it is not and the
 /// client has to create one. The server cannot create it alone: an account
 /// needs a key pair that only a client holding a passphrase can produce.
@@ -602,10 +704,30 @@ mod tests {
         assert!(error.to_string().contains("too old"), "{error}");
     }
 
+    /// A tripwire, not a tautology.
+    ///
+    /// Every endpoint contract this version describes is written down on
+    /// `PROTOCOL_VERSION` itself. Changing one without moving the constant is
+    /// the mistake that ships a server older clients silently misread, and it
+    /// has happened once already. Failing here makes the bump a deliberate
+    /// two-line edit rather than something to remember.
+    #[test]
+    fn the_protocol_numbers_are_what_this_source_documents() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(MIN_SERVER_PROTOCOL, 2);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 1);
+    }
+
     #[test]
     fn health_does_not_report_the_build_version() {
+        // Spelled out from the constants rather than hardcoded: the point of
+        // this test is which fields are on the wire, and it should not need
+        // editing every time one of the numbers moves.
         let json = serde_json::to_string(&Health::current()).unwrap();
-        assert_eq!(json, r#"{"status":"ok","protocol":1,"min_client_protocol":1}"#);
+        assert_eq!(
+            json,
+            format!(r#"{{"status":"ok","protocol":{PROTOCOL_VERSION},"min_client_protocol":{MIN_CLIENT_PROTOCOL}}}"#)
+        );
     }
 
     #[test]

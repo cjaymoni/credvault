@@ -21,6 +21,11 @@ pub enum ClientError {
     Conflict(String),
     #[error("your session has expired; please log in again")]
     Unauthorized,
+    /// 429: throttled by the server, which rejects in middleware before the
+    /// handler runs. A caller can therefore be certain nothing happened, which
+    /// is the whole reason this is not folded into [`ClientError::Server`].
+    #[error("{message}")]
+    TooManyRequests { message: String, retry_after_secs: Option<u64> },
     #[error("invalid server URL: {0}")]
     InvalidUrl(String),
     /// This build and the server do not speak the same protocol. Reported
@@ -106,8 +111,17 @@ impl ApiClient {
         if status == StatusCode::UNAUTHORIZED && self.token.is_some() {
             return Err(ClientError::Unauthorized);
         }
+        // Read before the body is consumed below.
+        let retry_after_secs = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
         let message =
             response.json::<ErrorBody>().await.map(|b| b.error).unwrap_or_else(|_| format!("server returned {status}"));
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ClientError::TooManyRequests { message, retry_after_secs });
+        }
         if status == StatusCode::CONFLICT {
             return Err(ClientError::Conflict(message));
         }
@@ -172,6 +186,20 @@ impl ApiClient {
         self.send(Method::POST, "/logout", Self::NO_BODY).await
     }
 
+    /// End every session for this account except this one, which comes back
+    /// replaced.
+    ///
+    /// The one eviction route with no budget of any kind, which is what makes
+    /// it the first move against someone who holds a session they should not.
+    /// Anything rationed per account can be emptied by whoever holds a session
+    /// for that account; this cannot, so it still answers when the rest are
+    /// refusing. The caller keeps a token so the request that takes away what
+    /// let the other party in can follow immediately. Install it or this
+    /// device is signed out along with the rest.
+    pub async fn logout_other_devices(&self) -> Result<SessionResponse, ClientError> {
+        self.send(Method::DELETE, "/sessions", Self::NO_BODY).await
+    }
+
     /// What this server offers, so the UI knows whether to show the Google
     /// button and whether to ask for a registration token.
     pub async fn capabilities(&self) -> Result<Capabilities, ClientError> {
@@ -191,8 +219,17 @@ impl ApiClient {
     }
 
     /// Bind a Google identity to the account this client is signed in as.
-    pub async fn oauth_link(&self, body: &OAuthCallbackRequest) -> Result<(), ClientError> {
+    pub async fn oauth_link(&self, body: &OAuthLinkRequest) -> Result<UserProfile, ClientError> {
         self.send(Method::POST, "/oauth/link", Some(body)).await
+    }
+
+    /// Remove the Google identity bound to this account.
+    ///
+    /// Answers with a session because the server ends every existing one:
+    /// tokens the link could have minted must not outlive it. The caller has
+    /// to install the new token or it is signed out along with them.
+    pub async fn oauth_unlink(&self, body: &OAuthUnlinkRequest) -> Result<SessionResponse, ClientError> {
+        self.send(Method::POST, "/oauth/unlink", Some(body)).await
     }
 
     /// The fingerprint is part of the query: the server only answers for a

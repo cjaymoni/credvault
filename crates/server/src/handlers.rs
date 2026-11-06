@@ -1326,43 +1326,31 @@ pub async fn oauth_register(
 /// stolen session does not carry. This is the rule `change_password` already
 /// applies, for the same reason.
 ///
-/// Returns whether the account signs in with a password. One that does not has
-/// no passphrase the server can check, and must not present one.
+/// The caller has already established that this account signs in with a
+/// password. One that does not has no passphrase the server could check, and
+/// is refused by each caller with a message of its own before this is reached.
 ///
 /// # Errors
 /// [`ApiError::Unauthorized`] if the passphrase is wrong;
-/// [`ApiError::BadRequest`] if it is missing, malformed, or supplied for an
-/// account that has no password login.
-async fn verify_account_passphrase(
-    pool: &SqlitePool,
-    user_id: i64,
-    presented: Option<&Zeroizing<String>>,
-) -> ApiResult<bool> {
-    let (stored_credential, password_login): (String, bool) =
-        sqlx::query_as("SELECT auth_hash, password_login FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_one(pool)
-            .await?;
-
-    if !password_login {
-        if presented.is_some() {
-            return Err(ApiError::BadRequest(
-                "this account signs in with Google, so it has no passphrase for the server to check".into(),
-            ));
-        }
-        return Ok(false);
-    }
-
-    let presented = presented.ok_or_else(|| ApiError::BadRequest("the current passphrase is required".into()))?;
-    validate_auth_hash(presented)?;
-    let presented = presented.clone();
+/// [`ApiError::BadRequest`] if it is malformed.
+async fn verify_account_passphrase(stored_credential: String, presented: Zeroizing<String>) -> ApiResult<()> {
+    validate_auth_hash(&presented)?;
     let verified = tokio::task::spawn_blocking(move || auth::verify_credential(&presented, &stored_credential))
         .await
         .map_err(ApiError::internal)?;
     if !verified {
         return Err(ApiError::Unauthorized);
     }
-    Ok(true)
+    Ok(())
+}
+
+/// The stored credential and whether a passphrase is what opens this account.
+///
+/// One indexed lookup for both, because every caller of
+/// [`verify_account_passphrase`] needs to know the second before it can decide
+/// whether to ask the first.
+async fn load_credential(pool: &SqlitePool, user_id: i64) -> ApiResult<(String, bool)> {
+    Ok(sqlx::query_as("SELECT auth_hash, password_login FROM users WHERE id = ?").bind(user_id).fetch_one(pool).await?)
 }
 
 /// Bind a Google identity to the account already signed in, so that account
@@ -1377,15 +1365,37 @@ pub async fn oauth_link(
     ApiJson(body): ApiJson<OAuthLinkRequest>,
 ) -> ApiResult<Json<UserProfile>> {
     spend_account_budget(&state.link_limiter, user.id, "google link")?;
-    // Before the attempt is spent and before Google is called: a caller who
-    // cannot prove the passphrase has no business doing either.
-    verify_account_passphrase(&state.pool, user.id, body.current_auth_hash.as_ref()).await?;
+    // The verify below is the same Argon2 work a login does, so it comes out
+    // of the budget that bounds passphrase guessing rather than only out of
+    // the one that bounds how often this account may make the server call
+    // Google. Otherwise linking would quietly widen the guess rate.
+    spend_account_budget(&state.password_limiter, user.id, "google link passphrase")?;
+
+    // Both checks happen before the attempt is spent and before Google is
+    // called: a caller who cannot prove the passphrase has no business doing
+    // either. An account with no password login is refused outright rather
+    // than waved through — today its one identity row is all its unique index
+    // allows, so the insert below would fail anyway, but that is a schema
+    // invariant in another file and not something this route should rest on.
+    let (stored_credential, password_login) = load_credential(&state.pool, user.id).await?;
+    if !password_login {
+        return Err(ApiError::BadRequest("this account already signs in with Google".into()));
+    }
+    let presented = body.current_auth_hash.clone().ok_or_else(|| {
+        ApiError::BadRequest(
+            "the current passphrase is required to link a Google account; if this app never asked for it, it is \
+             older than this server and needs updating"
+                .into(),
+        )
+    })?;
+    verify_account_passphrase(stored_credential, presented).await?;
+
     // The caller's id is part of what selects the attempt, so a link can only
     // be finished by the session that began it. Without that, any
     // authenticated caller holding a valid link state and secret could bind
     // that identity to their own account instead.
     let (identity, _) =
-        verified_identity_from_callback(&state, &body.callback, OAuthPurpose::Link, Some(user.id)).await?;
+        verified_identity_from_callback(&state, &body.callback(), OAuthPurpose::Link, Some(user.id)).await?;
 
     let linked = sqlx::query(
         "INSERT INTO oauth_identities (provider, subject, user_id, email, linked_at) VALUES (?, ?, ?, ?, ?)",
@@ -1412,45 +1422,61 @@ pub async fn oauth_link(
 /// Remove the Google identity bound to the account, so it can no longer be
 /// used to sign in.
 ///
+/// Every session is ended with it, and the caller is handed a fresh one. A
+/// link that should not have been there has had up to a session lifetime to
+/// mint tokens, and those tokens do not mention where they came from; deleting
+/// the row alone would leave the credential removed and its issue still
+/// working for another month. This is the same reasoning, and the same
+/// transaction shape, as [`change_password`].
+///
 /// Refused for an account created through Google: that identity is its only
 /// credential, and removing it would leave an account with nothing that can
 /// open it and no way to recover, since the server holds no plaintext.
 ///
 /// # Errors
 /// [`ApiError::Unauthorized`] if the passphrase is wrong;
-/// [`ApiError::BadRequest`] if this account signs in with Google only;
+/// [`ApiError::BadRequest`] if this account signs in with Google only, or the
+/// passphrase proof is malformed;
 /// [`ApiError::NotFound`] if nothing is linked.
 pub async fn oauth_unlink(
     State(state): State<AppState>,
     user: AuthUser,
     ApiJson(body): ApiJson<OAuthUnlinkRequest>,
-) -> ApiResult<Json<UserProfile>> {
+) -> ApiResult<Json<SessionResponse>> {
     // The Argon2 verify below is the cost worth bounding, and it is the same
     // cost a passphrase change pays, so it comes out of the same budget.
     spend_account_budget(&state.password_limiter, user.id, "google unlink")?;
-    // Asked before the passphrase is checked, so a Google-only account is told
+    // Read before the passphrase is checked, so a Google-only account is told
     // why it cannot unlink rather than that it supplied a passphrase it has no
-    // business having. One indexed lookup, and it saves an Argon2 verify on a
-    // request that cannot succeed.
-    let (password_login,): (bool,) =
-        sqlx::query_as("SELECT password_login FROM users WHERE id = ?").bind(user.id).fetch_one(&state.pool).await?;
+    // business having. It also saves an Argon2 verify on a request that cannot
+    // succeed.
+    let (stored_credential, password_login) = load_credential(&state.pool, user.id).await?;
     if !password_login {
         return Err(ApiError::BadRequest(
             "this account signs in with Google only; removing the link would leave no way to sign in".into(),
         ));
     }
-    verify_account_passphrase(&state.pool, user.id, Some(&body.current_auth_hash)).await?;
+    verify_account_passphrase(stored_credential, body.current_auth_hash.clone()).await?;
 
+    let mut tx = state.pool.begin().await?;
     let removed = sqlx::query("DELETE FROM oauth_identities WHERE user_id = ? AND provider = ?")
         .bind(user.id)
         .bind(oauth::PROVIDER_GOOGLE)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     if removed == 0 {
         return Err(ApiError::NotFound("no Google account is linked to this account".into()));
     }
-    Ok(Json(load_profile(&state.pool, user.id).await?))
+    // In the same transaction as the delete: a crash between the two would
+    // otherwise leave the sessions the link minted alive with nothing left to
+    // explain where they came from.
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    let token = issue_session(&state.pool, user.id).await?;
+    let profile = load_profile(&state.pool, user.id).await?;
+    Ok(Json(SessionResponse { token, user: profile }))
 }
 
 #[cfg(test)]

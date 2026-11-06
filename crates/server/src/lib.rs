@@ -186,9 +186,10 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     let oauth_callback_limit = limit_for(limits.login_burst, limits.login_refill);
     let oauth_register_limit = limit_for(limits.register_burst, limits.register_refill);
     // An address bucket in front of the link route, to absorb floods before a
-    // session is even resolved. The ceiling that actually bounds what one
-    // account can make the server fetch from Google is per-user and lives in
-    // the handler; see `AppState::link_limiter`.
+    // session is even resolved. The ceilings that actually bound one account
+    // are per-user and live in the handler: `AppState::link_limiter` for how
+    // often it may make the server fetch from Google, and `password_limiter`
+    // for the passphrase verify, shared with logging in and changing it.
     let oauth_link_limit = limit_for(limits.login_burst, limits.login_refill);
     // Removing a link verifies a passphrase, which is the same work a login
     // does, so it gets an address bucket of the same shape. The per-account

@@ -620,22 +620,37 @@ const GOOGLE_AUTHORIZATION_HOST: &str = "accounts.google.com";
 /// choosing too: `file://host/share/x` on Windows is a UNC path that
 /// authenticates outward to whoever answers.
 ///
-/// Scheme and host are what matter. The query carries `state`, `nonce` and the
-/// PKCE challenge, which are the server's to choose and are checked when the
-/// callback comes back.
+/// Scheme, host and port are what matter. The query carries `state`, `nonce`
+/// and the PKCE challenge, which are the server's to choose and are checked
+/// when the callback comes back.
 ///
 /// # Errors
-/// `oauth` if the URL does not parse, is not `https`, or is not Google's
-/// authorization host.
+/// `oauth` if the URL does not parse, is not `https`, names a port, or is not
+/// Google's authorization host.
 fn check_authorization_url(url: &str) -> CommandResult<()> {
     let parsed = url::Url::parse(url)
         .map_err(|e| CommandError::new("oauth", format!("the server sent a sign-in address that is not a URL: {e}")))?;
-    let host = parsed.host_str().unwrap_or_default();
-    if parsed.scheme() != "https" || !host.eq_ignore_ascii_case(GOOGLE_AUTHORIZATION_HOST) {
+    // Google's sign-in page is on the default port. Nothing is gained by
+    // allowing another, and `accounts.google.com:8443` in a warning is worth
+    // naming rather than passing over.
+    let is_googles_page = parsed.scheme() == "https"
+        && parsed.port().is_none()
+        && parsed.host_str().is_some_and(|host| host.eq_ignore_ascii_case(GOOGLE_AUTHORIZATION_HOST));
+    if !is_googles_page {
+        // `javascript:` and `mailto:` have no host at all, and a sentence with
+        // a hole where the destination should be is the last thing this
+        // particular warning can afford.
+        let destination = match parsed.host_str() {
+            Some(host) => match parsed.port() {
+                Some(port) => format!("{host} on port {port}"),
+                None => host.to_string(),
+            },
+            None => format!("a {} address naming no host", parsed.scheme()),
+        };
         return Err(CommandError::new(
             "oauth",
             format!(
-                "this server tried to send you to {host} to sign in, not to {GOOGLE_AUTHORIZATION_HOST}. \
+                "this server tried to send you to {destination} to sign in, not to {GOOGLE_AUTHORIZATION_HOST}. \
                  Nothing was opened. Do not trust this server with your Google password."
             ),
         ));
@@ -820,64 +835,151 @@ async fn google_link(
     state: State<'_, AppState>,
     current: Zeroizing<String>,
 ) -> CommandResult<UserSummary> {
-    let (api, email, server_url, password_login) = with_session(&state, |session| {
-        Ok((session.api.clone(), session.email.clone(), session.api.base_url().to_string(), session.password_login))
-    })?;
+    let password_login = with_session(&state, |session| Ok(session.password_login))?;
     if !password_login {
         return Err(CommandError::new("oauth", "this account already signs in with Google"));
     }
+    let api = api(&state)?;
     let capabilities = api.capabilities().await?;
     if !capabilities.google_sign_in {
         return Err(CommandError::new("oauth", "this server does not offer sign in with Google"));
     }
 
-    // Checked here before the browser is opened, so a typo costs one local
-    // comparison instead of a trip through Google that then fails.
-    let server = normalize_server_url(&server_url)?;
-    let master = derive_master(current, email).await?;
-    let matches_session: bool = with_session(&state, |session| {
-        Ok(master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref()).into())
-    })?;
-    if !matches_session {
-        return Err(CommandError::new("locked", "that is not your current passphrase"));
-    }
-
+    let proof = prove_current_passphrase(&state, current).await?;
     let callback = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
     let profile =
-        api.oauth_link(&OAuthLinkRequest { callback, current_auth_hash: Some(master.auth_hash(&server)) }).await?;
-    remember_google_email(&state, profile.google_email)
+        api.oauth_link(&OAuthLinkRequest::new(callback, Some(proof.auth_hash))).await.map_err(passphrase_rejected)?;
+    remember_google_email(&state, proof.user_id, profile.google_email)
 }
 
 /// Remove the linked Google account, so it can no longer sign in here.
+///
+/// The server ends every session as it goes, including this one, and answers
+/// with a replacement. Installing that replacement is what keeps this device
+/// signed in while every other is signed out.
 #[tauri::command]
 async fn google_unlink(state: State<'_, AppState>, current: Zeroizing<String>) -> CommandResult<UserSummary> {
-    let (api, email, server_url, password_login) = with_session(&state, |session| {
-        Ok((session.api.clone(), session.email.clone(), session.api.base_url().to_string(), session.password_login))
-    })?;
+    let password_login = with_session(&state, |session| Ok(session.password_login))?;
     if !password_login {
         return Err(CommandError::new(
             "oauth",
             "this account signs in with Google only; removing the link would leave no way to sign in",
         ));
     }
+    let api = api(&state)?;
+    let proof = prove_current_passphrase(&state, current).await?;
+    let signed_in = api
+        .oauth_unlink(&OAuthUnlinkRequest { current_auth_hash: proof.auth_hash })
+        .await
+        .map_err(passphrase_rejected)?;
+
+    with_session(&state, |session| {
+        if session.user_id != proof.user_id {
+            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
+        }
+        session.api = session.api.clone().with_token(&signed_in.token);
+        session.google_email = signed_in.user.google_email.clone();
+        Ok(summary_of(session))
+    })
+}
+
+/// Say what a `401` from the link routes actually means.
+///
+/// Everywhere else a `401` means the token is gone, and the client says so.
+/// On these two it cannot: the passphrase was already checked locally and
+/// passed, so reaching the server's own check at all means this session's wrap
+/// key is stale — the passphrase was changed on another device. Signing in
+/// again is still the fix, but "your session has expired" names the wrong
+/// cause for someone trying to work out what happened to their account.
+fn passphrase_rejected(error: ClientError) -> CommandError {
+    match error {
+        ClientError::Unauthorized => CommandError::new(
+            "locked",
+            "the server did not accept that passphrase. If you changed it on another device, \
+             sign out here and sign in with the new one.",
+        ),
+        other => other.into(),
+    }
+}
+
+/// A passphrase proved against the session that is open, and the account it
+/// was proved for.
+struct PassphraseProof {
+    /// Who the proof is for. Carried so a slow round trip cannot write its
+    /// answer onto whatever session happens to be open when it returns.
+    user_id: i64,
+    /// Bound to this server's address, so it is useless to any other.
+    auth_hash: Zeroizing<String>,
+    /// The key the passphrase derived. Handed back because deriving it is the
+    /// expensive part and a caller that re-wraps needs it; dropped unused by
+    /// the callers that only needed the proof.
+    master: MasterKey,
+}
+
+/// Derive the master key from `current` and check it opens the session that is
+/// already unlocked, returning the proof to send to the server.
+///
+/// The comparison is local and against the session's own wrap key, so a typo
+/// costs one Argon2 pass here instead of a round trip — and, for linking, a
+/// whole trip out through Google that then fails at the end.
+///
+/// # Errors
+/// `locked` if nothing is unlocked or the passphrase is not this session's.
+async fn prove_current_passphrase(state: &AppState, current: Zeroizing<String>) -> CommandResult<PassphraseProof> {
+    let (email, server_url, user_id) = with_session(state, |session| {
+        Ok((session.email.clone(), session.api.base_url().to_string(), session.user_id))
+    })?;
     let server = normalize_server_url(&server_url)?;
     let master = derive_master(current, email).await?;
-    let matches_session: bool = with_session(&state, |session| {
-        Ok(master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref()).into())
+    let matches_session: bool = with_session(state, |session| {
+        Ok(session.user_id == user_id
+            && bool::from(master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref())))
     })?;
     if !matches_session {
         return Err(CommandError::new("locked", "that is not your current passphrase"));
     }
-
-    let profile = api.oauth_unlink(&OAuthUnlinkRequest { current_auth_hash: master.auth_hash(&server) }).await?;
-    remember_google_email(&state, profile.google_email)
+    let auth_hash = master.auth_hash(&server);
+    Ok(PassphraseProof { user_id, auth_hash, master })
 }
 
 /// Record what the server now says is linked, and hand back the summary the
 /// UI redraws from.
-fn remember_google_email(state: &AppState, google_email: Option<String>) -> CommandResult<UserSummary> {
+///
+/// `user_id` is the account the answer was about. Linking blocks on a browser
+/// round trip of unbounded length, and the session can be replaced while it
+/// runs; without this check the first account's Google address could land on
+/// the second account's summary.
+fn remember_google_email(state: &AppState, user_id: i64, google_email: Option<String>) -> CommandResult<UserSummary> {
     with_session(state, |session| {
+        if session.user_id != user_id {
+            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
+        }
         session.google_email = google_email;
+        Ok(summary_of(session))
+    })
+}
+
+/// Re-read what the server says about this account and update what the
+/// session caches.
+///
+/// The Google address is the field worth re-reading: it can change from
+/// another device, and the account panel is where an unwanted link is supposed
+/// to become visible. Nothing secret is touched — this replaces facts the
+/// server already told us, not key material.
+///
+/// # Errors
+/// `locked` if nothing is unlocked or the session changed while this ran;
+/// whatever the client reports if the server cannot be reached.
+#[tauri::command]
+async fn refresh_account(state: State<'_, AppState>) -> CommandResult<UserSummary> {
+    let (api, user_id) = with_session(&state, |session| Ok((session.api.clone(), session.user_id)))?;
+    let profile = api.me().await?;
+    with_session(&state, |session| {
+        if session.user_id != user_id {
+            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
+        }
+        session.password_login = profile.password_login;
+        session.google_email = profile.google_email.clone();
         Ok(summary_of(session))
     })
 }
@@ -931,15 +1033,12 @@ async fn change_password(
     })?;
     let server = normalize_server_url(&server_url)?;
 
-    let old_master = derive_master(current, email.clone()).await?;
-    // Checked here rather than left to the server, so a typo costs one local
-    // comparison instead of a round trip that also re-wraps every key.
-    let matches_session: bool = with_session(&state, |session| {
-        Ok(old_master.self_wrap_key().as_ref().ct_eq(session.self_wrap_key.as_ref()).into())
-    })?;
-    if !matches_session {
-        return Err(CommandError::new("locked", "that is not your current passphrase"));
-    }
+    // Proved locally rather than left to the server, so a typo costs one
+    // Argon2 pass instead of a round trip that also re-wraps every key. The
+    // derived key comes back with the proof: re-wrapping needs it, and
+    // deriving it twice would double the one slow step on this path.
+    let PassphraseProof { user_id, auth_hash: current_auth_hash, master: old_master } =
+        prove_current_passphrase(&state, current).await?;
     let new_master = derive_master(new_password, email).await?;
 
     // Keys without payloads: re-wrapping never looks at a payload, and at the
@@ -954,7 +1053,7 @@ async fn change_password(
     })?;
     let password_login = with_session(&state, |session| Ok(session.password_login))?;
     let request = ChangePasswordRequest {
-        current_auth_hash: password_login.then(|| old_master.auth_hash(&server)),
+        current_auth_hash: password_login.then_some(current_auth_hash),
         new_auth_hash: password_login.then(|| new_master.auth_hash(&server)),
         encrypted_private_key: identity_key,
         rewrapped_keys,
@@ -973,6 +1072,13 @@ async fn change_password(
     // new self-wrap key. Cached secret keys stay valid — they did not change —
     // but they are dropped rather than reasoned about.
     with_session(&state, |current| {
+        // This takes minutes on a large vault, long enough for the session to
+        // have been replaced underneath it. Writing a new wrap key onto some
+        // other account's session would lock that account out of its own
+        // secrets.
+        if current.user_id != user_id {
+            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
+        }
         current.api = api.with_token(&session.token);
         current.self_wrap_key = new_master.self_wrap_key();
         current.keys.clear();
@@ -1754,6 +1860,7 @@ pub fn run() {
             google_link,
             google_unlink,
             change_password,
+            refresh_account,
             session_info,
             startup_warnings,
             ui_constants,
@@ -1809,6 +1916,9 @@ mod tests {
             "file://attacker.example/share/payload.exe",
             "smb://attacker.example/share",
             "javascript:alert(1)",
+            "mailto:someone@attacker.example",
+            // The right host on a port Google's sign-in page is not on.
+            "https://accounts.google.com:8443/o/oauth2/v2/auth",
             // Not a URL.
             "",
             "not a url",
@@ -1816,6 +1926,23 @@ mod tests {
             let error = check_authorization_url(refused).expect_err("{refused} must be refused");
             assert_eq!(error.code, "oauth", "{refused}");
         }
+    }
+
+    /// The message is the whole product of this check: nothing is opened, so
+    /// all the user gets is the sentence. It has to name where the server
+    /// tried to send them, including for the schemes that have no host.
+    #[test]
+    fn the_refusal_names_where_the_server_tried_to_send_you() {
+        let host = check_authorization_url("https://accounts.google.com.attacker.example/x").unwrap_err();
+        assert!(host.message.contains("accounts.google.com.attacker.example"), "{}", host.message);
+
+        let port = check_authorization_url("https://accounts.google.com:8443/x").unwrap_err();
+        assert!(port.message.contains("port 8443"), "{}", port.message);
+
+        // No host at all: the sentence must not come out with a hole in it.
+        let hostless = check_authorization_url("javascript:alert(1)").unwrap_err();
+        assert!(hostless.message.contains("javascript"), "{}", hostless.message);
+        assert!(!hostless.message.contains("send you to  "), "{}", hostless.message);
     }
 
     #[test]

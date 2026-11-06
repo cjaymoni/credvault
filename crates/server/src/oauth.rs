@@ -535,6 +535,11 @@ mod tests {
         }
         assert_eq!(validation.algorithms, vec![Algorithm::RS256]);
         assert!(validation.validate_exp);
+        // Requiring `aud` to be present and checking what it says are two
+        // separate switches in jsonwebtoken: with this one off the claim is
+        // still demanded, and then any audience at all is accepted.
+        assert!(validation.validate_aud, "a required audience that is never compared is not a check");
+        assert_eq!(validation.leeway, CLOCK_SKEW_SECS);
     }
 
     #[test]

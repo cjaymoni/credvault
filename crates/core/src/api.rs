@@ -62,15 +62,25 @@ const REDACTED: &str = "<redacted>";
 /// whose meaning moved, an endpoint whose contract changed, a response an
 /// older client would misread. A field that older peers can ignore safely is
 /// additive and needs no bump.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2: `/oauth/link` gained a required `current_auth_hash` and now answers with
+/// a profile where it answered `204`; `/oauth/unlink` is new and answers with
+/// a fresh session, because removing a link ends every session the link could
+/// have minted.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest server protocol a client built from this source will talk to.
+///
+/// Still 1. A protocol-1 server has no `/oauth/unlink`, but it also returns no
+/// [`UserProfile::google_email`], so this client never offers to remove a link
+/// it cannot see. Everything else about a protocol-1 server is unchanged.
 pub const MIN_SERVER_PROTOCOL: u32 = 1;
 
 /// The oldest client protocol a server built from this source still serves.
 ///
 /// Raising this locks out installed clients, so it moves only when serving
-/// them would be wrong rather than merely inconvenient.
+/// them would be wrong rather than merely inconvenient. Still 1: a protocol-1
+/// client is refused when it tries to link, and works for everything else.
 pub const MIN_CLIENT_PROTOCOL: u32 = 1;
 
 /// The body of `GET /health`.
@@ -433,10 +443,20 @@ impl fmt::Debug for OAuthCallbackRequest {
 /// link is a second, standalone way into the account, so a session alone must
 /// not be enough to create one — for the same reason a session alone cannot
 /// change the passphrase. See [`ChangePasswordRequest::current_auth_hash`].
+///
+/// The callback's three fields are spelled out here rather than flattened in
+/// from [`OAuthCallbackRequest`]. `#[serde(flatten)]` deserializes through
+/// serde's buffering path, which collects every field it did not match by
+/// name into a plain `String` first — so `app_secret` and `code` would each
+/// get an un-zeroized heap copy on the way in, on the one route that also
+/// carries a passphrase proof. The JSON on the wire is identical either way.
 #[derive(Serialize, Deserialize)]
 pub struct OAuthLinkRequest {
-    #[serde(flatten)]
-    pub callback: OAuthCallbackRequest,
+    pub state: String,
+    /// The `app_secret` from [`OAuthStartResponse`].
+    pub app_secret: Zeroizing<String>,
+    /// Single-use, but still a credential until it is spent.
+    pub code: Zeroizing<String>,
     /// Proof of the current passphrase, for an account that signs in with a
     /// password. A Google account has no password login and so nothing the
     /// server can check, and this is absent.
@@ -444,10 +464,25 @@ pub struct OAuthLinkRequest {
     pub current_auth_hash: Option<Zeroizing<String>>,
 }
 
+impl OAuthLinkRequest {
+    /// Finish a link begun by [`OAuthStartRequest`], proving the passphrase.
+    pub fn new(callback: OAuthCallbackRequest, current_auth_hash: Option<Zeroizing<String>>) -> Self {
+        let OAuthCallbackRequest { state, app_secret, code } = callback;
+        Self { state, app_secret, code, current_auth_hash }
+    }
+
+    /// The callback half, for the code path that redeems it.
+    pub fn callback(&self) -> OAuthCallbackRequest {
+        OAuthCallbackRequest { state: self.state.clone(), app_secret: self.app_secret.clone(), code: self.code.clone() }
+    }
+}
+
 impl fmt::Debug for OAuthLinkRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OAuthLinkRequest")
-            .field("callback", &self.callback)
+            .field("state", &self.state)
+            .field("app_secret", &REDACTED)
+            .field("code", &REDACTED)
             .field("current_auth_hash", &self.current_auth_hash.as_ref().map(|_| REDACTED))
             .finish()
     }
@@ -651,8 +686,14 @@ mod tests {
 
     #[test]
     fn health_does_not_report_the_build_version() {
+        // Spelled out from the constants rather than hardcoded: the point of
+        // this test is which fields are on the wire, and it should not need
+        // editing every time one of the numbers moves.
         let json = serde_json::to_string(&Health::current()).unwrap();
-        assert_eq!(json, r#"{"status":"ok","protocol":1,"min_client_protocol":1}"#);
+        assert_eq!(
+            json,
+            format!(r#"{{"status":"ok","protocol":{PROTOCOL_VERSION},"min_client_protocol":{MIN_CLIENT_PROTOCOL}}}"#)
+        );
     }
 
     #[test]

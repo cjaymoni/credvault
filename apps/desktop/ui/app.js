@@ -204,6 +204,24 @@ function openAccountSheet() {
   sheet.setAttribute("aria-modal", "true");
   sheet.setAttribute("aria-label", "Account and settings");
   $("btn-fingerprint").focus();
+  // The chip is how an unwanted Google link becomes visible, so what it shows
+  // is re-read from the server each time this opens rather than left at
+  // whatever sign-in put there. A link added from another device would
+  // otherwise stay invisible for the life of this session.
+  refreshAccountFacts();
+}
+
+/// Re-read the signed-in account from the server and redraw what depends on
+/// it. Silent on failure: this runs on opening a panel, and a chip showing
+/// slightly stale text is better than an error over a screen the user opened
+/// to do something else.
+async function refreshAccountFacts() {
+  try {
+    state.user = await invoke("refresh_account");
+    renderGoogleChip();
+  } catch (error) {
+    console.warn("could not refresh the account panel", error);
+  }
 }
 function closeAccountSheet({ restoreFocus = true } = {}) {
   const app = $("app");

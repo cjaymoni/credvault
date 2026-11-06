@@ -196,7 +196,11 @@ impl ApiClient {
     }
 
     /// Remove the Google identity bound to this account.
-    pub async fn oauth_unlink(&self, body: &OAuthUnlinkRequest) -> Result<UserProfile, ClientError> {
+    ///
+    /// Answers with a session because the server ends every existing one:
+    /// tokens the link could have minted must not outlive it. The caller has
+    /// to install the new token or it is signed out along with them.
+    pub async fn oauth_unlink(&self, body: &OAuthUnlinkRequest) -> Result<SessionResponse, ClientError> {
         self.send(Method::POST, "/oauth/unlink", Some(body)).await
     }
 

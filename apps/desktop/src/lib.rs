@@ -357,9 +357,13 @@ impl CommandError {
         Self { code, message: message.into(), retry_after_secs: None }
     }
 
-    fn retry_after(mut self, secs: Option<u64>) -> Self {
-        self.retry_after_secs = secs;
-        self
+    /// The one code that carries a wait. A constructor rather than a builder
+    /// on the general type, so a wait cannot be attached to a code that does
+    /// not mean one, and nothing raises `throttled` without going through
+    /// here. `new("throttled", …)` would still compile; this makes the right
+    /// thing the easy one rather than the only one.
+    fn throttled(message: impl Into<String>, retry_after_secs: Option<u64>) -> Self {
+        Self { code: "throttled", message: message.into(), retry_after_secs }
     }
 }
 
@@ -383,23 +387,22 @@ impl From<&str> for CommandError {
 
 impl From<ClientError> for CommandError {
     fn from(error: ClientError) -> Self {
-        let retry_after_secs = match &error {
-            ClientError::TooManyRequests { retry_after_secs, .. } => *retry_after_secs,
-            _ => None,
-        };
+        if let ClientError::TooManyRequests { retry_after_secs, .. } = &error {
+            let retry_after_secs = *retry_after_secs;
+            return Self::throttled(error.to_string(), retry_after_secs);
+        }
         let code = match error {
             ClientError::Network(_) => "network",
             ClientError::Server(_) => "server",
             ClientError::NotFound(_) => "not_found",
             ClientError::Conflict(_) => "conflict",
             ClientError::Unauthorized => "unauthorized",
-            // Its own code so the UI can say "wait and try again" rather than
-            // handing the user a server sentence to parse.
+            // Handled above, where the wait travels with the code.
             ClientError::TooManyRequests { .. } => "throttled",
             ClientError::InvalidUrl(_) => "invalid_url",
             ClientError::Incompatible(_) => "incompatible",
         };
-        Self::new(code, error.to_string()).retry_after(retry_after_secs)
+        Self::new(code, error.to_string())
     }
 }
 

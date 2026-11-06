@@ -608,6 +608,11 @@ async function submitGoogleLinkChange(event) {
   }
 }
 
+/// Past this, the server's suggested wait is reported as "later" rather than
+/// relayed as a number. Five minutes is already far longer than any bucket
+/// here refills in.
+const RETRY_HINT_CEILING_SECS = 300;
+
 /// Turn a throttled error into an instruction rather than a verdict.
 ///
 /// Written here from the number the server sent rather than built on the
@@ -616,9 +621,15 @@ async function submitGoogleLinkChange(event) {
 /// it. The wait is a fact we can state ourselves.
 function retryLater(error) {
   const secs = Number(error?.retry_after_secs);
-  const when = Number.isFinite(secs) && secs > 0
-    ? `in ${secs} ${secs === 1 ? "second" : "seconds"}`
-    : "in a few seconds";
+  // The number is the server's, and the server is the party this app guards
+  // against. It cannot do anything worse here than keep refusing, but relaying
+  // "try again in thirty-one years" would turn an instruction into nonsense,
+  // so anything past a few minutes is reported as a few minutes.
+  const when = !Number.isFinite(secs) || secs <= 0
+    ? "in a few seconds"
+    : secs > RETRY_HINT_CEILING_SECS
+      ? "later"
+      : `in ${Math.ceil(secs)} ${Math.ceil(secs) === 1 ? "second" : "seconds"}`;
   return `Nothing was changed. The server is limiting how often this can be asked — try again ${when}.`;
 }
 

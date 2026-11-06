@@ -138,24 +138,69 @@ pub struct AuthLimit {
     pub trust_forwarded_for: bool,
 }
 
-/// Resolve the address a request should be limited by.
-pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trust_forwarded_for: bool) -> IpAddr {
-    if trust_forwarded_for {
-        // Proxies may append a second header line instead of extending the
-        // first, so take the last line, then its rightmost entry: that is the
-        // one our own proxy wrote. Everything before it came from the client.
-        let forwarded = headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .next_back()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.rsplit(',').next())
-            .and_then(|last| last.trim().parse::<IpAddr>().ok());
-        if let Some(ip) = forwarded {
-            return ip;
+/// Whether a peer may be believed when it claims to be forwarding for someone.
+///
+/// A reverse proxy sits on the same host or the same private network as this
+/// server, so trust stops at the edge of that network. A request arriving
+/// straight from a public address is not from a proxy whatever its headers
+/// say, and believing it would hand every client an unlimited supply of rate
+/// limit buckets.
+///
+/// This is why `--trust-forwarded-for` is safe to leave on: a deployment that
+/// accidentally exposes the port falls back to limiting by peer address
+/// instead of not limiting at all.
+fn is_trusted_proxy(peer: IpAddr) -> bool {
+    fn trusted_v4(ip: std::net::Ipv4Addr) -> bool {
+        ip.is_loopback() || ip.is_private() || ip.is_link_local()
+    }
+    match peer {
+        IpAddr::V4(ip) => trusted_v4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return trusted_v4(mapped);
+            }
+            let octets = ip.octets();
+            // fc00::/7 unique local, and fe80::/10 link local. Spelled out
+            // because the std predicates for both are still unstable.
+            ip.is_loopback() || octets[0] & 0xfe == 0xfc || (octets[0] == 0xfe && octets[1] & 0xc0 == 0x80)
         }
     }
-    peer.ip()
+}
+
+/// Warn the first time a direct request arrives while the proxy header is
+/// trusted, and only the first time: the condition is attacker-triggerable, so
+/// logging it per request would be a way to fill the disk.
+fn warn_once_about_direct_request(peer: IpAddr) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            %peer,
+            "--trust-forwarded-for is set but this request did not come from a private address; \
+             limiting by peer address instead. If the server is reachable directly, it should not be."
+        );
+    }
+}
+
+/// Resolve the address a request should be limited by.
+pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trust_forwarded_for: bool) -> IpAddr {
+    if !trust_forwarded_for {
+        return peer.ip();
+    }
+    if !is_trusted_proxy(peer.ip()) {
+        warn_once_about_direct_request(peer.ip());
+        return peer.ip();
+    }
+    // Proxies may append a second header line instead of extending the first,
+    // so take the last line, then its rightmost entry: that is the one our own
+    // proxy wrote. Everything before it came from the client.
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|last| last.trim().parse::<IpAddr>().ok())
+        .unwrap_or_else(|| peer.ip())
 }
 
 pub async fn limit(
@@ -276,9 +321,80 @@ mod tests {
         assert!(limiter.try_acquire_keyed_at(7, start + Duration::from_secs(60)).is_ok());
     }
 
+    /// The bypass this check exists to stop: a client reaching the server
+    /// directly, inventing a new forwarded address per request, and so a new
+    /// bucket per request. Only the flag used to be consulted, so any peer
+    /// could do this and the limiter was effectively off.
+    #[test]
+    fn a_public_peer_cannot_mint_buckets_with_a_forwarded_header() {
+        let limiter = RateLimiter::new(3, Duration::from_secs(60));
+        let start = Instant::now();
+        let attacker: SocketAddr = "203.0.113.7:4000".parse().unwrap();
+
+        for attempt in 0..10 {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", format!("198.51.100.{attempt}").parse().unwrap());
+            // The flag is on, as it is in the shipped compose file.
+            let key = client_ip(attacker, &headers, true);
+            assert_eq!(key, attacker.ip(), "a direct peer must be limited as itself");
+            let allowed = limiter.try_acquire_at(key, start).is_ok();
+            assert_eq!(
+                allowed,
+                attempt < 3,
+                "attempt {attempt} should {} have passed",
+                if attempt < 3 { "" } else { "not" }
+            );
+        }
+        assert_eq!(limiter.tracked(), 1, "every request shared one bucket");
+    }
+
+    /// The same header from a proxy on the private network is still believed,
+    /// which is the whole point of the flag.
+    #[test]
+    fn a_private_peer_is_still_believed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9, 198.51.100.7".parse().unwrap());
+        for proxy in ["127.0.0.1:1", "10.1.2.3:1", "172.17.0.2:1", "192.168.1.5:1", "169.254.1.1:1"] {
+            let peer: SocketAddr = proxy.parse().unwrap();
+            assert_eq!(
+                client_ip(peer, &headers, true),
+                "198.51.100.7".parse::<IpAddr>().unwrap(),
+                "{proxy} is a place a reverse proxy runs"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_stops_at_the_edge_of_the_private_network_for_ipv6_too() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        let resolve = |peer: &str| client_ip(peer.parse().unwrap(), &headers, true);
+        let forwarded: IpAddr = "198.51.100.7".parse().unwrap();
+
+        // Loopback, unique local (fc00::/7) and link local (fe80::/10).
+        assert_eq!(resolve("[::1]:1"), forwarded);
+        assert_eq!(resolve("[fd00::1]:1"), forwarded);
+        assert_eq!(resolve("[fe80::1]:1"), forwarded);
+        // An IPv4-mapped private address is the docker case seen through v6.
+        assert_eq!(resolve("[::ffff:172.17.0.2]:1"), forwarded);
+
+        // Public v6, and a mapped public v4, are clients.
+        assert_eq!(resolve("[2001:db8::1]:1"), "2001:db8::1".parse::<IpAddr>().unwrap());
+        // The peer is returned in the form it arrived in; `limiter_key` folds
+        // a mapped address down to v4 afterwards.
+        assert_eq!(resolve("[::ffff:203.0.113.7]:1"), "::ffff:203.0.113.7".parse::<IpAddr>().unwrap());
+        assert_eq!(limiter_key(resolve("[::ffff:203.0.113.7]:1")), "203.0.113.7".parse::<IpAddr>().unwrap());
+        // fec0::/10 is site-local, deprecated and not a private network here.
+        assert_eq!(resolve("[fec0::1]:1"), "fec0::1".parse::<IpAddr>().unwrap());
+    }
+
     #[test]
     fn client_ip_honours_forwarded_header_only_when_trusted() {
-        let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        // A proxy's address. It used to be enough for the flag to be on, so
+        // this test ran against a public peer; that is the hole the trusted
+        // peer check closes, and `a_public_peer_cannot_mint_buckets_with_a_
+        // forwarded_header` now covers the other side of it.
+        let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "203.0.113.9, 198.51.100.7".parse().unwrap());
         assert_eq!(client_ip(peer, &headers, false), peer.ip());

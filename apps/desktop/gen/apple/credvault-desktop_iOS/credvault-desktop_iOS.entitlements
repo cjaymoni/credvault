@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict/>
+<dict>
+	<!--
+	  Files are unreadable whenever the device is locked, rather than from
+	  first unlock after boot, which is what iOS gives by default. What is on
+	  disk is the pinned-key store and the WebView's local storage; the
+	  session token and the vault key never leave memory.
+	-->
+	<key>com.apple.developer.default-data-protection</key>
+	<string>NSFileProtectionComplete</string>
+</dict>
 </plist>

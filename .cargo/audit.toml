@@ -1,0 +1,30 @@
+# Exemptions for `cargo audit`. Each one records why it is safe here, so the
+# judgement can be re-checked rather than re-made from scratch.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin attack, a timing sidechannel in the `rsa`
+    # crate that can recover a private key. No fixed version exists.
+    #
+    # Not reachable in this build. `rsa` is pulled by `sqlx-mysql`, which is an
+    # optional driver this server never selects: it enables only
+    # ["runtime-tokio", "sqlite", "migrate", "chrono"]. cargo audit reads
+    # Cargo.lock, which lists optional dependencies whether a feature turns
+    # them on or not.
+    #
+    # Verified three ways: the build produces no libsqlx_mysql and no librsa;
+    # the binary has zero sqlx_mysql symbols; and every symbol containing
+    # "rsa" belongs to ring::rsa, which jsonwebtoken uses to VERIFY Google's
+    # RS256 id tokens. Marvin attacks private-key operations, which this
+    # server never performs.
+    #
+    # Re-check on any sqlx upgrade: the argument depends on the MySQL driver
+    # staying unselected.
+    "RUSTSEC-2023-0071",
+]
+
+# Unmaintained and unsound crates are reported rather than ignored. They are
+# all Linux-desktop-only and reach the tree through Tauri's GTK backend and
+# through tauri-plugin-opener's zbus dependency. None of them is in the server.
+# They resolve when Tauri moves off GTK and zbus.
+informational_warnings = ["unmaintained", "unsound"]

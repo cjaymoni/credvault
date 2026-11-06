@@ -22,8 +22,13 @@ serde.workspace = true
 serde_json.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-clipboard-manager = "2"
+# Opens the Google sign-in page in the system browser rather than in the app
+# webview, so credentials are typed into Google's own window.
+tauri-plugin-opener = "2"
 thiserror.workspace = true
 zeroize.workspace = true
+# Comparing derived key material without leaking where it differs.
+subtle = "2"
 sha2.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,26 @@
+{
+	email {$CREDVAULT_ACME_EMAIL}
+}
+
+{$CREDVAULT_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# The server exposes /health at the root and everything else under /api.
+	# Anything outside those two is not part of the API; refuse it here rather
+	# than letting it reach the application.
+	@api path /api /api/* /health
+	handle @api {
+		reverse_proxy credvault:8787
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

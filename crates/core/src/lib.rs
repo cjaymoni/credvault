@@ -15,6 +15,13 @@
 //!    wrapping the key for them; revoking means rotating the secret's key and
 //!    re-wrapping it for everyone who still has access.
 //!
+//! Every encrypted blob carries the version of the scheme that produced it
+//! (see [`aead::SEALED_FORMAT`]), and every secret's plaintext carries the
+//! version of its own field layout (see [`secret::PAYLOAD_FORMAT`]). Both are
+//! authenticated, and both are readable before the data they describe, so a
+//! scheme this build cannot run is reported as that rather than as the
+//! "decryption failed" a wrong passphrase also produces.
+//!
 //! Public keys are fetched from the server. Clients must let users compare
 //! [`PublicKey::fingerprint`] out of band and pin keys on first use, otherwise
 //! a malicious server could substitute its own key and read shared secrets.
@@ -43,8 +50,34 @@ pub enum CryptoError {
     Kdf,
     #[error("invalid encoding: {0}")]
     Encoding(String),
+    /// Stored data written by a newer build than this one. Refused rather than
+    /// partially read: a client that dropped what it did not understand and
+    /// then saved the record back would destroy data it never showed the user.
+    #[error("this {what} was saved by a newer version of credvault (format {found}); update the app to open it")]
+    NewerFormat { what: &'static str, found: u32 },
+    /// Stored data in a format this build does not implement. Distinct from
+    /// [`CryptoError::Decrypt`] on purpose: a wrong passphrase and a scheme
+    /// this build cannot run are different problems with different answers,
+    /// and an AEAD that simply fails to open cannot tell them apart.
+    #[error("this {what} is in format {found}, which this version of credvault cannot read")]
+    UnknownFormat { what: &'static str, found: u32 },
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
+
+/// Compare a format tag read out of stored data against what this build writes.
+///
+/// Refusing is the point. A build that read the parts it recognised and
+/// ignored the rest would go on to save the record back, destroying whatever
+/// it had quietly dropped.
+pub(crate) fn check_format(what: &'static str, found: u32, expected: u32) -> Result<()> {
+    if found > expected {
+        return Err(CryptoError::NewerFormat { what, found });
+    }
+    if found != expected {
+        return Err(CryptoError::UnknownFormat { what, found });
+    }
+    Ok(())
+}

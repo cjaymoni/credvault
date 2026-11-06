@@ -1021,3 +1021,33 @@ input.mono.mismatch { border-color: var(--danger); }
    by the next keystroke, and this is the only notice that pins were lost. */
 .startup-warning { margin-bottom: 12px; align-items: center; }
 .startup-warning .btn { margin-left: auto; flex: none; }
+
+/* ----- sign in with Google -------------------------------------------------
+   The brand button keeps its own neutral surface in both themes: Google's
+   guidelines expect a light or dark button rather than an accent-tinted one. */
+.auth-alt { margin-top: 18px; }
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+  color: var(--text-3);
+  font-size: var(--text-small);
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.btn.google { gap: 10px; font-weight: 500; }
+.btn.google .ic { width: 18px; height: 18px; flex: none; }
+
+/* The link button under the passphrase prompt is a full-width row, not an
+   inline link, so it lines up with the submit button above it. */
+.link-btn.block { display: block; width: 100%; margin-top: 10px; text-align: center; }
+
+#btn-link-google .ic { width: 16px; height: 16px; }

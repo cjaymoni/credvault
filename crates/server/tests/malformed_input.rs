@@ -38,6 +38,8 @@ async fn spawn() -> TestServer {
             password_refill: Duration::from_secs(1),
             link_burst: 100_000,
             link_refill: Duration::from_secs(1),
+            unlink_burst: 100_000,
+            unlink_refill: Duration::from_secs(1),
         },
         ..ServerConfig::default()
     };

@@ -1446,10 +1446,11 @@ pub async fn oauth_unlink(
     user: AuthUser,
     ApiJson(body): ApiJson<OAuthUnlinkRequest>,
 ) -> ApiResult<Json<SessionResponse>> {
-    // Its own budget, not the one `change_password` and `oauth_link` share.
-    // This route is how an account holder evicts a link they did not ask for,
-    // and whoever put that link there can hold the shared budget at zero by
-    // spending it from the other two; see `AppState::unlink_limiter`.
+    // Its own budget, so traffic on `/password` and `/oauth/link` cannot
+    // decide whether this route answers. It does not make the route
+    // unstarvable — nothing keyed by account can be, against someone holding a
+    // session for that account — and `AppState::unlink_limiter` says what to
+    // reach for instead.
     spend_account_budget(&state.unlink_limiter, user.id, "google unlink")?;
     // Read before the passphrase is checked, so a Google-only account is told
     // why it cannot unlink rather than that it supplied a passphrase it has no

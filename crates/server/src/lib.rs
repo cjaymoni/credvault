@@ -70,6 +70,14 @@ pub struct RateLimits {
     /// behind one NAT would share a budget none of them spent.
     pub link_burst: u32,
     pub link_refill: Duration,
+    /// Also per authenticated user, and deliberately not the password budget
+    /// even though the work is the same. The two protect different things and
+    /// must be able to move apart: tightening the passphrase budget to harden
+    /// against guessing would otherwise tighten the route that removes an
+    /// unwanted sign-in method, which is the opposite of what the operator
+    /// doing the tightening wants. See `AppState::unlink_limiter`.
+    pub unlink_burst: u32,
+    pub unlink_refill: Duration,
 }
 
 impl Default for RateLimits {
@@ -98,6 +106,8 @@ impl Default for RateLimits {
             password_refill: Duration::from_secs(60),
             link_burst: 5,
             link_refill: Duration::from_secs(60),
+            unlink_burst: 10,
+            unlink_refill: Duration::from_secs(60),
         }
     }
 }
@@ -154,13 +164,20 @@ pub struct AppState {
     pub link_limiter: Arc<RateLimiter<i64>>,
     /// Throttles unlinking per account, in a bucket of its own.
     ///
-    /// Unlinking is the remedy for a link that should not be there, and it
-    /// verifies a passphrase, so sharing `password_limiter` would be the
-    /// obvious thing. It is also the wrong thing: whoever holds a stolen
-    /// session can spend that budget from `/oauth/link` or `/password` as fast
-    /// as it refills, and the owner trying to evict them would get a `429`.
-    /// The route that evicts an attacker must not draw on a budget the
-    /// attacker can empty.
+    /// Unlinking verifies a passphrase, so sharing `password_limiter` with
+    /// `change_password` and `oauth_link` is the obvious thing. It is the
+    /// wrong thing: `/password` spends a token before it does any work, so
+    /// traffic on those two routes would decide whether this one answers.
+    ///
+    /// Separation is all this buys, and it is worth saying what it does not.
+    /// Every per-account budget is spendable by whoever holds a session for
+    /// that account, which is exactly the attacker F-13 describes — they can
+    /// empty this bucket by calling `/oauth/unlink` with a malformed proof,
+    /// one request a minute, for nothing. No per-account limit can prevent
+    /// that. The eviction path that does not depend on a budget is
+    /// `DELETE /sessions`, which has none: ending the attacker's session stops
+    /// them spending anything, and the unlink follows on a quiet bucket. That
+    /// is the order the app offers in the account panel.
     pub unlink_limiter: Arc<RateLimiter<i64>>,
 }
 
@@ -208,9 +225,7 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
     let password_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
     let link_limiter = Arc::new(RateLimiter::new(limits.link_burst, limits.link_refill));
-    // Same shape as the password budget, but its own bucket; see
-    // `AppState::unlink_limiter` for why it must not share one.
-    let unlink_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
+    let unlink_limiter = Arc::new(RateLimiter::new(limits.unlink_burst, limits.unlink_refill));
 
     let api = Router::new()
         .route(

@@ -489,6 +489,70 @@ function renderGoogleLinkForm() {
   $("gl-current").focus();
 }
 
+/// Confirmation for ending every session, including this one.
+///
+/// Deliberately not behind the passphrase. Someone reaches for this because
+/// they think another session is open that should not be, and the whole value
+/// of the route is that nothing the other session does can block it — adding a
+/// derivation and a verify in front would hand it a way to.
+function renderSignOutEverywhereForm() {
+  closeAccountSheet({ restoreFocus: false });
+  state.selected = null;
+  state.editing = true;
+  renderList();
+  showDetailScreen();
+  $("detail").innerHTML = `
+    <form class="card" id="sign-out-all-form" novalidate aria-labelledby="sign-out-all-title">
+      <h2 id="sign-out-all-title" class="card-title">${icon("alert")} Sign out everywhere</h2>
+      <p class="card-lead">
+        Every device signed in to this account is signed out, including this one.
+        Your secrets are untouched and your passphrase does not change &mdash;
+        you just sign in again.
+      </p>
+      <p class="card-lead">
+        This is the thing to do first if you think someone else is signed in as you.
+        Nothing they can do stops it, and once their session is gone they cannot
+        interfere with removing a Google sign-in they added.
+      </p>
+      <div class="error" id="soa-error" role="alert"></div>
+      <div class="actions">
+        <button type="submit" class="btn danger solid" id="btn-soa-save">
+          ${icon("check")} Sign out everywhere
+        </button>
+        <button type="button" class="btn" id="btn-soa-cancel">Cancel</button>
+      </div>
+    </form>`;
+
+  $("btn-soa-cancel").onclick = () => { state.editing = false; renderDetail(); showListScreen(); };
+  $("sign-out-all-form").onsubmit = submitSignOutEverywhere;
+  $("btn-soa-cancel").focus();
+}
+
+async function submitSignOutEverywhere(event) {
+  event.preventDefault();
+  setError("soa-error", "");
+  setBusy($("btn-soa-save"), true, "Signing out…");
+  try {
+    await invoke("sign_out_everywhere");
+    // Reported rather than best-effort, so the local session is only dropped
+    // once the server has confirmed the rest are gone. Everything else the
+    // signed-out state needs is what `logout` already clears.
+    clearReveals();
+    state.user = null;
+    state.secrets = []; state.selected = null; state.editing = false;
+    $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
+    setError("main-error", "");
+    $("app").classList.add("hidden");
+    $("auth").classList.remove("hidden");
+    $("password").focus();
+    toast("Signed out on every device");
+  } catch (error) {
+    setError("soa-error", error);
+  } finally {
+    setBusy($("btn-soa-save"), false);
+  }
+}
+
 async function submitGoogleLinkChange(event) {
   event.preventDefault();
   setError("gl-error", "");
@@ -1543,6 +1607,7 @@ $("btn-google-cancel").onclick = cancelGoogleSignIn;
 $("btn-google-toggle-pw").onclick = () => togglePasswordInput($("google-password"), $("btn-google-toggle-pw"));
 $("btn-link-google").onclick = () => renderGoogleLinkForm();
 $("btn-change-passphrase").onclick = () => renderPassphraseForm();
+$("btn-sign-out-everywhere").onclick = () => renderSignOutEverywhereForm();
 // The button belongs to whichever server is in the box, so re-ask when it
 // settles rather than on every keystroke.
 $("server").onchange = () => refreshCapabilities();

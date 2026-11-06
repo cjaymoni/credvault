@@ -97,6 +97,13 @@ Argon2id on your device. The server stores no password for such an account.
   all. You stay signed in where you asked for the removal. An account created
   *through* Google cannot remove its link: it is the only thing that opens
   that account.
+- "Sign out everywhere" in the account panel ends every session for the
+  account, on every device including this one, and asks for nothing but the
+  button. That is deliberate. It is the move to make first if you think someone
+  else is signed in as you: every other per-account limit can be used up by
+  whoever is already signed in, and this one cannot, so it still works when the
+  rest are refusing. Once their session is gone they cannot get in the way of
+  removing a Google sign-in they added.
 - A first sign-in still needs the server's registration token, if it has one.
   A verified Google address is not by itself permission to have an account on
   someone else's server.

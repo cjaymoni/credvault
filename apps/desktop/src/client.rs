@@ -172,6 +172,17 @@ impl ApiClient {
         self.send(Method::POST, "/logout", Self::NO_BODY).await
     }
 
+    /// End every session for this account, this one included.
+    ///
+    /// The one eviction route with no per-account budget, which is what makes
+    /// it the first move against someone who holds a session they should not.
+    /// Anything rationed per account can be emptied by whoever holds a session
+    /// for that account; this cannot, so it still answers when the rest are
+    /// refusing. Removing a Google link follows it, not the other way round.
+    pub async fn logout_everywhere(&self) -> Result<(), ClientError> {
+        self.send(Method::DELETE, "/sessions", Self::NO_BODY).await
+    }
+
     /// What this server offers, so the UI knows whether to show the Google
     /// button and whether to ask for a registration token.
     pub async fn capabilities(&self) -> Result<Capabilities, ClientError> {

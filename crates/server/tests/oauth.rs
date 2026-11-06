@@ -952,17 +952,20 @@ async fn changing_the_passphrase_leaves_a_linked_google_account_alone() {
     }
 }
 
-/// The route that evicts an unwanted link cannot be starved by the budget the
-/// other passphrase routes share.
+/// Unlinking draws on its own budget, not the one the passphrase routes share.
 ///
 /// Unlinking verifies a passphrase, so putting it on `password_limiter` with
-/// `change_password` and `oauth_link` looks right and is not: whoever holds a
-/// stolen session can spend that budget as fast as it refills — `/password`
-/// spends a token before it does any work at all — and the owner trying to
-/// remove the attacker's link would get a `429`. The remedy must not draw on a
-/// budget the attacker can empty.
+/// `change_password` and `oauth_link` looks right and is not: `/password`
+/// spends a token before it does any work at all, so traffic on those routes
+/// would decide whether this one answers.
+///
+/// Separation is all this proves. It does not make unlinking unstarvable —
+/// nothing keyed by account can be, against someone holding a session for that
+/// account, who can empty this bucket from `/oauth/unlink` itself. The
+/// eviction path that does not depend on a budget is the one in
+/// `signing_out_everywhere_answers_when_every_account_budget_is_empty`.
 #[tokio::test]
-async fn draining_the_passphrase_budget_does_not_block_removing_a_link() {
+async fn the_unlink_budget_is_not_the_passphrase_budget() {
     let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
     let server = spawn(Arc::clone(&stub)).await;
     let alice = password_session(&server, "alice@example.com").await;
@@ -999,6 +1002,56 @@ async fn draining_the_passphrase_budget_does_not_block_removing_a_link() {
     let removed = unlink(&server, &alice.token, &auth_hash).await;
     assert_eq!(removed.status(), StatusCode::OK, "{}", removed.text().await.unwrap());
     assert_eq!(removed.json::<SessionResponse>().await.unwrap().user.google_email, None);
+}
+
+/// Ending every session answers even when every per-account budget is empty.
+///
+/// This is what makes the F-13 remedy reachable. Whoever holds a session for
+/// an account can empty any budget keyed to that account simply by spending
+/// it — including the one in front of `/oauth/unlink`, with a malformed proof,
+/// for the cost of one request a minute. So the first move against them cannot
+/// be rationed that way. `DELETE /sessions` is not: it ends their session,
+/// after which they can spend nothing, and the unlink follows on a quiet
+/// bucket.
+#[tokio::test]
+async fn signing_out_everywhere_answers_when_every_account_budget_is_empty() {
+    let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let limits = RateLimits::default();
+
+    // Empty the passphrase budget, then the unlink budget, both the way
+    // someone holding this session would: cheap requests that are refused
+    // after the token is taken.
+    for _ in 0..limits.password_burst {
+        server
+            .client
+            .post(format!("{}/password", server.base))
+            .bearer_auth(&alice.token)
+            .json(&serde_json::json!({
+                "current_auth_hash": "not a credential",
+                "new_auth_hash": "not a credential either",
+                "encrypted_private_key": alice.user.encrypted_private_key,
+                "rewrapped_keys": [],
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+    for _ in 0..limits.unlink_burst {
+        unlink(&server, &alice.token, "not a credential").await;
+    }
+    assert_eq!(
+        unlink(&server, &alice.token, "not a credential").await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the unlink budget should be empty by now"
+    );
+
+    // The one route that still answers.
+    let response =
+        server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&alice.token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "{}", response.text().await.unwrap());
+    assert_eq!(server.get_as("/me", &alice.token).await.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// An account created through Google cannot link a second identity, and is

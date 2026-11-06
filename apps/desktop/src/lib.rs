@@ -345,11 +345,21 @@ fn load_known_keys_or_recover(path: &Path) -> std::io::Result<(KnownKeys, Option
 pub struct CommandError {
     pub code: &'static str,
     pub message: String,
+    /// How long until a throttled request is worth retrying. Carried so the
+    /// UI can compose its own sentence from the number instead of quoting the
+    /// server's, which in this threat model is a string the adversary chooses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 impl CommandError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), retry_after_secs: None }
+    }
+
+    fn retry_after(mut self, secs: Option<u64>) -> Self {
+        self.retry_after_secs = secs;
+        self
     }
 }
 
@@ -373,6 +383,10 @@ impl From<&str> for CommandError {
 
 impl From<ClientError> for CommandError {
     fn from(error: ClientError) -> Self {
+        let retry_after_secs = match &error {
+            ClientError::TooManyRequests { retry_after_secs, .. } => *retry_after_secs,
+            _ => None,
+        };
         let code = match error {
             ClientError::Network(_) => "network",
             ClientError::Server(_) => "server",
@@ -385,7 +399,7 @@ impl From<ClientError> for CommandError {
             ClientError::InvalidUrl(_) => "invalid_url",
             ClientError::Incompatible(_) => "incompatible",
         };
-        Self::new(code, error.to_string())
+        Self::new(code, error.to_string()).retry_after(retry_after_secs)
     }
 }
 
@@ -635,31 +649,41 @@ async fn logout(state: State<'_, AppState>) -> CommandResult<()> {
 /// exists that should not, and the one answer that must never be given wrongly
 /// is that it is gone.
 ///
-/// Two kinds of failure, told apart because they mean different things to the
-/// person reading them. A lost answer or a server error is genuinely
+/// Three kinds of failure, told apart because they mean different things to
+/// the person reading them. A lost answer or a server error is genuinely
 /// ambiguous: the purge commits before the replacement is issued, so a `500`
-/// can mean it happened. Anything else — a `401`, a refusal — means the
-/// request did not run, and saying "it is not clear" would be inventing a
-/// doubt. Both sign this device out, because that is the safe side either way;
-/// only the sentence differs.
+/// can mean it happened, and this device is signed out on the safe side. A
+/// `401` or a refusal means the request did not run and this token is already
+/// worthless, so it goes too, but saying "it is not clear" would invent a
+/// doubt. Being throttled also means nothing ran — and there the session is
+/// still good, so it is kept and the user waits a few seconds instead of
+/// losing the head start this route exists to give them.
 ///
 /// # Errors
-/// `ambiguous` when the answer was lost and the outcome is unknown;
-/// `signed-out` when the request plainly did not run. Both mean this device is
-/// no longer signed in.
+/// `ambiguous` when the answer was lost and the outcome is unknown, and
+/// `signed-out` when the request plainly did not run: both mean this device is
+/// no longer signed in. `throttled` leaves it signed in.
 #[tauri::command]
 async fn sign_out_other_devices(state: State<'_, AppState>) -> CommandResult<UserSummary> {
     let (api, user_id) = with_session(&state, |session| Ok((session.api.clone(), session.user_id)))?;
     let signed_in = match api.logout_other_devices().await {
         Ok(signed_in) => signed_in,
+        // A throttled call is refused by middleware before the handler ever
+        // runs, so nothing was purged and the token in hand is still good.
+        // Keeping it is the point: this route exists to buy the user a few
+        // seconds, and throwing their session away to wait those seconds out
+        // spends exactly what it was meant to save — worse, on a shared egress
+        // address the evicted party can hold the bucket empty and turn this
+        // button into one that only logs the owner out.
+        Err(error @ ClientError::TooManyRequests { .. }) => return Err(error.into()),
         Err(error) => {
             clear_local_session(&state);
             clear_pending_google(&state);
-            // A throttled call is refused by middleware before the handler
-            // runs, so it is certain nothing was purged. It is only reachable
-            // at all because this route gained a limiter, and telling someone
-            // their other devices might be signed out when they are not is the
-            // one answer this command must never give wrongly.
+            // The rest all end this device's session, because either the
+            // outcome is unknown or this token is already gone. Only the
+            // sentence differs, and telling someone their other devices might
+            // be signed out when they are not is the one answer this command
+            // must never give wrongly.
             let ambiguous = matches!(error, ClientError::Network(_) | ClientError::Server(_));
             return Err(if ambiguous {
                 CommandError::new(
@@ -2165,6 +2189,33 @@ mod tests {
         let malformed = unlock_failure(CryptoError::Encoding("private key must be 32 bytes".into()), "wrong password");
         assert_eq!(malformed.code, "locked");
         assert!(malformed.message.contains("32 bytes"), "{malformed:?}");
+    }
+
+    /// A throttled request is the one failure that leaves the caller's session
+    /// intact, so the UI has to be able to tell it apart and say how long to
+    /// wait. Both halves travel on the error.
+    #[test]
+    fn a_throttled_error_carries_its_own_code_and_the_wait() {
+        let throttled = CommandError::from(ClientError::TooManyRequests {
+            message: "too many requests; try again in 6 seconds".into(),
+            retry_after_secs: Some(6),
+        });
+        assert_eq!(throttled.code, "throttled");
+        assert_eq!(throttled.retry_after_secs, Some(6));
+
+        // A server that sends no usable Retry-After still classifies, and the
+        // UI falls back to "in a few seconds".
+        let no_hint =
+            CommandError::from(ClientError::TooManyRequests { message: "slow down".into(), retry_after_secs: None });
+        assert_eq!(no_hint.code, "throttled");
+        assert_eq!(no_hint.retry_after_secs, None);
+
+        // Nothing else claims a wait.
+        for other in [ClientError::Network("down".into()), ClientError::Server("boom".into())] {
+            let error = CommandError::from(other);
+            assert_ne!(error.code, "throttled");
+            assert_eq!(error.retry_after_secs, None);
+        }
     }
 
     fn test_session(identity: Identity) -> Session {

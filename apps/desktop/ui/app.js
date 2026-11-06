@@ -609,9 +609,17 @@ async function submitGoogleLinkChange(event) {
 }
 
 /// Turn a throttled error into an instruction rather than a verdict.
+///
+/// Written here from the number the server sent rather than built on the
+/// sentence it sent. That sentence is a string a hostile server chooses, and
+/// appending "nothing was changed" to it would read as this app vouching for
+/// it. The wait is a fact we can state ourselves.
 function retryLater(error) {
-  const message = String(error?.message ?? error);
-  return `${message} Nothing was changed — wait and try again.`;
+  const secs = Number(error?.retry_after_secs);
+  const when = Number.isFinite(secs) && secs > 0
+    ? `in ${secs} ${secs === 1 ? "second" : "seconds"}`
+    : "in a few seconds";
+  return `Nothing was changed. The server is limiting how often this can be asked — try again ${when}.`;
 }
 
 function showApp(user) {
@@ -1430,7 +1438,10 @@ async function submitPassphraseChange(event) {
       signOutAfterAmbiguousChange(error.message);
       return;
     }
-    setError("pp-error", error);
+    // This form's two neighbouring failures are "changed but unconfirmed" and
+    // "changed but unknown", so red here reads as "my vault may have a new
+    // passphrase". Throttling means the request never ran; say so.
+    setError("pp-error", error?.code === "throttled" ? retryLater(error) : error);
     if (error?.code === "locked") $("pp-current").focus();
   } finally {
     if ($("btn-pp-save")?.isConnected) setBusy($("btn-pp-save"), false);

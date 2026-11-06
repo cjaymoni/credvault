@@ -71,10 +71,19 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest server protocol a client built from this source will talk to.
 ///
-/// Still 1. A protocol-1 server has no `/oauth/unlink`, but it also returns no
-/// [`UserProfile::google_email`], so this client never offers to remove a link
-/// it cannot see. Everything else about a protocol-1 server is unchanged.
-pub const MIN_SERVER_PROTOCOL: u32 = 1;
+/// 2, because a protocol-1 server answers the link request *successfully* and
+/// this client cannot tell. The old handler takes the callback fields and
+/// ignores the `current_auth_hash` it does not know about, writes the identity
+/// row, and answers `204`; the client then fails to read a profile out of an
+/// empty body and reports that linking failed. The link exists, the account
+/// holder believes it does not, that server returns no `google_email` so
+/// nothing displays it, and it has no `/oauth/unlink` to remove it with —
+/// which is the invisible, unremovable, standalone credential F-13 exists to
+/// prevent, reached by nothing worse than updating the app before the server.
+///
+/// Refusing at `check_protocol` says so before any credential is sent, which
+/// is what that path is for.
+pub const MIN_SERVER_PROTOCOL: u32 = 2;
 
 /// The oldest client protocol a server built from this source still serves.
 ///
@@ -82,6 +91,11 @@ pub const MIN_SERVER_PROTOCOL: u32 = 1;
 /// them would be wrong rather than merely inconvenient. Still 1: a protocol-1
 /// client is refused when it tries to link, and works for everything else.
 pub const MIN_CLIENT_PROTOCOL: u32 = 1;
+
+// A build where either minimum has overtaken the version it was raised
+// alongside is a build that refuses its own counterpart from the same tree.
+const _: () = assert!(MIN_SERVER_PROTOCOL <= PROTOCOL_VERSION, "this client could not talk to its own server");
+const _: () = assert!(MIN_CLIENT_PROTOCOL <= PROTOCOL_VERSION, "this server would refuse its own client");
 
 /// The body of `GET /health`.
 ///
@@ -682,6 +696,20 @@ mod tests {
         let error = check_protocol(&health).unwrap_err();
         assert!(matches!(error, ProtocolMismatch::ServerTooOld { .. }), "{error:?}");
         assert!(error.to_string().contains("too old"), "{error}");
+    }
+
+    /// A tripwire, not a tautology.
+    ///
+    /// Every endpoint contract this version describes is written down on
+    /// `PROTOCOL_VERSION` itself. Changing one without moving the constant is
+    /// the mistake that ships a server older clients silently misread, and it
+    /// has happened once already. Failing here makes the bump a deliberate
+    /// two-line edit rather than something to remember.
+    #[test]
+    fn the_protocol_numbers_are_what_this_source_documents() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(MIN_SERVER_PROTOCOL, 2);
+        assert_eq!(MIN_CLIENT_PROTOCOL, 1);
     }
 
     #[test]

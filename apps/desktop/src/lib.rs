@@ -424,6 +424,30 @@ fn with_session<T>(state: &AppState, f: impl FnOnce(&mut Session) -> CommandResu
     f(session)
 }
 
+/// [`with_session`], but only if the open session is still `user_id`'s.
+///
+/// Every command that reads the session, awaits something slow, and then
+/// writes the answer back goes through this. The session can be replaced while
+/// the slow part runs — a browser round trip, a passphrase change that
+/// re-wraps a large vault — and writing one account's answer onto another
+/// account's session ranges from a wrong label to a wrap key that locks an
+/// account out of its own secrets.
+///
+/// # Errors
+/// `locked` if nothing is unlocked, or if the session is now someone else's.
+fn with_same_session<T>(
+    state: &AppState,
+    user_id: i64,
+    f: impl FnOnce(&mut Session) -> CommandResult<T>,
+) -> CommandResult<T> {
+    with_session(state, |session| {
+        if session.user_id != user_id {
+            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
+        }
+        f(session)
+    })
+}
+
 /// Open a client for `server` and refuse to go on if this build and that
 /// server do not speak the same protocol.
 ///
@@ -839,17 +863,19 @@ async fn google_link(
     if !password_login {
         return Err(CommandError::new("oauth", "this account already signs in with Google"));
     }
-    let api = api(&state)?;
+    let PassphraseProof { user_id, api, auth_hash, master, .. } = prove_current_passphrase(&state, current).await?;
+    // Nothing below needs the vault key, and what comes next waits on the user
+    // reading a consent screen in a browser. Dropped rather than held for it.
+    drop(master);
+
     let capabilities = api.capabilities().await?;
     if !capabilities.google_sign_in {
         return Err(CommandError::new("oauth", "this server does not offer sign in with Google"));
     }
-
-    let proof = prove_current_passphrase(&state, current).await?;
     let callback = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
     let profile =
-        api.oauth_link(&OAuthLinkRequest::new(callback, Some(proof.auth_hash))).await.map_err(passphrase_rejected)?;
-    remember_google_email(&state, proof.user_id, profile.google_email)
+        api.oauth_link(&OAuthLinkRequest::new(callback, Some(auth_hash))).await.map_err(passphrase_rejected)?;
+    remember_google_email(&state, user_id, profile.google_email)
 }
 
 /// Remove the linked Google account, so it can no longer sign in here.
@@ -866,18 +892,12 @@ async fn google_unlink(state: State<'_, AppState>, current: Zeroizing<String>) -
             "this account signs in with Google only; removing the link would leave no way to sign in",
         ));
     }
-    let api = api(&state)?;
-    let proof = prove_current_passphrase(&state, current).await?;
-    let signed_in = api
-        .oauth_unlink(&OAuthUnlinkRequest { current_auth_hash: proof.auth_hash })
-        .await
-        .map_err(passphrase_rejected)?;
+    let PassphraseProof { user_id, api, auth_hash, .. } = prove_current_passphrase(&state, current).await?;
+    let signed_in =
+        api.oauth_unlink(&OAuthUnlinkRequest { current_auth_hash: auth_hash }).await.map_err(passphrase_rejected)?;
 
-    with_session(&state, |session| {
-        if session.user_id != proof.user_id {
-            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
-        }
-        session.api = session.api.clone().with_token(&signed_in.token);
+    with_same_session(&state, user_id, |session| {
+        session.api = api.clone().with_token(&signed_in.token);
         session.google_email = signed_in.user.google_email.clone();
         Ok(summary_of(session))
     })
@@ -908,11 +928,19 @@ struct PassphraseProof {
     /// Who the proof is for. Carried so a slow round trip cannot write its
     /// answer onto whatever session happens to be open when it returns.
     user_id: i64,
-    /// Bound to this server's address, so it is useless to any other.
+    /// The client the proof was read from, so everything that follows speaks
+    /// to the session it was proved against rather than re-reading the lock.
+    api: ApiClient,
+    /// The address both hashes are bound to. Read once here, so a caller
+    /// deriving a second hash cannot bind it to a different server than the
+    /// first — which would rebind the account's credential to an address the
+    /// user never signs in at.
+    server: ServerAddress,
+    /// Bound to [`PassphraseProof::server`], so it is useless to any other.
     auth_hash: Zeroizing<String>,
     /// The key the passphrase derived. Handed back because deriving it is the
-    /// expensive part and a caller that re-wraps needs it; dropped unused by
-    /// the callers that only needed the proof.
+    /// expensive part and a caller that re-wraps needs it; callers that only
+    /// needed the proof drop it, and should do so before anything slow.
     master: MasterKey,
 }
 
@@ -926,10 +954,11 @@ struct PassphraseProof {
 /// # Errors
 /// `locked` if nothing is unlocked or the passphrase is not this session's.
 async fn prove_current_passphrase(state: &AppState, current: Zeroizing<String>) -> CommandResult<PassphraseProof> {
-    let (email, server_url, user_id) = with_session(state, |session| {
-        Ok((session.email.clone(), session.api.base_url().to_string(), session.user_id))
-    })?;
-    let server = normalize_server_url(&server_url)?;
+    // One read of the session for everything that has to agree: the account,
+    // the client and the address the hashes bind to.
+    let (email, api, user_id) =
+        with_session(state, |session| Ok((session.email.clone(), session.api.clone(), session.user_id)))?;
+    let server = normalize_server_url(api.base_url())?;
     let master = derive_master(current, email).await?;
     let matches_session: bool = with_session(state, |session| {
         Ok(session.user_id == user_id
@@ -939,7 +968,7 @@ async fn prove_current_passphrase(state: &AppState, current: Zeroizing<String>) 
         return Err(CommandError::new("locked", "that is not your current passphrase"));
     }
     let auth_hash = master.auth_hash(&server);
-    Ok(PassphraseProof { user_id, auth_hash, master })
+    Ok(PassphraseProof { user_id, api, server, auth_hash, master })
 }
 
 /// Record what the server now says is linked, and hand back the summary the
@@ -950,10 +979,7 @@ async fn prove_current_passphrase(state: &AppState, current: Zeroizing<String>) 
 /// runs; without this check the first account's Google address could land on
 /// the second account's summary.
 fn remember_google_email(state: &AppState, user_id: i64, google_email: Option<String>) -> CommandResult<UserSummary> {
-    with_session(state, |session| {
-        if session.user_id != user_id {
-            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
-        }
+    with_same_session(state, user_id, |session| {
         session.google_email = google_email;
         Ok(summary_of(session))
     })
@@ -967,6 +993,13 @@ fn remember_google_email(state: &AppState, user_id: i64, google_email: Option<St
 /// to become visible. Nothing secret is touched — this replaces facts the
 /// server already told us, not key material.
 ///
+/// `password_login` is taken from the server too, which was fixed at sign-in
+/// before. A hostile server flipping it gains nothing: false makes
+/// `change_password` send no hashes, which the server's own check rejects for
+/// a password account, and true makes a Google account send hashes rejected
+/// for the opposite reason. Both fail closed, and a server that wants to hide
+/// the chip can already do it by returning no `google_email`.
+///
 /// # Errors
 /// `locked` if nothing is unlocked or the session changed while this ran;
 /// whatever the client reports if the server cannot be reached.
@@ -974,10 +1007,7 @@ fn remember_google_email(state: &AppState, user_id: i64, google_email: Option<St
 async fn refresh_account(state: State<'_, AppState>) -> CommandResult<UserSummary> {
     let (api, user_id) = with_session(&state, |session| Ok((session.api.clone(), session.user_id)))?;
     let profile = api.me().await?;
-    with_session(&state, |session| {
-        if session.user_id != user_id {
-            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
-        }
+    with_same_session(&state, user_id, |session| {
         session.password_login = profile.password_login;
         session.google_email = profile.google_email.clone();
         Ok(summary_of(session))
@@ -1028,16 +1058,16 @@ async fn change_password(
     new_password: Zeroizing<String>,
 ) -> CommandResult<()> {
     kdf::validate_new_password(&new_password).map_err(user_facing)?;
-    let (api, email, server_url) = with_session(&state, |session| {
-        Ok((session.api.clone(), session.email.clone(), session.api.base_url().to_string()))
-    })?;
-    let server = normalize_server_url(&server_url)?;
+    let email = with_session(&state, |session| Ok(session.email.clone()))?;
 
     // Proved locally rather than left to the server, so a typo costs one
     // Argon2 pass instead of a round trip that also re-wraps every key. The
     // derived key comes back with the proof: re-wrapping needs it, and
-    // deriving it twice would double the one slow step on this path.
-    let PassphraseProof { user_id, auth_hash: current_auth_hash, master: old_master } =
+    // deriving it twice would double the one slow step on this path. The
+    // address comes back with it too, so both hashes below bind to the same
+    // server — two reads of it could in principle disagree, and a new
+    // credential bound to an address the user never signs in at is a lockout.
+    let PassphraseProof { user_id, api, server, auth_hash: current_auth_hash, master: old_master } =
         prove_current_passphrase(&state, current).await?;
     let new_master = derive_master(new_password, email).await?;
 
@@ -1071,14 +1101,9 @@ async fn change_password(
     // Every other device was signed out, and this one holds a new token and a
     // new self-wrap key. Cached secret keys stay valid — they did not change —
     // but they are dropped rather than reasoned about.
-    with_session(&state, |current| {
-        // This takes minutes on a large vault, long enough for the session to
-        // have been replaced underneath it. Writing a new wrap key onto some
-        // other account's session would lock that account out of its own
-        // secrets.
-        if current.user_id != user_id {
-            return Err(CommandError::new("locked", "you signed in as someone else while that was in flight"));
-        }
+    // Guarded on the account: this takes minutes on a large vault, long enough
+    // for the session to have been replaced underneath it.
+    with_same_session(&state, user_id, |current| {
         current.api = api.with_token(&session.token);
         current.self_wrap_key = new_master.self_wrap_key();
         current.keys.clear();

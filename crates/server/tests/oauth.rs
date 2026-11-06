@@ -14,7 +14,7 @@ use credvault_core::{Identity, MasterKey};
 use credvault_server::api::*;
 use credvault_server::error::ApiError;
 use credvault_server::oauth::{AuthorizationRequest, BoxFuture, ExchangeRequest, OAuthProvider, VerifiedIdentity};
-use credvault_server::{RegistrationPolicy, ServerConfig};
+use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use reqwest::{Client, StatusCode};
 use sqlx::SqlitePool;
 
@@ -952,6 +952,55 @@ async fn changing_the_passphrase_leaves_a_linked_google_account_alone() {
     }
 }
 
+/// The route that evicts an unwanted link cannot be starved by the budget the
+/// other passphrase routes share.
+///
+/// Unlinking verifies a passphrase, so putting it on `password_limiter` with
+/// `change_password` and `oauth_link` looks right and is not: whoever holds a
+/// stolen session can spend that budget as fast as it refills — `/password`
+/// spends a token before it does any work at all — and the owner trying to
+/// remove the attacker's link would get a `429`. The remedy must not draw on a
+/// budget the attacker can empty.
+#[tokio::test]
+async fn draining_the_passphrase_budget_does_not_block_removing_a_link() {
+    let stub = StubProvider::with_code("code-1", "sub", "mallory@gmail.example");
+    let server = spawn(Arc::clone(&stub)).await;
+    let alice = password_session(&server, "alice@example.com").await;
+    let auth_hash = session_auth_hash(&server, "alice@example.com");
+
+    let started = server.start_as("link", Some(&alice.token)).await;
+    assert_eq!(link(&server, &started, "code-1", &alice.token, Some(&auth_hash)).await.status(), StatusCode::OK);
+
+    // Empty the shared budget. Each of these is refused for its own reason,
+    // and each costs a token before the refusal — which is the whole point.
+    let mut starved = false;
+    for _ in 0..RateLimits::default().password_burst + 1 {
+        let response = server
+            .client
+            .post(format!("{}/password", server.base))
+            .bearer_auth(&alice.token)
+            .json(&serde_json::json!({
+                "current_auth_hash": "not a credential",
+                "new_auth_hash": "not a credential either",
+                "encrypted_private_key": alice.user.encrypted_private_key,
+                "rewrapped_keys": [],
+            }))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            starved = true;
+            break;
+        }
+    }
+    assert!(starved, "the passphrase budget should run out within its burst");
+
+    // The remedy still works on its own budget.
+    let removed = unlink(&server, &alice.token, &auth_hash).await;
+    assert_eq!(removed.status(), StatusCode::OK, "{}", removed.text().await.unwrap());
+    assert_eq!(removed.json::<SessionResponse>().await.unwrap().user.google_email, None);
+}
+
 /// An account created through Google cannot link a second identity, and is
 /// told so before anything is spent.
 ///
@@ -991,9 +1040,14 @@ async fn a_malformed_passphrase_proof_is_refused_on_both_routes() {
     let started = server.start_as("link", Some(&alice.token)).await;
     let refused = link(&server, &started, "code-1", &alice.token, Some(&malformed)).await;
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    // Named, so this keeps testing the credential check rather than passing
+    // because some length or body-size cap rejected it earlier.
+    assert!(refused.text().await.unwrap().contains("auth hash"));
     assert_eq!(stub.exchanges().len(), 0, "a malformed proof must not reach the provider");
 
-    assert_eq!(unlink(&server, &alice.token, &malformed).await.status(), StatusCode::BAD_REQUEST);
+    let refused = unlink(&server, &alice.token, &malformed).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("auth hash"));
     // Nothing was consumed: the attempt still finishes with the real proof.
     let proof = session_auth_hash(&server, "alice@example.com");
     let good = link(&server, &started, "code-1", &alice.token, Some(&proof)).await;

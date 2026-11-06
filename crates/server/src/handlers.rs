@@ -1365,11 +1365,6 @@ pub async fn oauth_link(
     ApiJson(body): ApiJson<OAuthLinkRequest>,
 ) -> ApiResult<Json<UserProfile>> {
     spend_account_budget(&state.link_limiter, user.id, "google link")?;
-    // The verify below is the same Argon2 work a login does, so it comes out
-    // of the budget that bounds passphrase guessing rather than only out of
-    // the one that bounds how often this account may make the server call
-    // Google. Otherwise linking would quietly widen the guess rate.
-    spend_account_budget(&state.password_limiter, user.id, "google link passphrase")?;
 
     // Both checks happen before the attempt is spent and before Google is
     // called: a caller who cannot prove the passphrase has no business doing
@@ -1388,6 +1383,14 @@ pub async fn oauth_link(
                 .into(),
         )
     })?;
+    // Spent here rather than at the top, because this is the only line below
+    // that costs an Argon2 pass: the two refusals above reject without one and
+    // should not burn the budget that bounds passphrase guessing. That budget
+    // is shared with `change_password` so that linking cannot be used to widen
+    // the guess rate — but deliberately not with `oauth_unlink`, which has to
+    // stay reachable while someone is spending this one; see
+    // `AppState::unlink_limiter`.
+    spend_account_budget(&state.password_limiter, user.id, "google link passphrase")?;
     verify_account_passphrase(stored_credential, presented).await?;
 
     // The caller's id is part of what selects the attempt, so a link can only
@@ -1443,9 +1446,11 @@ pub async fn oauth_unlink(
     user: AuthUser,
     ApiJson(body): ApiJson<OAuthUnlinkRequest>,
 ) -> ApiResult<Json<SessionResponse>> {
-    // The Argon2 verify below is the cost worth bounding, and it is the same
-    // cost a passphrase change pays, so it comes out of the same budget.
-    spend_account_budget(&state.password_limiter, user.id, "google unlink")?;
+    // Its own budget, not the one `change_password` and `oauth_link` share.
+    // This route is how an account holder evicts a link they did not ask for,
+    // and whoever put that link there can hold the shared budget at zero by
+    // spending it from the other two; see `AppState::unlink_limiter`.
+    spend_account_budget(&state.unlink_limiter, user.id, "google unlink")?;
     // Read before the passphrase is checked, so a Google-only account is told
     // why it cannot unlink rather than that it supplied a passphrase it has no
     // business having. It also saves an Argon2 verify on a request that cannot
@@ -1458,7 +1463,11 @@ pub async fn oauth_unlink(
     }
     verify_account_passphrase(stored_credential, body.current_auth_hash.clone()).await?;
 
-    let mut tx = state.pool.begin().await?;
+    let mut tx = begin_write(&state.pool).await?;
+    // The delete comes first on purpose. It takes the write lock, and when it
+    // matches nothing this returns before any other statement has run — so the
+    // early return below has nothing to undo rather than relying on the
+    // rollback. Adding a read above it would give up both properties.
     let removed = sqlx::query("DELETE FROM oauth_identities WHERE user_id = ? AND provider = ?")
         .bind(user.id)
         .bind(oauth::PROVIDER_GOOGLE)

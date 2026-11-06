@@ -152,6 +152,16 @@ pub struct AppState {
     /// Throttles Google links per account, bounding the outbound requests one
     /// account can make the server perform.
     pub link_limiter: Arc<RateLimiter<i64>>,
+    /// Throttles unlinking per account, in a bucket of its own.
+    ///
+    /// Unlinking is the remedy for a link that should not be there, and it
+    /// verifies a passphrase, so sharing `password_limiter` would be the
+    /// obvious thing. It is also the wrong thing: whoever holds a stolen
+    /// session can spend that budget from `/oauth/link` or `/password` as fast
+    /// as it refills, and the owner trying to evict them would get a `429`.
+    /// The route that evicts an attacker must not draw on a budget the
+    /// attacker can empty.
+    pub unlink_limiter: Arc<RateLimiter<i64>>,
 }
 
 /// Open (creating if needed) the SQLite database and apply migrations.
@@ -193,11 +203,14 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     let oauth_link_limit = limit_for(limits.login_burst, limits.login_refill);
     // Removing a link verifies a passphrase, which is the same work a login
     // does, so it gets an address bucket of the same shape. The per-account
-    // ceiling is `AppState::password_limiter`, which is what the handler spends.
+    // ceiling is `AppState::unlink_limiter`, which is what the handler spends.
     let oauth_unlink_limit = limit_for(limits.login_burst, limits.login_refill);
     let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
     let password_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
     let link_limiter = Arc::new(RateLimiter::new(limits.link_burst, limits.link_refill));
+    // Same shape as the password budget, but its own bucket; see
+    // `AppState::unlink_limiter` for why it must not share one.
+    let unlink_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
 
     let api = Router::new()
         .route(
@@ -249,7 +262,14 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .nest("/api", api)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState { pool, config: Arc::new(config), lookup_limiter, password_limiter, link_limiter })
+        .with_state(AppState {
+            pool,
+            config: Arc::new(config),
+            lookup_limiter,
+            password_limiter,
+            link_limiter,
+            unlink_limiter,
+        })
 }
 
 /// Convenience for callers that want the connect-info service type spelled out.

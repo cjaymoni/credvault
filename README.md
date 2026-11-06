@@ -171,13 +171,19 @@ numbers and nothing else — not the build version, which would only tell a
 passer-by which advisories to look up.
 
 ```json
-{ "status": "ok", "protocol": 1, "min_client_protocol": 1 }
+{ "status": "ok", "protocol": 2, "min_client_protocol": 1 }
 ```
 
 `protocol` is what the server speaks; `min_client_protocol` is the oldest
 client it serves. The app reads both before it derives a key or sends a
 credential, and stops with a plain message when the two cannot work together.
 A server ahead of the app that still serves the app's protocol works normally.
+
+Protocol 2 added the passphrase proof on linking and the unlink route. This app
+will not talk to a protocol-1 server at all: that server would accept a link
+request, ignore the proof, and answer in a shape the app reads as failure —
+leaving a Google sign-in on the account that the app cannot show you and that
+server cannot remove. Update the server, then the app.
 
 **The encryption scheme**, on every encrypted blob — your private key, each
 secret's key, each secret's contents. It covers the key derivation behind the

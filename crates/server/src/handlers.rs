@@ -299,11 +299,19 @@ pub async fn logout(State(state): State<AppState>, user: AuthUser) -> ApiResult<
 /// budgets again. Handing back a token makes the next request immediate, and
 /// an attacker needs a whole OAuth round trip to interfere with it.
 ///
-/// Deliberately unrationed: every other per-account limit can be emptied by
-/// whoever is already signed in as that account, so the route that evicts them
-/// must not have one. It can afford to go without — it is authenticated, it is
-/// one indexed delete, there is no Argon2 and no outbound call, and flooding
-/// it costs the flooder their own session on the first request.
+/// Rationed per address and deliberately never per account. Every per-account
+/// limit can be emptied by whoever is already signed in as that account, so a
+/// bucket keyed that way would let the party being evicted block their own
+/// eviction. An address bucket throttles a flooder at their own address and
+/// leaves the owner's alone, and the owner needs one request against a burst
+/// of ten.
+///
+/// A limiter of some kind is needed because handing back a token makes this
+/// route self-renewing: it costs the caller nothing, and each call takes the
+/// single write lock three times — the purge, the insert, and the expiry
+/// housekeeping inside [`issue_session`]. Before the replacement, the first
+/// request killed the caller's token and every further one had to go through
+/// `/login`, which was throttle enough on its own.
 ///
 /// Both of the other handlers that end every session, [`change_password`] and
 /// [`oauth_unlink`], replace the caller's for the same reason.

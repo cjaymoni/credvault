@@ -101,8 +101,9 @@ Argon2id on your device. The server stores no password for such an account.
   account except the one you are using, and asks for nothing but the button.
   Both halves are deliberate. It is the move to make first if you think someone
   else is signed in as you: every other per-account limit can be used up by
-  whoever is already signed in, and this one has no limit at all, so it still
-  works when the rest are refusing. And you stay signed in here, so you can go
+  whoever is already signed in, and this one is limited by where the request
+  comes from rather than by whose account it is, so it still works when the
+  rest are refusing. And you stay signed in here, so you can go
   straight on to remove a Google sign-in they added — if this signed you out
   too, you would be sitting through a sign-in while they came back. To sign out
   this device as well, use "Log out" afterwards.

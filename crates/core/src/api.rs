@@ -63,6 +63,10 @@ const REDACTED: &str = "<redacted>";
 /// older client would misread. A field that older peers can ignore safely is
 /// additive and needs no bump.
 ///
+/// 2 is this branch and has not been released — no tag, and `main` serves 1 —
+/// so the three contract changes below are one version rather than three.
+/// Once a build serving 2 reaches anyone, the next change is a 3.
+///
 /// 2: `/oauth/link` gained a required `current_auth_hash` and now answers with
 /// a profile where it answered `204`; `/oauth/unlink` is new and answers with
 /// a fresh session, because removing a link ends every session the link could

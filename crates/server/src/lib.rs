@@ -222,6 +222,13 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
     // does, so it gets an address bucket of the same shape. The per-account
     // ceiling is `AppState::unlink_limiter`, which is what the handler spends.
     let oauth_unlink_limit = limit_for(limits.login_burst, limits.login_refill);
+    // Ending other sessions hands the caller a replacement, so it no longer
+    // costs the caller their own token and is no longer self-limiting: an
+    // authenticated caller could loop it, and each pass takes SQLite's single
+    // write lock three times. Per address, deliberately, and never per
+    // account — the party this route evicts holds a session for the victim's
+    // account and could empty an account bucket to block their own eviction.
+    let sessions_limit = limit_for(limits.login_burst, limits.login_refill);
     let lookup_limiter = Arc::new(RateLimiter::new(limits.lookup_burst, limits.lookup_refill));
     let password_limiter = Arc::new(RateLimiter::new(limits.password_burst, limits.password_refill));
     let link_limiter = Arc::new(RateLimiter::new(limits.link_burst, limits.link_refill));
@@ -257,7 +264,11 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
             post(handlers::oauth_unlink).layer(middleware::from_fn_with_state(oauth_unlink_limit, ratelimit::limit)),
         )
         .route("/logout", post(handlers::logout))
-        .route("/sessions", delete(handlers::logout_other_devices))
+        .route(
+            "/sessions",
+            delete(handlers::logout_other_devices)
+                .layer(middleware::from_fn_with_state(sessions_limit, ratelimit::limit)),
+        )
         .route("/me", get(handlers::me))
         .route("/password", post(handlers::change_password))
         .route("/users/lookup", get(handlers::lookup_user))

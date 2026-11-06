@@ -449,7 +449,12 @@ function cancelGoogleSignIn() {
 /// signed into and a session alone must not be enough to do that. The server
 /// enforces it; asking here is what makes the rule visible and catches a typo
 /// before a trip through the browser.
-function renderGoogleLinkForm() {
+///
+/// `afterEviction` means the user has just signed out their other devices and
+/// was brought straight here. It adds the two things they need and cannot
+/// infer: that the eviction worked, and that "too many requests" on the
+/// removal means wait and try again rather than it failed.
+function renderGoogleLinkForm({ afterEviction = false } = {}) {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
@@ -459,6 +464,14 @@ function renderGoogleLinkForm() {
   $("detail").innerHTML = `
     <form class="card" id="google-link-form" novalidate aria-labelledby="google-link-title">
       <h2 id="google-link-title" class="card-title">${icon("lock")} ${linked ? "Google sign-in" : "Link Google"}</h2>
+      ${afterEviction
+        ? `<p class="card-lead">
+             Your other devices are signed out. If someone else added this sign-in, removing it
+             now is what keeps them out &mdash; they would have to go through Google again to
+             get back. If the server says there have been too many requests, wait the few
+             seconds it names and try again; it has not failed.
+           </p>`
+        : ""}
       <p class="card-lead">
         ${linked
           ? `<strong>${esc(linked)}</strong> can sign in to this account without your passphrase.
@@ -539,15 +552,24 @@ async function submitSignOutOthers(event) {
   try {
     state.user = await invoke("sign_out_other_devices");
     renderGoogleChip();
+    toast("Other devices signed out");
+    // The few seconds this just bought are the whole point, so spend them on
+    // the thing it bought them for rather than leaving the user to find the
+    // chip themselves. Only when there is a link to remove: otherwise the list
+    // is where they should land.
+    if (state.user?.google_email) {
+      renderGoogleLinkForm({ afterEviction: true });
+      return;
+    }
     state.editing = false;
     renderDetail();
     showListScreen();
-    toast("Other devices signed out");
   } catch (error) {
-    // When the answer was lost the command signs this device out too, because
-    // whether the others went cannot be known. Follow it here rather than
-    // leaving a card over a vault this app no longer holds a session for.
-    if (String(error?.code ?? "") === "locked") {
+    // Both failure codes mean this device is signed out as well, so follow it
+    // here rather than leaving a card over a vault this app no longer holds a
+    // session for. The message says which of the two it was.
+    const code = String(error?.code ?? "");
+    if (code === "ambiguous" || code === "signed-out") {
       signOutAfterAmbiguousChange(String(error?.message ?? error));
       return;
     }

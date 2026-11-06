@@ -568,8 +568,48 @@ async fn expired_sessions_are_rejected_and_pruned() {
     assert_eq!(count, 1);
 }
 
+/// Ending other sessions is throttled per address, because handing the caller
+/// a replacement took away the throttle it used to have.
+///
+/// Before the replacement, the first call killed the caller's token, so a
+/// flood had to go back through `/login` for every iteration. Now it costs the
+/// caller nothing, and each call takes SQLite's single write lock three times
+/// — the purge, the insert, and the expiry housekeeping — which on a
+/// single-writer database is a usable denial of service against every other
+/// write.
+///
+/// Per address and never per account: the party this route exists to evict
+/// holds a session for the victim's account, so an account bucket would let
+/// them block their own eviction.
 #[tokio::test]
-async fn logout_invalidates_only_that_token_and_logout_everywhere_all() {
+async fn ending_other_sessions_is_rate_limited_per_address() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "alice-password").await;
+
+    // Each call answers with a fresh token, so the flood can keep going; that
+    // is exactly why the bucket is needed.
+    let mut token = alice.token.clone();
+    let mut statuses = Vec::new();
+    for _ in 0..11 {
+        let response =
+            server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&token).send().await.unwrap();
+        let status = response.status();
+        statuses.push(status);
+        if status == StatusCode::OK {
+            token = response.json::<SessionResponse>().await.unwrap().token;
+        }
+    }
+    assert!(statuses[..10].iter().all(|s| *s == StatusCode::OK), "{statuses:?}");
+    assert_eq!(statuses[10], StatusCode::TOO_MANY_REQUESTS);
+
+    let response = server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&token).send().await.unwrap();
+    assert!(response.headers().get("retry-after").is_some(), "a throttled caller is told how long to wait");
+}
+
+/// `/logout` ends one session; `DELETE /sessions` ends the others and replaces
+/// the caller's, so the person who asked can carry straight on.
+#[tokio::test]
+async fn logout_invalidates_one_token_and_sessions_delete_spares_the_caller() {
     let server = spawn().await;
     let alice = register(&server, "alice@example.com", "alice-password").await;
     let master = MasterKey::derive("alice-password", "alice@example.com").unwrap();

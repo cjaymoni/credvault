@@ -619,21 +619,31 @@ async fn logout(state: State<'_, AppState>) -> CommandResult<()> {
 ///
 /// The move to make first when someone else may be signed in. Every
 /// per-account budget can be emptied by whoever already holds a session for
-/// that account, so the route that evicts them carries no budget at all — it
-/// answers when the rest are refusing. This device keeps a token so the next
-/// thing the user does, usually removing the Google link that let the other
-/// party in, goes out immediately rather than after a sign-in; the evicted
-/// party needs a whole OAuth round trip to come back and interfere.
+/// that account, so the route that evicts them carries no per-account budget —
+/// only one keyed by address, which the evicted party cannot spend on the
+/// owner's behalf. It answers when the rest are refusing. This device keeps a
+/// token so the next thing the user does, usually removing the Google link
+/// that let the other party in, goes out immediately rather than after a
+/// sign-in; the evicted party needs a whole OAuth round trip to come back and
+/// interfere.
 ///
 /// Unlike [`logout`] this is reported rather than best-effort, and a failure
 /// signs this device out too. Someone reaches for it believing another session
-/// exists that should not, and the one answer that must never be given
-/// wrongly is that it is gone. A lost answer is not a failed delete — the
-/// server may have purged everything and died on the way back — so the
-/// ambiguity is resolved toward the safe side and said out loud.
+/// exists that should not, and the one answer that must never be given wrongly
+/// is that it is gone.
+///
+/// Two kinds of failure, told apart because they mean different things to the
+/// person reading them. A lost answer or a server error is genuinely
+/// ambiguous: the purge commits before the replacement is issued, so a `500`
+/// can mean it happened. Anything else — a `401`, a refusal — means the
+/// request did not run, and saying "it is not clear" would be inventing a
+/// doubt. Both sign this device out, because that is the safe side either way;
+/// only the sentence differs.
 ///
 /// # Errors
-/// `locked` when the answer was lost, carrying what is and is not known.
+/// `ambiguous` when the answer was lost and the outcome is unknown;
+/// `signed-out` when the request plainly did not run. Both mean this device is
+/// no longer signed in.
 #[tauri::command]
 async fn sign_out_other_devices(state: State<'_, AppState>) -> CommandResult<UserSummary> {
     let (api, user_id) = with_session(&state, |session| Ok((session.api.clone(), session.user_id)))?;
@@ -642,13 +652,18 @@ async fn sign_out_other_devices(state: State<'_, AppState>) -> CommandResult<Use
         Err(error) => {
             clear_local_session(&state);
             clear_pending_google(&state);
-            return Err(CommandError::new(
-                "locked",
-                format!(
-                    "{error}. It is not clear whether your other devices were signed out, so this one has been \
-                     signed out too. Sign in again and check."
-                ),
-            ));
+            let ambiguous = matches!(error, ClientError::Network(_) | ClientError::Server(_));
+            return Err(if ambiguous {
+                CommandError::new(
+                    "ambiguous",
+                    format!(
+                        "{error}. It is not clear whether your other devices were signed out, so this one has \
+                         been signed out too. Sign in again and check."
+                    ),
+                )
+            } else {
+                CommandError::new("signed-out", format!("{error}. Nothing was signed out. Sign in again."))
+            });
         }
     };
     with_same_session(&state, user_id, |session| {

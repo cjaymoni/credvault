@@ -21,6 +21,11 @@ pub enum ClientError {
     Conflict(String),
     #[error("your session has expired; please log in again")]
     Unauthorized,
+    /// 429: throttled by the server, which rejects in middleware before the
+    /// handler runs. A caller can therefore be certain nothing happened, which
+    /// is the whole reason this is not folded into [`ClientError::Server`].
+    #[error("{message}")]
+    TooManyRequests { message: String, retry_after_secs: Option<u64> },
     #[error("invalid server URL: {0}")]
     InvalidUrl(String),
     /// This build and the server do not speak the same protocol. Reported
@@ -106,8 +111,17 @@ impl ApiClient {
         if status == StatusCode::UNAUTHORIZED && self.token.is_some() {
             return Err(ClientError::Unauthorized);
         }
+        // Read before the body is consumed below.
+        let retry_after_secs = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
         let message =
             response.json::<ErrorBody>().await.map(|b| b.error).unwrap_or_else(|_| format!("server returned {status}"));
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ClientError::TooManyRequests { message, retry_after_secs });
+        }
         if status == StatusCode::CONFLICT {
             return Err(ClientError::Conflict(message));
         }

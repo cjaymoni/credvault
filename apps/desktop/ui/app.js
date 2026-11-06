@@ -468,8 +468,7 @@ function renderGoogleLinkForm({ afterEviction = false } = {}) {
         ? `<p class="card-lead">
              Your other devices are signed out. If someone else added this sign-in, removing it
              now is what keeps them out &mdash; they would have to go through Google again to
-             get back. If the server says there have been too many requests, wait the few
-             seconds it names and try again; it has not failed.
+             get back.
            </p>`
         : ""}
       <p class="card-lead">
@@ -573,9 +572,11 @@ async function submitSignOutOthers(event) {
       signOutAfterAmbiguousChange(String(error?.message ?? error));
       return;
     }
-    setError("soa-error", error);
+    setError("soa-error", code === "throttled" ? retryLater(error) : error);
   } finally {
-    setBusy($("btn-soa-save"), false);
+    // The success path replaces `#detail`, so this button may be gone. Checked
+    // rather than left to `setBusy` to absorb, matching `submitPassphraseChange`.
+    if ($("btn-soa-save")?.isConnected) setBusy($("btn-soa-save"), false);
   }
 }
 
@@ -599,10 +600,18 @@ async function submitGoogleLinkChange(event) {
     renderDetail();
     showListScreen();
   } catch (error) {
-    setError("gl-error", error);
+    // Throttling is not failure, and the difference matters most to someone
+    // trying to remove a sign-in that should not be there. Say what to do.
+    setError("gl-error", String(error?.code ?? "") === "throttled" ? retryLater(error) : error);
   } finally {
     setBusy($("btn-gl-save"), false);
   }
+}
+
+/// Turn a throttled error into an instruction rather than a verdict.
+function retryLater(error) {
+  const message = String(error?.message ?? error);
+  return `${message} Nothing was changed — wait and try again.`;
 }
 
 function showApp(user) {

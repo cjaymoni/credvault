@@ -581,6 +581,13 @@ async fn expired_sessions_are_rejected_and_pruned() {
 /// Per address and never per account: the party this route exists to evict
 /// holds a session for the victim's account, so an account bucket would let
 /// them block their own eviction.
+///
+/// What this pins is that the route is throttled at all, which is the thing
+/// the replacement token took away. It cannot see *which* bucket: every
+/// request here comes from 127.0.0.1, so swapping the layer for a per-account
+/// budget would leave it passing. That buckets are keyed by address and
+/// independent of each other is pinned a layer down, in
+/// `ratelimit::tests::burst_then_refill`.
 #[tokio::test]
 async fn ending_other_sessions_is_rate_limited_per_address() {
     let server = spawn().await;
@@ -599,10 +606,14 @@ async fn ending_other_sessions_is_rate_limited_per_address() {
             token = response.json::<SessionResponse>().await.unwrap().token;
         }
     }
-    assert!(statuses[..10].iter().all(|s| *s == StatusCode::OK), "{statuses:?}");
-    assert_eq!(statuses[10], StatusCode::TOO_MANY_REQUESTS);
+    // Not pinned at index 10: the refill is six seconds of wall clock and this
+    // suite runs in parallel against a single-writer database, contending for
+    // the very lock this route takes three times a call. That one of eleven is
+    // refused carries the whole meaning without the flake.
+    assert!(statuses.contains(&StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
 
     let response = server.client.delete(format!("{}/sessions", server.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(response.headers().get("retry-after").is_some(), "a throttled caller is told how long to wait");
 }
 

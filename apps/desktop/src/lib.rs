@@ -379,6 +379,9 @@ impl From<ClientError> for CommandError {
             ClientError::NotFound(_) => "not_found",
             ClientError::Conflict(_) => "conflict",
             ClientError::Unauthorized => "unauthorized",
+            // Its own code so the UI can say "wait and try again" rather than
+            // handing the user a server sentence to parse.
+            ClientError::TooManyRequests { .. } => "throttled",
             ClientError::InvalidUrl(_) => "invalid_url",
             ClientError::Incompatible(_) => "incompatible",
         };
@@ -652,6 +655,11 @@ async fn sign_out_other_devices(state: State<'_, AppState>) -> CommandResult<Use
         Err(error) => {
             clear_local_session(&state);
             clear_pending_google(&state);
+            // A throttled call is refused by middleware before the handler
+            // runs, so it is certain nothing was purged. It is only reachable
+            // at all because this route gained a limiter, and telling someone
+            // their other devices might be signed out when they are not is the
+            // one answer this command must never give wrongly.
             let ambiguous = matches!(error, ClientError::Network(_) | ClientError::Server(_));
             return Err(if ambiguous {
                 CommandError::new(

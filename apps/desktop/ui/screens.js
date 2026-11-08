@@ -131,6 +131,19 @@
     return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${key}` : `Ctrl+${key}`;
   }
 
+  /// The platforms whose windows come with a keyboard.
+  const KEYBOARD_PLATFORMS = ["macos", "windows", "linux"];
+
+  /// Whether a shortcut is worth naming on `platform`.
+  ///
+  /// A phone has no ⌘ or Ctrl to press, so printing one names a key that is
+  /// not there. It matters beyond the tooltip: the new-secret button's own
+  /// label is hidden on three of the five looks, which leaves `title` as the
+  /// whole of what a screen reader reads out.
+  function hasKeyboard(platform) {
+    return KEYBOARD_PLATFORMS.includes(platform);
+  }
+
   /// The controls that move between platforms, and the slot each one goes to.
   ///
   /// Every control exists once in the page and is moved into its slot at
@@ -155,5 +168,5 @@
     return PLACED_CONTROLS.map((control) => [control, table[control]]);
   }
 
-  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel };
+  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, hasKeyboard };
 });

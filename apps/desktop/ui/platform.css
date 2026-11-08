@@ -532,7 +532,7 @@
   --danger: #ff6961; --danger-hover: #ff857e; --danger-soft: #3a1f1c; --danger-border: #6d3029; --on-danger: #3d0a06;
   --focus: #40d3c2; --focus-ring: rgba(64, 211, 194, 0.4);
   --toast-bg: rgba(48, 48, 52, 0.96); --toast-fg: #ffffff; --toast-icon: #40d3c2;
-    --sheet-bg: #1f1f22; --sheet-cell: #303034;
+  --sheet-bg: #1f1f22; --sheet-cell: #303034;
   --av-bg-s: 30%; --av-bg-l: 26%; --av-fg-s: 55%; --av-fg-l: 78%;
 }
 

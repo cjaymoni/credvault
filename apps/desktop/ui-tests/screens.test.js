@@ -167,7 +167,7 @@ test("a budget that is not a number is refused rather than ignored", () => {
 // platform, so a misread costs the wrong styling, never safety, but it should
 // still be right.
 
-const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel } = require("../ui/screens.js");
+const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, hasKeyboard } = require("../ui/screens.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -229,18 +229,28 @@ test("asking for a platform with no layout fails loudly", () => {
 // one is printed. Printing the wrong one is the kind of detail the native
 // look exists to get right.
 
+/// What each platform should print, spelled out rather than derived, so the
+/// test fails if the rule changes and not only if the code does.
+const SPELLINGS = {
+  macos: "\u2318N",
+  ios: "\u2318N",
+  windows: "Ctrl+N",
+  linux: "Ctrl+N",
+  android: "Ctrl+N",
+};
+
 test("the shortcut is spelled the way the platform's own apps spell it", () => {
-  assert.equal(shortcutLabel("macos", "N"), "\u2318N");
-  assert.equal(shortcutLabel("ios", "K"), "\u2318K");
-  assert.equal(shortcutLabel("windows", "N"), "Ctrl+N");
-  assert.equal(shortcutLabel("linux", "N"), "Ctrl+N");
-  assert.equal(shortcutLabel("android", "N"), "Ctrl+N");
+  for (const [platform, expected] of Object.entries(SPELLINGS)) {
+    assert.equal(shortcutLabel(platform, "N"), expected, platform);
+  }
+  assert.equal(shortcutLabel("macos", "K"), "\u2318K");
 });
 
-test("every platform the app knows gets a label, and an unknown one gets Ctrl", () => {
-  for (const platform of PLATFORMS) {
-    assert.match(shortcutLabel(platform, "N"), /^(\u2318N|Ctrl\+N)$/, platform);
-  }
+test("no platform the app knows is missing from the table above", () => {
+  assert.deepEqual([...PLATFORMS].sort(), Object.keys(SPELLINGS).sort());
+});
+
+test("an unknown platform gets Ctrl rather than a label from Object's prototype", () => {
   for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
     assert.equal(shortcutLabel(unknown, "N"), "Ctrl+N", String(unknown));
   }
@@ -251,4 +261,20 @@ test("a shortcut with no key fails loudly rather than naming one that is undefin
   assert.throws(() => shortcutLabel("macos", ""), TypeError);
   assert.throws(() => shortcutLabel("macos", null), TypeError);
   assert.throws(() => shortcutLabel("windows", 7), TypeError);
+});
+
+// ----- which platforms have a keyboard to press the shortcut on --------------
+
+test("only the platforms with a keyboard name a shortcut", () => {
+  assert.equal(hasKeyboard("macos"), true);
+  assert.equal(hasKeyboard("windows"), true);
+  assert.equal(hasKeyboard("linux"), true);
+  assert.equal(hasKeyboard("ios"), false);
+  assert.equal(hasKeyboard("android"), false);
+});
+
+test("an unknown platform is not assumed to have a keyboard from Object's prototype", () => {
+  for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
+    assert.equal(hasKeyboard(unknown), false, String(unknown));
+  }
 });

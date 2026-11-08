@@ -71,10 +71,11 @@ function placeControls() {
 }
 placeControls();
 
-/// Name the shortcuts in the two tooltips that carry one. Written here rather
-/// than in the markup because the right spelling is not known until the
-/// platform is.
+/// Put the shortcut in the two tooltips that can carry one. Written here
+/// rather than in the markup because the right spelling is not known until
+/// the platform is, and on a phone there is no right spelling at all.
 function labelShortcuts() {
+  if (!Screens.hasKeyboard(PLATFORM)) return;
   $("btn-new").title = `New secret (${NEW_SECRET_SHORTCUT})`;
   $("filter").title = `Search (${SEARCH_SHORTCUT})`;
 }

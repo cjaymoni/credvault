@@ -188,7 +188,12 @@ button { font: inherit; color: inherit; }
 .ic { width: var(--ic); height: var(--ic); flex: none; }
 
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-input:focus-visible, textarea:focus-visible {
+/* A focused text field is marked by its border turning --focus; the shadow is
+   only a halo around it, and on its own it is under 3:1 on every palette. A
+   checkbox is drawn by the platform and has no border to turn, so it must not
+   match this rule -- `outline: none` would take the browser's own ring away
+   and leave it with just that halo. It falls through to the outline above. */
+input:not([type="checkbox"]):focus-visible, textarea:focus-visible {
   outline: none;
   border-color: var(--focus);
   box-shadow: 0 0 0 3px var(--focus-ring);

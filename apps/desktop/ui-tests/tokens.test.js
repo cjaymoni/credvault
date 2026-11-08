@@ -12,18 +12,25 @@ const path = require("node:path");
 const { PLATFORMS } = require("../ui/screens.js");
 
 const UI_DIR = path.join(__dirname, "../ui");
-/// Every stylesheet, read from disk rather than listed, so a palette moved
-/// into a new file cannot slip past these tests.
+/// Every stylesheet in ui/, read from the directory rather than listed, so a
+/// palette moved into a new file cannot slip past these tests. The trade is
+/// that a stylesheet vendored in from elsewhere will fail the dialect check
+/// below rather than being skipped, which is deliberate: these tests would
+/// otherwise quietly stop covering whatever it contains.
 const STYLESHEETS = fs.readdirSync(UI_DIR).filter((name) => name.endsWith(".css")).sort();
 
 // ----- a small CSS reader ----------------------------------------------------
 //
-// These two stylesheets are written in a narrow dialect: no strings or url()
-// in a declaration value, no statement at-rules, no native nesting. The
-// reader below assumes all three, and assertStylesheetDialect() fails loudly
-// if one stops holding, because each assumption fails differently -- a quote
-// invents declarations silently, a brace inside a string throws, and a
-// statement at-rule would swallow the rule after it.
+// The stylesheets are written in a narrow dialect, and the reader below
+// assumes it: block at-rules only, no nested style rules, and no delimiter of
+// its own inside a string. Each assumption fails differently when broken -- a
+// nested rule folds its declarations into the parent, a statement at-rule
+// swallows the rule after it, a `;` in a string invents declarations that are
+// not there -- and two of the three fail silently, so all three are asserted
+// rather than trusted.
+
+/// The at-rules the reader understands, all of which wrap a block.
+const BLOCK_AT_RULES = ["@media", "@supports", "@keyframes", "@font-face", "@layer"];
 
 /// Every rule in a stylesheet, flattened, as `{ at, selector, declarations }`.
 ///
@@ -46,8 +53,23 @@ function rules(css, at = []) {
     }
     assert.ok(close < css.length, `unbalanced braces in or before: ${prelude}`);
     const body = css.slice(open + 1, close);
-    if (prelude.startsWith("@")) found.push(...rules(body, [...at, prelude]));
-    else found.push({ at, selector: prelude, declarations: customProperties(body) });
+    if (prelude.startsWith("@")) {
+      const name = prelude.split(/[\s(]/)[0];
+      assert.ok(
+        BLOCK_AT_RULES.includes(name),
+        `${name} is not an at-rule the reader in this file handles. If it carries no block it swallows the rule after it. Extend it.`,
+      );
+      found.push(...rules(body, [...at, prelude]));
+    } else {
+      // A nested rule is the one break that makes the reader lie rather than
+      // fail: customProperties() scans the whole body, so the nested block's
+      // tokens are folded into this selector and the last one wins.
+      assert.ok(
+        !body.includes("{"),
+        `${prelude}: nested rule. The reader in this file folds its declarations into the parent. Extend it.`,
+      );
+      found.push({ at, selector: prelude, declarations: customProperties(body) });
+    }
     i = close + 1;
   }
 }
@@ -60,36 +82,49 @@ function stripComments(css) {
   return css.replace(/\/\*[\s\S]*?\*\//g, "");
 }
 
+/// Every quoted run in some CSS. Escapes are honoured, so a `\"` inside a
+/// string does not end it -- without that, text after the escape reads as if
+/// it were outside the quotes and is never checked.
+const QUOTED = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g;
+/// The same, over CSS that still has its comments, with comments taken first
+/// so their prose cannot be mistaken for a string.
+const COMMENT_OR_QUOTED = /\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g;
+
 /// Fail with a useful message if a stylesheet outgrows the reader above.
-/// Takes CSS with its comments already gone, and assumes no comment opened or
-/// closed inside a string -- the one assumption here that is not checked.
-function assertStylesheetDialect(name, css) {
-  for (const atRule of ["@import", "@charset", "@layer"]) {
-    assert.ok(
-      !css.includes(atRule),
-      `${name}: ${atRule} has no block, so the reader in this file would swallow the rule after it. Extend it.`,
-    );
-  }
+/// `raw` is the file as written; `css` is the same with comments gone.
+function assertStylesheetDialect(name, raw, css) {
   assert.ok(
     !css.includes("url("),
     `${name}: url() can hold a ; or a brace, which the reader in this file splits on. Extend it.`,
   );
   // Quotes themselves are fine and everywhere -- `[data-platform="macos"]`, a
   // font stack naming "SF Pro Text". What the reader cannot survive is one of
-  // its own delimiters inside a string: a `;` invents a declaration that is
-  // not there, a brace throws.
-  for (const [quoted] of css.matchAll(/"[^"]*"|'[^']*'/g)) {
+  // its own delimiters inside a string.
+  for (const [quoted] of css.matchAll(QUOTED)) {
     assert.ok(
       !/[;{}]/.test(quoted),
       `${name}: ${quoted} holds a delimiter the reader in this file splits on. Extend it.`,
+    );
+  }
+  // Checked against the file before comments were stripped, because a comment
+  // delimiter inside a string would have made stripComments() cut in the
+  // wrong place and there would be nothing left to find. Comments are matched
+  // first so that an apostrophe in one -- "the platform's own apps" -- is read
+  // as prose rather than as the start of a string.
+  for (const [token] of raw.matchAll(COMMENT_OR_QUOTED)) {
+    if (token.startsWith("/*")) continue;
+    assert.ok(
+      !token.includes("/*") && !token.includes("*/"),
+      `${name}: ${token} holds a comment delimiter, so stripComments() cuts in the wrong place. Extend it.`,
     );
   }
 }
 
 const ALL_RULES = [];
 for (const name of STYLESHEETS) {
-  const css = stripComments(fs.readFileSync(path.join(UI_DIR, name), "utf8"));
-  assertStylesheetDialect(name, css);
+  const raw = fs.readFileSync(path.join(UI_DIR, name), "utf8");
+  const css = stripComments(raw);
+  assertStylesheetDialect(name, raw, css);
   ALL_RULES.push(...rules(css));
 }
 
@@ -102,7 +137,7 @@ function declarationsFor(selector, { inDarkMedia }) {
   return ALL_RULES.filter(
     (rule) =>
       rule.selector === selector &&
-      (inDarkMedia ? rule.at.includes(DARK_MEDIA) : rule.at.length === 0),
+      (inDarkMedia ? rule.at.includes(DARK_MEDIA) : !rule.at.includes(DARK_MEDIA)),
   ).flatMap((rule) => rule.declarations);
 }
 
@@ -127,23 +162,29 @@ const DARK_PALETTES = [
 // ----- the table above has to cover the stylesheets --------------------------
 //
 // Every test below walks DARK_PALETTES, so a palette the stylesheets define
-// but the table never names is not checked by any of them -- it would pass
-// black, white and drifted without a word. This is the same hole the shortcut
-// table in screens.test.js closes, read off the CSS instead of a constant.
+// but the table never names is checked by nothing -- it would pass black,
+// white and drifted without a word. Both sides of every pair are enumerated,
+// and neither is matched on the shape of its selector: shape is the thing
+// that varies (a selector list, an unquoted attribute value, a platform
+// added under the OS preference and nowhere else), so a pattern written
+// around today's house style turns a palette it does not recognise into one
+// that simply is not there.
 
-/// A top-level `[data-theme="dark"]` block that actually carries tokens.
-/// `:root[data-theme="dark"] { color-scheme: dark; }` declares none, so the
-/// length check leaves it out.
-const DARK_SELECTOR = /^:root[^,{]*\[data-theme="dark"\]$/;
+/// A rule that carries tokens and so is part of some palette.
+const carriesTokens = (rule) => rule.declarations.length > 0;
 
 test("the table above names every dark palette the stylesheets define", () => {
-  const inStylesheets = ALL_RULES.filter(
-    (rule) => rule.at.length === 0 && DARK_SELECTOR.test(rule.selector) && rule.declarations.length > 0,
-  ).map((rule) => rule.selector);
-  assert.deepStrictEqual(
-    [...new Set(inStylesheets)].sort(),
-    DARK_PALETTES.map(([, , themeSelector]) => themeSelector).sort(),
+  const underPreference = ALL_RULES.filter((rule) => rule.at.includes(DARK_MEDIA) && carriesTokens(rule));
+  const underSetting = ALL_RULES.filter(
+    (rule) =>
+      !rule.at.includes(DARK_MEDIA) &&
+      rule.selector.includes("data-theme") &&
+      !rule.selector.includes("light") &&
+      carriesTokens(rule),
   );
+  const unique = (found) => [...new Set(found.map((rule) => rule.selector))].sort();
+  assert.deepStrictEqual(unique(underPreference), DARK_PALETTES.map(([, media]) => media).sort());
+  assert.deepStrictEqual(unique(underSetting), DARK_PALETTES.map(([, , theme]) => theme).sort());
 });
 
 test("the palettes are the platforms the app knows, and nothing else", () => {
@@ -180,12 +221,29 @@ const BLACK = [0, 0, 0];
 const WHITE = [255, 255, 255];
 const KEYWORDS = { black: BLACK, white: WHITE };
 const BACKGROUND_TOKENS = ["--bg", "--content-bg", "--sidebar-bg"];
+const CHANNEL_MAX = 255;
+
+/// Whether `value` lets what is behind it through. Such a token has no colour
+/// of its own to judge: what it renders as depends on its ancestor, which
+/// this test cannot see. `rgba(255, 255, 255, 0.87)` is Material's dark body
+/// text and renders near #dedede -- calling it pure white would be a
+/// confident wrong answer, which is worse than declining to answer.
+function isTranslucent(value) {
+  const text = value.trim().toLowerCase();
+  if (text === "transparent") return true;
+  const functional = /^rgba?\(([^)]*)\)$/.exec(text);
+  if (!functional) return false;
+  const parts = functional[1].split(/[\s,/]+/).filter(Boolean);
+  return parts.length > 3 && Number(parts[3]) < 1;
+}
 
 /// `value` as `[r, g, b]`, or null if it is written in a form this test does
-/// not read. Alpha is dropped: a token these tests cover is always opaque.
+/// not read. Only called for values isTranslucent() has already passed on,
+/// so any alpha here is 1.
 function toRgb(value) {
   const text = value.trim().toLowerCase();
   if (Object.hasOwn(KEYWORDS, text)) return KEYWORDS[text];
+  const channel = (n) => Math.min(CHANNEL_MAX, Math.max(0, Math.round(n)));
   const hex = /^#([0-9a-f]+)$/.exec(text);
   if (hex) {
     const digits = hex[1];
@@ -196,7 +254,7 @@ function toRgb(value) {
   const functional = /^rgba?\(([^)]*)\)$/.exec(text);
   if (functional) {
     const channels = functional[1].split(/[\s,/]+/).filter(Boolean).slice(0, 3).map(Number);
-    if (channels.length === 3 && channels.every(Number.isFinite)) return channels;
+    if (channels.length === 3 && channels.every(Number.isFinite)) return channels.map(channel);
   }
   return null;
 }
@@ -213,10 +271,12 @@ test("no dark palette uses pure black for a background or pure white for text", 
         // A palette inherits any token it does not set, so only what it
         // declares is its to answer for.
         if (!Object.hasOwn(declared, token)) continue;
-        const rgb = toRgb(declared[token]);
-        assert.ok(rgb, `${name}: ${token} is ${declared[token]}, which this test cannot read. Extend toRgb().`);
+        const value = declared[token];
+        if (isTranslucent(value)) continue;
+        const rgb = toRgb(value);
+        assert.ok(rgb, `${name}: ${token} is ${value}, which this test cannot read. Extend toRgb().`);
         const forbidden = token === "--text" ? WHITE : BLACK;
-        assert.notDeepStrictEqual(rgb, forbidden, `${name}: ${token} is ${declared[token]}`);
+        assert.notDeepStrictEqual(rgb, forbidden, `${name}: ${token} is ${value}`);
       }
     }
   }

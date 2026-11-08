@@ -167,7 +167,7 @@ test("a budget that is not a number is refused rather than ignored", () => {
 // platform, so a misread costs the wrong styling, never safety, but it should
 // still be right.
 
-const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, namesShortcuts } = require("../ui/screens.js");
+const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts } = require("../ui/screens.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -254,6 +254,28 @@ test("an unknown platform gets Ctrl rather than a label from Object's prototype"
   for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
     assert.equal(shortcutLabel(unknown, "N"), "Ctrl+N", String(unknown));
   }
+});
+
+test("the announced spelling uses the spec's key names, not the printed glyph", () => {
+  assert.equal(shortcutKeys("macos", "N"), "Meta+N");
+  assert.equal(shortcutKeys("ios", "K"), "Meta+K");
+  assert.equal(shortcutKeys("windows", "N"), "Control+N");
+  assert.equal(shortcutKeys("linux", "N"), "Control+N");
+  assert.equal(shortcutKeys("android", "N"), "Control+N");
+});
+
+test("the printed shortcut and the announced one agree on which modifier it is", () => {
+  for (const platform of [...PLATFORMS, "beos", "", null, undefined, "__proto__"]) {
+    const printed = shortcutLabel(platform, "N").startsWith("\u2318");
+    const announced = shortcutKeys(platform, "N").startsWith("Meta");
+    assert.equal(printed, announced, String(platform));
+  }
+});
+
+test("an announced shortcut with no key fails loudly, the same as a printed one", () => {
+  assert.throws(() => shortcutKeys("macos"), TypeError);
+  assert.throws(() => shortcutKeys("macos", ""), TypeError);
+  assert.throws(() => shortcutKeys("windows", 7), TypeError);
 });
 
 test("a shortcut with no key fails loudly rather than naming one that is undefined", () => {

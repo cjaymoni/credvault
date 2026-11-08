@@ -131,6 +131,21 @@
     return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${key}` : `Ctrl+${key}`;
   }
 
+  /// The same shortcut in the spelling `aria-keyshortcuts` takes, e.g.
+  /// `Meta+N`. Those names come from the spec's key set, which has no ⌘, so
+  /// this cannot reuse shortcutLabel() -- but both must agree on which
+  /// platforms press Meta, so both read COMMAND_KEY_PLATFORMS.
+  ///
+  /// The handler accepts either modifier everywhere; this declares the one
+  /// the interface names, which is what a screen reader should read out.
+  function shortcutKeys(platform, key) {
+    if (typeof key !== "string" || !key) {
+      throw new TypeError("shortcutKeys needs the key the shortcut is pressed with");
+    }
+    const modifier = COMMAND_KEY_PLATFORMS.includes(platform) ? "Meta" : "Control";
+    return `${modifier}+${key.toUpperCase()}`;
+  }
+
   /// The platforms whose own apps print shortcuts in the interface at all.
   const SHORTCUT_NAMING_PLATFORMS = ["macos", "windows", "linux"];
 
@@ -170,5 +185,5 @@
     return PLACED_CONTROLS.map((control) => [control, table[control]]);
   }
 
-  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, namesShortcuts };
+  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
 });

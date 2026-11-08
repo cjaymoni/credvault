@@ -160,3 +160,65 @@ test("a budget that is not a number is refused rather than ignored", () => {
   assert.throws(() => serverSummaryText(long, "x", NaN), /budget/);
   assert.throws(() => serverSummaryText(long, "x", "30"), /budget/);
 });
+
+// ----- which platform's look -------------------------------------------------
+//
+// Real user agents of each webview the app runs in. The look follows the
+// platform, so a misread costs the wrong styling, never safety, but it should
+// still be right.
+
+const { PLATFORMS, platformFrom, resolvePlatform, placementFor } = require("../ui/screens.js");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const USER_AGENTS = {
+  macos: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+  windows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+  linux: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+  ios: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+  android: "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/130.0.0.0 Mobile Safari/537.36",
+};
+
+test("each webview's user agent maps to its own platform", () => {
+  for (const [platform, ua] of Object.entries(USER_AGENTS)) {
+    assert.equal(platformFrom(ua), platform, ua);
+  }
+});
+
+test("Android is not mistaken for Linux, nor iOS for macOS", () => {
+  assert.equal(platformFrom(USER_AGENTS.android), "android"); // its UA also says Linux
+  assert.equal(platformFrom(USER_AGENTS.ios), "ios"); // its UA also says Mac OS X
+});
+
+test("an iPad, which reports itself as a Mac, is told apart by touch points", () => {
+  assert.equal(platformFrom(USER_AGENTS.macos, 5), "ios");
+  assert.equal(platformFrom(USER_AGENTS.macos, 0), "macos");
+});
+
+test("an unknown or missing user agent falls back to the Linux look", () => {
+  for (const ua of ["", null, undefined, "SomethingElse/1.0"]) assert.equal(platformFrom(ua), "linux");
+});
+
+test("a preview override wins only when it names a known platform", () => {
+  assert.equal(resolvePlatform("android", USER_AGENTS.macos), "android");
+  for (const bad of [null, "", "beos", "__proto__", "toString"]) {
+    assert.equal(resolvePlatform(bad, USER_AGENTS.windows), "windows", String(bad));
+  }
+});
+
+test("every platform places every moving control, each in a slot the page has", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../ui/index.html"), "utf8");
+  const slots = new Set([...html.matchAll(/data-slot="([^"]+)"/g)].map((m) => m[1]));
+  for (const platform of PLATFORMS) {
+    const placement = placementFor(platform);
+    assert.deepEqual(placement.map(([control]) => control), ["search", "newSecret", "refresh", "account", "invites"], platform);
+    for (const [control, slot] of placement) assert.ok(slots.has(slot), `${platform}: ${control} -> missing slot ${slot}`);
+  }
+});
+
+test("asking for a platform with no layout fails loudly", () => {
+  assert.throws(() => placementFor("beos"), TypeError);
+  assert.throws(() => placementFor("toString"), TypeError);
+  assert.throws(() => placementFor("__proto__"), TypeError);
+  assert.throws(() => placementFor(undefined), TypeError);
+});

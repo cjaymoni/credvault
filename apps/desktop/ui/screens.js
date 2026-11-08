@@ -82,5 +82,58 @@
     return `${heading}<div class="list-group" ${wrapper}>${itemsHtml}</div>`;
   }
 
-  return { esc, serverSummaryText, listGroupHtml };
+  /// The platforms the interface has a native look for. Anything else gets
+  /// the Linux look, the most generic of the five.
+  const PLATFORMS = ["macos", "windows", "linux", "ios", "android"];
+  const FALLBACK_PLATFORM = "linux";
+  /// iPadOS reports itself as a Mac; a Mac has no touch points, an iPad has 5.
+  const IPAD_MIN_TOUCH_POINTS = 2;
+
+  /// Which platform the app is running on, from the webview's user agent.
+  ///
+  /// The answer only picks a look: nothing security-relevant depends on it,
+  /// so a spoofed or unusual user agent costs at most the wrong styling.
+  /// Order matters: Android user agents also say "Linux", and iOS ones also
+  /// say "Mac OS X".
+  function platformFrom(userAgent, maxTouchPoints = 0) {
+    const ua = String(userAgent ?? "");
+    if (/Android/i.test(ua)) return "android";
+    if (/iPhone|iPad|iPod/i.test(ua)) return "ios";
+    if (/Macintosh|Mac OS X/i.test(ua)) return maxTouchPoints >= IPAD_MIN_TOUCH_POINTS ? "ios" : "macos";
+    if (/Windows/i.test(ua)) return "windows";
+    if (/Linux|X11|CrOS/i.test(ua)) return "linux";
+    return FALLBACK_PLATFORM;
+  }
+
+  /// A platform named explicitly (a `?platform=` override used when
+  /// previewing the interface in a browser) wins when it is one we know.
+  function resolvePlatform(override, userAgent, maxTouchPoints) {
+    return PLATFORMS.includes(override) ? override : platformFrom(userAgent, maxTouchPoints);
+  }
+
+  /// The controls that move between platforms, and the slot each one goes to.
+  ///
+  /// Every control exists once in the page and is moved into its slot at
+  /// startup, so DOM order (and therefore Tab order and what a screen reader
+  /// reads next) matches where the control is drawn. Slots are elements with
+  /// a matching `data-slot` attribute.
+  const PLACEMENT = {
+    macos: { search: "toolbar-end", newSecret: "toolbar-actions", refresh: "toolbar-actions", account: "sidebar-foot", invites: "sidebar-top" },
+    windows: { search: "toolbar-center", newSecret: "pane-actions", refresh: "pane-actions", account: "toolbar-end", invites: "sidebar-top" },
+    linux: { search: "sidebar-search", newSecret: "pane-head-start", refresh: "account-menu", account: "pane-head-end", invites: "content-top" },
+    ios: { search: "sidebar-search", newSecret: "bottombar-end", refresh: "account-menu", account: "pane-head-end", invites: "sidebar-top" },
+    android: { search: "sidebar-search", newSecret: "fab", refresh: "account-menu", account: "search-end", invites: "sidebar-top" },
+  };
+  const PLACED_CONTROLS = ["search", "newSecret", "refresh", "account", "invites"];
+
+  /// Where each moving control goes on `platform`, as `[control, slot]` pairs
+  /// in the order they should be appended.
+  function placementFor(platform) {
+    // Own keys only: "toString" or "__proto__" must not find Object's.
+    const table = Object.hasOwn(PLACEMENT, String(platform)) ? PLACEMENT[platform] : null;
+    if (!table) throw new TypeError(`no placement for platform ${JSON.stringify(platform)}`);
+    return PLACED_CONTROLS.map((control) => [control, table[control]]);
+  }
+
+  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor };
 });

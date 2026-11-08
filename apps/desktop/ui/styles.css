@@ -490,13 +490,12 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
 .app {
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-  grid-template-rows: auto 1fr;
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
 }
 @media (max-width: 900px) { .app { --sidebar-w: 248px; } }
 
 .topbar {
-  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -919,61 +918,6 @@ input.mono.mismatch { border-color: var(--danger); }
     opacity: 0.9;
   }
 
-  /* ----- shell ----- */
-  /* minmax(0, 1fr): a bare 1fr track refuses to shrink below the longest nowrap item name */
-  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; height: 100dvh; }
-  .topbar {
-    grid-column: 1;
-    flex-wrap: nowrap;
-    gap: 4px;
-    min-height: calc(var(--topbar-h) + env(safe-area-inset-top));
-    padding: env(safe-area-inset-top) 10px 0;
-  }
-  .app[data-screen="detail"] .sidebar { display: none; }
-  .app[data-screen="list"] .main { display: none; }
-  .app[data-screen="list"] #btn-back { display: none; }
-  .app[data-screen="detail"] .brand { display: none; }
-  .app[data-screen="list"] #mobile-title { display: none; }
-  /* The back chevron is tinted and oversized, the way a phone draws the one
-     control that leaves the screen. */
-  #btn-back { display: inline-flex; width: 44px; height: 44px; margin-left: -8px; color: var(--accent); }
-  #btn-back .ic { width: 26px; height: 26px; }
-  #mobile-title {
-    display: block;
-    flex: 1;
-    min-width: 0;
-    text-align: center;
-    font-weight: 600;
-    font-size: var(--text-emphasis);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .app[data-screen="detail"] .spacer { display: none; }
-  .app[data-screen="detail"] #btn-account { visibility: hidden; } /* keeps the title centred */
-
-  /* On the list screen the nav bar is the app's home header, so the brand
-     sits at title size rather than shrunk to fit beside a sidebar. */
-  .brand.compact { gap: 12px; padding-left: 4px; }
-  .brand.compact .brand-mark { width: 36px; height: 36px; border-radius: 11px; }
-  .brand.compact .brand-mark svg { width: 21px; height: 21px; }
-  .brand.compact .brand-name { font-size: var(--text-title); font-weight: 700; }
-
-  #btn-account {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 40px;
-    height: 40px;
-    margin: 0 2px;
-    border: 0;
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--accent-soft-text);
-    cursor: pointer;
-  }
-  #btn-account .ic { width: 22px; height: 22px; }
-
   /* ----- list screen ----- */
   .sidebar { border-right: 0; background: var(--bg); }
   .sidebar-tools { padding: 6px 16px 10px; }
@@ -1024,42 +968,6 @@ input.mono.mismatch { border-color: var(--danger); }
   .badge { height: 26px; padding: 0 10px; }
   .badge .ic { width: 14px; height: 14px; }
   .list-empty { padding: 48px 16px; font-size: var(--text-body); }
-
-  /* compose button */
-  #btn-new {
-    position: fixed;
-    right: 20px;
-    bottom: calc(24px + env(safe-area-inset-bottom));
-    z-index: 5;
-    width: 64px;
-    height: 64px;
-    padding: 0;
-    border-radius: 999px;
-    box-shadow: 0 10px 24px var(--accent-glow), var(--shadow-md);
-  }
-  #btn-new .ic { width: 28px; height: 28px; }
-  #btn-new .btn-text { display: none; }
-  #btn-new:active { transform: scale(0.94); }
-
-  #invites-banner { display: block; }
-  .invites-banner {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    width: calc(100% - 32px);
-    margin: 2px 16px 10px;
-    padding: 16px;
-    border: 0;
-    border-radius: var(--radius-lg);
-    background: var(--accent-soft);
-    color: var(--accent-soft-text);
-    font-size: var(--text-body);
-    font-weight: 600;
-    text-align: left;
-    cursor: pointer;
-  }
-  .invites-banner > span:not(.count-pill) { flex: 1; }
-  .invites-banner .ic:last-child { color: currentColor; opacity: 0.75; }
 
   /* ----- detail screen ----- */
   /* No bottom padding here: the form's action bar sticks to the foot of the

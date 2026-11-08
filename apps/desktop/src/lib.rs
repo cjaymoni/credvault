@@ -753,10 +753,6 @@ const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth
 /// Drive while they thought they were signing in.
 const GOOGLE_SCOPE: &str = "openid email";
 
-/// The longest a server-supplied authorization parameter may be. Real ones
-/// are 43 characters of base64url, or a client id of about 70.
-const MAX_AUTHORIZATION_PARAMETER_LEN: usize = 512;
-
 /// Check one of the opaque values the server supplies for the authorization
 /// URL.
 ///
@@ -767,32 +763,32 @@ const MAX_AUTHORIZATION_PARAMETER_LEN: usize = 512;
 /// `/usr/bin/open`, and it would still refuse the reserved characters if the
 /// composition below were ever rewritten with `format!`.
 ///
-/// The permitted set is RFC 3986's unreserved characters, which covers both
-/// base64url tokens and a Google client id.
+/// The rule itself is [`check_opaque_oauth_value`] in core, where the server
+/// can see it too. What is here is only the wording: a refusal is the entire
+/// product of this function, so each reason gets its own sentence, and the
+/// one that means "a value outside the published contract" says what the
+/// contract is rather than only that it was broken.
 ///
 /// # Errors
-/// `oauth` if the value is empty, over [`MAX_AUTHORIZATION_PARAMETER_LEN`],
-/// or holds anything outside that set.
+/// `oauth` if the value is not one [`OAuthStartResponse`] may carry.
 fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
-    let refuse = |why: &str| {
-        Err(CommandError::new(
-            "oauth",
-            format!(
-                "this server sent a sign-in {name} that is {why}. Nothing was opened. \
-                 Do not trust this server with your Google password."
-            ),
-        ))
+    let why = match check_opaque_oauth_value(value) {
+        Ok(()) => return Ok(()),
+        Err(NotAnOpaqueValue::Empty) => "empty".to_string(),
+        Err(NotAnOpaqueValue::TooLong) => {
+            format!("longer than the {MAX_OAUTH_PARAMETER_LEN} characters this protocol allows")
+        }
+        Err(NotAnOpaqueValue::BadCharacters) => "spelled with characters this protocol does not allow there — \
+             letters, digits, and the four marks - . _ ~ are the whole set"
+            .to_string(),
     };
-    if value.is_empty() {
-        return refuse("empty");
-    }
-    if value.len() > MAX_AUTHORIZATION_PARAMETER_LEN {
-        return refuse("longer than any real one");
-    }
-    if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')) {
-        return refuse("spelled with characters a real one never contains");
-    }
-    Ok(())
+    Err(CommandError::new(
+        "oauth",
+        format!(
+            "this server sent a sign-in {name} that is {why}. Nothing was opened. \
+             Do not trust this server with your Google password."
+        ),
+    ))
 }
 
 /// Build the URL the system browser will be sent to.
@@ -812,17 +808,26 @@ fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
 /// `oauth` if any server-supplied value fails
 /// [`check_authorization_parameter`].
 fn compose_authorization_url(started: &OAuthStartResponse, redirect_uri: &str) -> CommandResult<String> {
+    // Destructured rather than read field by field, so that a field added to
+    // `OAuthStartResponse` later stops this compiling until someone decides
+    // whether it belongs in the URL and what checks it. `started.client_id`
+    // and friends would have taken a new field in silence, and neither the
+    // parameter count asserted below nor the test's field list would have
+    // said so. `app_secret` is named here to be refused: it is the one value
+    // that must never travel through a browser.
+    let OAuthStartResponse { client_id, state, nonce, code_challenge, app_secret: _ } = started;
     let parameters = [
-        ("client_id", started.client_id.as_str()),
-        ("state", started.state.as_str()),
-        ("nonce", started.nonce.as_str()),
-        ("code_challenge", started.code_challenge.as_str()),
+        ("client_id", client_id.as_str()),
+        ("state", state.as_str()),
+        ("nonce", nonce.as_str()),
+        ("code_challenge", code_challenge.as_str()),
     ];
     for (name, value) in parameters {
         check_authorization_parameter(name, value)?;
     }
     // Composed from the array that was just checked, so a value cannot be
-    // validated and then a different one used. The binding is positional:
+    // validated and then a different one used — these four names now mean the
+    // checked values rather than the raw fields. The binding is positional:
     // reordering the array above swaps two of these silently, and what catches
     // that is `the_composed_url_is_googles_own_sign_in_page`, which gives each
     // parameter a distinct value.
@@ -2202,6 +2207,12 @@ mod tests {
         // whichever one the browser already holds, with nothing to notice.
         assert_eq!(parameters["prompt"], "select_account");
         assert_eq!(parameters.len(), 9, "an unexpected parameter is as much a change as a missing one");
+        // The parameter count above catches `app_secret` arriving as a tenth
+        // pair; this catches it arriving as the value of one of the nine.
+        // It is the piece that binds the flow to this app, it is handed over
+        // the app's own HTTPS connection, and a browser would put it in the
+        // address bar, the history and the referer.
+        assert!(!url.contains("app-secret"), "the app secret must never travel through the browser");
     }
 
     /// The property the server-supplied values rest on: the composition
@@ -2241,7 +2252,7 @@ mod tests {
             "token\nnewline",
             "tokén",
             "token%2Fencoded",
-            &"x".repeat(MAX_AUTHORIZATION_PARAMETER_LEN + 1),
+            &"x".repeat(MAX_OAUTH_PARAMETER_LEN + 1),
         ] {
             for field in ["client_id", "state", "nonce", "code_challenge"] {
                 let mut started = start_response();
@@ -2269,8 +2280,7 @@ mod tests {
     #[test]
     fn an_ordinary_response_composes() {
         assert!(compose_authorization_url(&start_response(), REDIRECT).is_ok());
-        for token in
-            ["A-Za-z0-9", "with.dots", "with_underscores", "with~tildes", &"x".repeat(MAX_AUTHORIZATION_PARAMETER_LEN)]
+        for token in ["A-Za-z0-9", "with.dots", "with_underscores", "with~tildes", &"x".repeat(MAX_OAUTH_PARAMETER_LEN)]
         {
             let mut started = start_response();
             started.nonce = token.into();

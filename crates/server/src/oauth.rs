@@ -524,14 +524,47 @@ mod tests {
     /// enforced by the trait having one method, not by a test.
     #[test]
     fn the_provider_publishes_its_client_id_and_never_its_secret() {
+        const SECRET: &str = "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";
         let provider =
-            GoogleProvider::new(GoogleConfig::new("client-123".into(), Zeroizing::new("sec".into()))).unwrap();
+            GoogleProvider::new(GoogleConfig::new("client-123".into(), Zeroizing::new(SECRET.into()))).unwrap();
         assert_eq!(provider.client_id(), "client-123");
-        // This value is handed to a client and ends up in a URL a browser
-        // follows. The two config fields sit next to each other, so the cheap
-        // guard against a future edit reaching for the wrong one stays here
-        // even though no URL is composed on this side any more.
-        assert_ne!(provider.client_id(), "sec", "the secret must never be what is published");
+
+        // The two config fields sit next to each other, so a future edit
+        // reaching for the wrong one is the thing worth guarding against. An
+        // `assert_ne!(provider.client_id(), SECRET)` on the line below would
+        // not do it: the equality above fails first, so that guard could never
+        // be the one to fire. Check the whole surface a client is handed
+        // instead, which also covers the secret arriving through some field
+        // other than this one.
+        let (state, nonce) = new_state_and_nonce();
+        let (_verifier, code_challenge) = pkce_pair();
+        let published = serde_json::to_string(&credvault_core::api::OAuthStartResponse {
+            client_id: provider.client_id().to_string(),
+            state,
+            nonce,
+            code_challenge,
+            app_secret: new_app_secret(),
+        })
+        .expect("the start response must serialize");
+        assert!(!published.contains(SECRET), "the client secret must never reach a client: {published}");
+    }
+
+    /// The client refuses any value outside `check_opaque_oauth_value` before
+    /// it composes an authorization URL, and says so in a sentence that tells
+    /// the user not to trust this server. Nothing but this test stops a change
+    /// to `random_token`'s base64 alphabet turning every sign-in into that
+    /// accusation, aimed at the operator's own server.
+    #[test]
+    fn generated_values_satisfy_the_contract_the_client_enforces() {
+        let (state, nonce) = new_state_and_nonce();
+        let (_verifier, code_challenge) = pkce_pair();
+        for (name, value) in [("state", &state), ("nonce", &nonce), ("code_challenge", &code_challenge)] {
+            assert_eq!(
+                credvault_core::api::check_opaque_oauth_value(value),
+                Ok(()),
+                "{name} must be a value the client will accept, and {value} is not"
+            );
+        }
     }
 
     #[test]

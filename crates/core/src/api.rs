@@ -439,6 +439,56 @@ fn sign_in_purpose() -> OAuthPurpose {
     OAuthPurpose::SignIn
 }
 
+/// The longest an opaque value in [`OAuthStartResponse`] may be.
+///
+/// Comfortably above every real one — a base64url token of 32 bytes is 43
+/// characters and the longest Google client id seen is under 80 — and low
+/// enough that a value built to be a payload rather than a token is refused
+/// before it reaches a browser.
+pub const MAX_OAUTH_PARAMETER_LEN: usize = 512;
+
+/// Why a value is not one [`OAuthStartResponse`] may carry.
+///
+/// The client turns each of these into its own sentence, so they are separate
+/// rather than one boolean.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotAnOpaqueValue {
+    Empty,
+    TooLong,
+    /// Holds something outside the permitted set.
+    BadCharacters,
+}
+
+/// Whether a value is one [`OAuthStartResponse`] may carry: non-empty, no
+/// longer than [`MAX_OAUTH_PARAMETER_LEN`], and spelled only in RFC 3986's
+/// unreserved characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`).
+///
+/// This lives in core because both halves of the protocol depend on it and
+/// neither can see the other: the server emits values inside this set, and the
+/// client refuses values outside it before composing an authorization URL.
+/// Two copies would be one base64 alphabet away from every sign-in failing
+/// with the client accusing the operator's own server of hostility. The server
+/// pins its side in `generated_values_satisfy_the_contract_the_client_enforces`
+/// and the client pins its side in `values_that_are_not_opaque_tokens_are_refused`.
+///
+/// The set is the intersection of what a base64url token uses and what a
+/// Google client id uses, so widening it needs a reason on both sides.
+///
+/// # Errors
+/// [`NotAnOpaqueValue`] saying which of the three rules the value broke.
+pub fn check_opaque_oauth_value(value: &str) -> Result<(), NotAnOpaqueValue> {
+    if value.is_empty() {
+        return Err(NotAnOpaqueValue::Empty);
+    }
+    if value.len() > MAX_OAUTH_PARAMETER_LEN {
+        return Err(NotAnOpaqueValue::TooLong);
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')) {
+        return Err(NotAnOpaqueValue::BadCharacters);
+    }
+    Ok(())
+}
+
 /// The parts of an authorization request that the client cannot know, and
 /// nothing else.
 ///
@@ -449,6 +499,10 @@ fn sign_in_purpose() -> OAuthPurpose {
 /// permissions it asks for, and not whether an account chooser is shown. The
 /// three values below are opaque to both sides; see F-12 in the security
 /// audit for what that leaves a hostile server, which is not nothing.
+///
+/// Every field but `app_secret` reaches an authorization URL, and each one
+/// must satisfy [`check_opaque_oauth_value`]. That is the contract a server
+/// implementing this endpoint has to meet, and the client enforces it.
 #[derive(Serialize, Deserialize)]
 pub struct OAuthStartResponse {
     /// The OAuth client the server is registered with at the provider. Not a
@@ -769,6 +823,37 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, 3);
         assert_eq!(MIN_SERVER_PROTOCOL, 3);
         assert_eq!(MIN_CLIENT_PROTOCOL, 1);
+    }
+
+    /// The set is the intersection of what the server's base64url tokens use
+    /// and what a Google client id uses. Both ends of that intersection are
+    /// pinned here, because widening it weakens the client's second layer and
+    /// narrowing it refuses values a correct server sends.
+    #[test]
+    fn an_opaque_oauth_value_is_a_token_or_a_client_id_and_nothing_else() {
+        for ok in [
+            "G844yM5uFc7EGLBZZiEUXkE",                      // a base64url token
+            "1234567890-abcdef.apps.googleusercontent.com", // a Google client id
+            "with-dashes_and_underscores.and~tildes",
+            &"x".repeat(MAX_OAUTH_PARAMETER_LEN),
+        ] {
+            assert_eq!(check_opaque_oauth_value(ok), Ok(()), "{ok} is a value a correct server sends");
+        }
+
+        assert_eq!(check_opaque_oauth_value(""), Err(NotAnOpaqueValue::Empty));
+        assert_eq!(check_opaque_oauth_value(&"x".repeat(MAX_OAUTH_PARAMETER_LEN + 1)), Err(NotAnOpaqueValue::TooLong));
+        for bad in [
+            "has space",
+            "padded=",     // base64 standard alphabet
+            "slash/plus+", // the other two standard-alphabet characters
+            "&scope=https://www.googleapis.com/auth/drive",
+            "javascript:alert(1)",
+            "percent%2Fencoded", // already encoded, so encoding it again changes it
+            "new\nline",
+            "unicodé",
+        ] {
+            assert_eq!(check_opaque_oauth_value(bad), Err(NotAnOpaqueValue::BadCharacters), "{bad} must be refused");
+        }
     }
 
     #[test]

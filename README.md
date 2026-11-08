@@ -219,10 +219,19 @@ message. For an account that has a passphrase, that is an annoyance until the
 app is updated. For an account created *through* Google, whose link is the only
 thing that opens it, it is no way in at all.
 
+There is no order that avoids that. Updating those apps first does not help
+and makes it worse: a protocol-3 app refuses a protocol-2 server outright, at
+the check it runs before any credential is sent, so the people on that device
+lose passphrase sign-in as well and gain nothing — they could not sign in with
+Google either way. A Google-created account cannot be given a passphrase in
+advance to escape through, because changing a passphrase requires proving the
+old one and those accounts have none.
+
 So: if every account on the server signs in with a passphrase, update the
 server first and the apps at your leisure. If any account signs in only with
-Google, update those apps first, or accept that those people cannot sign in
-until you do.
+Google, move the server and those apps together and expect a window between
+the two. Staging the app update on those devices beforehand shortens the
+window; nothing removes it.
 
 **The encryption scheme**, on every encrypted blob — your private key, each
 secret's key, each secret's contents. It covers the key derivation behind the

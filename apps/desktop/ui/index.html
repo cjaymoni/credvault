@@ -6,11 +6,15 @@
 <meta name="color-scheme" content="light dark">
 <title>credvault</title>
 <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="platform.css">
+<script src="screens.js"></script>
+<script src="boot.js"></script>
 </head>
 <body>
 
 <!-- Sign in / create account -->
 <section id="auth" class="auth" aria-labelledby="auth-title">
+  <div class="window-drag" data-tauri-drag-region></div>
   <div class="auth-card">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">
@@ -112,27 +116,101 @@
 </section>
 
 <!-- Vault -->
+<!-- Each platform draws this window its own way (see platform.css). Controls
+     that sit in different places per platform exist once and are moved into a
+     [data-slot] at startup by placeControls() in app.js, so Tab order always
+     follows what is on screen. -->
 <section id="app" class="app hidden" aria-labelledby="app-title" data-screen="list">
   <h1 id="app-title" class="sr-only">Vault</h1>
-  <header class="topbar">
-    <button type="button" class="icon-btn mobile-only" id="btn-back" aria-label="Back to vault">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
-    </button>
-    <div class="brand compact">
-      <span class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="4" y="11" width="16" height="10" rx="2"/></svg>
-      </span>
-      <span class="brand-name">credvault</span>
+
+  <nav class="sidebar" aria-label="Secrets">
+    <div class="pane-head" data-tauri-drag-region>
+      <div class="slot" data-slot="pane-head-start"></div>
+      <div class="pane-head-title" data-tauri-drag-region>Vault</div>
+      <div class="slot" data-slot="pane-head-end"></div>
     </div>
+    <div class="list-title" aria-hidden="true">Vault</div>
+    <div class="pane-actions slot" data-slot="pane-actions"></div>
+    <div class="sidebar-search slot" data-slot="sidebar-search">
+      <div class="search" id="search-box">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="filter" type="search" placeholder="Search" aria-label="Search secrets" autocomplete="off" spellcheck="false">
+        <div class="slot" data-slot="search-end"></div>
+      </div>
+    </div>
+    <div class="slot" data-slot="sidebar-top">
+      <div id="invites-banner"></div>
+    </div>
+    <div class="sidebar-count" id="count" aria-live="polite"></div>
+    <div id="list" class="list" role="listbox" aria-label="Secrets"></div>
+    <div class="sidebar-foot slot" data-slot="sidebar-foot"></div>
+    <div class="slot" data-slot="fab">
+      <button type="button" class="btn primary" id="btn-new" aria-label="New secret">
+        <svg class="ic new-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        <svg class="ic new-compose" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        <span class="btn-text">New secret</span>
+      </button>
+    </div>
+  </nav>
 
-    <span class="mobile-title mobile-only" id="mobile-title"></span>
-    <div class="spacer"></div>
+  <div class="content">
+    <header class="topbar" data-tauri-drag-region>
+      <button type="button" class="icon-btn" id="btn-back" aria-label="Back to vault">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="back-chevron" d="m15 18-6-6 6-6"/><path class="back-arrow" d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        <span class="back-label">Vault</span>
+      </button>
+      <div class="toolbar-title" data-tauri-drag-region>
+        <span class="toolbar-app-title">Vault</span>
+        <span class="toolbar-sub" id="toolbar-sub"></span>
+        <span class="mobile-title" id="mobile-title"></span>
+      </div>
+      <div class="toolbar-center slot" data-slot="toolbar-center"></div>
+      <div class="toolbar-actions">
+        <button type="button" class="bar-btn hidden" id="btn-bar-edit">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+          <span class="bar-label">Edit</span>
+        </button>
+        <div class="bar-menu-wrap">
+          <button type="button" class="bar-btn hidden" id="btn-bar-more" aria-label="More options" aria-haspopup="menu" aria-expanded="false" aria-controls="bar-menu">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+          </button>
+          <div class="bar-menu" id="bar-menu" role="menu" aria-labelledby="btn-bar-more" hidden>
+            <button type="button" class="bar-menu-item" id="btn-menu-delete" role="menuitem" tabindex="-1">Delete</button>
+          </div>
+        </div>
+        <div class="slot" data-slot="toolbar-actions"></div>
+      </div>
+      <div class="toolbar-end slot" data-slot="toolbar-end"></div>
+    </header>
+    <div class="content-top slot" data-slot="content-top"></div>
+    <main class="main" id="main">
+      <div class="main-inner">
+        <div id="invites"></div>
+        <div id="detail"></div>
+        <div class="error" id="main-error" role="alert"></div>
+      </div>
+    </main>
+  </div>
 
-    <button type="button" class="account-btn mobile-only" id="btn-account" aria-label="Account and settings" aria-expanded="false" aria-controls="account-tools">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-    </button>
-    <div class="backdrop" id="account-backdrop"></div>
-    <div class="account-tools" id="account-tools">
+  <footer class="bottombar">
+    <span class="bottombar-spacer"></span>
+    <span class="bottombar-count" id="bottom-count"></span>
+    <div class="slot" data-slot="bottombar-end"></div>
+  </footer>
+
+  <!-- One account button; placeControls() moves it to where each platform
+       keeps account settings. Which of its parts shows is up to the platform:
+       a person icon, a menu icon, an avatar, or the address and key. -->
+  <button type="button" class="account-btn" id="btn-account" aria-label="Account and settings" aria-expanded="false" aria-controls="account-tools">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="ic acct-person"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="ic acct-menu"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="ic acct-key"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>
+    <span class="acct-avatar" id="acct-initial" aria-hidden="true"></span>
+    <span class="acct-text" aria-hidden="true"><span class="acct-email" id="acct-email"></span><code class="acct-fp" id="acct-fp"></code></span>
+  </button>
+
+  <div class="backdrop" id="account-backdrop"></div>
+  <div class="account-tools" id="account-tools">
     <div class="sheet-handle mobile-only" aria-hidden="true"></div>
     <div class="identity" aria-label="Signed in as">
       <span class="identity-email" id="who-email"></span>
@@ -176,46 +254,54 @@
       </button>
     </div>
 
+    <div class="slot" data-slot="account-menu">
     <button type="button" class="icon-btn" id="btn-refresh" aria-label="Refresh" title="Refresh">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       <span class="btn-label">Refresh</span>
     </button>
+    </div>
     <button type="button" class="icon-btn" id="btn-logout" aria-label="Log out" title="Log out">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
       <span class="btn-label">Log out</span>
     </button>
-    </div>
-  </header>
-
-  <aside class="sidebar" aria-label="Secrets">
-    <div class="sidebar-tools">
-      <div class="search">
-        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="filter" type="search" placeholder="Search" aria-label="Search secrets" autocomplete="off" spellcheck="false" title="Search (⌘K / Ctrl+K)">
-      </div>
-      <button type="button" class="btn primary" id="btn-new" title="New secret (⌘N / Ctrl+N)">
-        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        <span class="btn-text">New</span>
-      </button>
-    </div>
-    <div id="invites-banner" class="mobile-only"></div>
-    <div class="sidebar-count" id="count" aria-live="polite"></div>
-    <div id="list" class="list" role="listbox" aria-label="Secrets"></div>
-  </aside>
-
-  <main class="main" id="main">
-    <div class="main-inner">
-      <div id="invites"></div>
-      <div id="detail"></div>
-      <div class="error" id="main-error" role="alert"></div>
-    </div>
-  </main>
+  </div>
 </section>
+
+<!-- Invite someone to the open secret. A modal dialog on every platform: it
+     holds the email, the fingerprint check and the confirmation in one place. -->
+<dialog class="dialog" id="invite-dialog" aria-labelledby="invite-dialog-title">
+  <form id="invite-form" novalidate>
+    <h2 id="invite-dialog-title" class="dialog-title">Invite someone</h2>
+    <p class="dialog-lead">They get read-only access to this one secret. Use the email they signed up with.</p>
+    <div class="field">
+      <label for="invite-email">Email</label>
+      <input id="invite-email" type="email" placeholder="friend@example.com" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="invite-fingerprint">Their key fingerprint</label>
+      <input id="invite-fingerprint" class="mono" placeholder="0000-0000-0000-0000-0000-0000" autocomplete="off" spellcheck="false">
+      <p class="hint">Ask them to read it from their credvault account settings. Leave blank for someone you have already shared with.</p>
+    </div>
+    <div class="field">
+      <label for="invite-message">Message <span class="label-note">(optional)</span></label>
+      <input id="invite-message" placeholder="e.g. The shared Wi-Fi password">
+    </div>
+    <div class="error" id="invite-error" role="alert"></div>
+    <div class="dialog-actions">
+      <button type="submit" class="btn primary" id="btn-invite">Continue</button>
+      <button type="button" class="btn" id="btn-invite-close">Cancel</button>
+    </div>
+  </form>
+  <div id="invite-confirm"></div>
+</dialog>
+
+<!-- Windows edits a secret in a dialog over the vault; every other platform
+     uses the detail pane. renderForm() picks the host. -->
+<dialog class="dialog form-dialog" id="form-dialog" aria-labelledby="form-title"></dialog>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script src="fields.js"></script>
-<script src="screens.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

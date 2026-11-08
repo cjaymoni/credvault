@@ -82,5 +82,111 @@
     return `${heading}<div class="list-group" ${wrapper}>${itemsHtml}</div>`;
   }
 
-  return { esc, serverSummaryText, listGroupHtml };
+  /// The platforms the interface has a native look for. Anything else gets
+  /// the Linux look, the most generic of the five.
+  const PLATFORMS = ["macos", "windows", "linux", "ios", "android"];
+  const FALLBACK_PLATFORM = "linux";
+  /// iPadOS reports itself as a Mac; a Mac has no touch points, an iPad has 5.
+  const IPAD_MIN_TOUCH_POINTS = 2;
+
+  /// Which platform the app is running on, from the webview's user agent.
+  ///
+  /// The answer only picks a look: nothing security-relevant depends on it,
+  /// so a spoofed or unusual user agent costs at most the wrong styling.
+  /// Order matters: Android user agents also say "Linux", and iOS ones also
+  /// say "Mac OS X".
+  function platformFrom(userAgent, maxTouchPoints = 0) {
+    const ua = String(userAgent ?? "");
+    if (/Android/i.test(ua)) return "android";
+    if (/iPhone|iPad|iPod/i.test(ua)) return "ios";
+    if (/Macintosh|Mac OS X/i.test(ua)) return maxTouchPoints >= IPAD_MIN_TOUCH_POINTS ? "ios" : "macos";
+    if (/Windows/i.test(ua)) return "windows";
+    if (/Linux|X11|CrOS/i.test(ua)) return "linux";
+    return FALLBACK_PLATFORM;
+  }
+
+  /// A platform named explicitly (a `?platform=` override used when
+  /// previewing the interface in a browser) wins when it is one we know.
+  function resolvePlatform(override, userAgent, maxTouchPoints) {
+    return PLATFORMS.includes(override) ? override : platformFrom(userAgent, maxTouchPoints);
+  }
+
+  /// The platforms whose own apps print ⌘ rather than Ctrl.
+  const COMMAND_KEY_PLATFORMS = ["macos", "ios"];
+
+  /// How to write the shortcut for `key` on `platform`, e.g. `⌘N` or `Ctrl+N`.
+  ///
+  /// The handler accepts `metaKey` or `ctrlKey` on every platform, so both
+  /// shortcuts always work and this only picks which one to *name*. Naming
+  /// both, as the interface used to, puts a key no Mac has in front of a Mac
+  /// user and vice versa.
+  ///
+  /// An unknown platform gets Ctrl, matching the Linux look it is given.
+  /// A missing key is a bug rather than a label, and says so: printing
+  /// "⌘undefined" in a tooltip would be worse than failing here.
+  function shortcutLabel(platform, key) {
+    if (typeof key !== "string" || !key) {
+      throw new TypeError("shortcutLabel needs the key the shortcut is pressed with");
+    }
+    // Upper case in both spellings: a shortcut is written ⌘N, not ⌘n, and
+    // aria-keyshortcuts takes the key's own name, which is "N".
+    const named = key.toUpperCase();
+    return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${named}` : `Ctrl+${named}`;
+  }
+
+  /// The same shortcut in the spelling `aria-keyshortcuts` takes, e.g.
+  /// `Meta+N`. Those names come from the spec's key set, which has no ⌘, so
+  /// this cannot reuse shortcutLabel() -- but both must agree on which
+  /// platforms press Meta, so both read COMMAND_KEY_PLATFORMS.
+  ///
+  /// The handler accepts either modifier everywhere; this declares the one
+  /// the interface names, which is what a screen reader should read out.
+  function shortcutKeys(platform, key) {
+    if (typeof key !== "string" || !key) {
+      throw new TypeError("shortcutKeys needs the key the shortcut is pressed with");
+    }
+    const modifier = COMMAND_KEY_PLATFORMS.includes(platform) ? "Meta" : "Control";
+    return `${modifier}+${key.toUpperCase()}`;
+  }
+
+  /// The platforms whose own apps print shortcuts in the interface at all.
+  const SHORTCUT_NAMING_PLATFORMS = ["macos", "windows", "linux"];
+
+  /// Whether `platform` is one that names shortcuts in its interface.
+  ///
+  /// This is a convention, not a claim about the hardware: an iPad with a
+  /// keyboard attached can press ⌘N perfectly well, and the handler takes it,
+  /// but iOS and Android apps do not print shortcuts on their controls and
+  /// neither does this one. Naming one costs more than the tooltip, because
+  /// the new-secret button's own label is hidden on three of the five looks,
+  /// which leaves `title` as the whole of what a screen reader reads out.
+  function namesShortcuts(platform) {
+    return SHORTCUT_NAMING_PLATFORMS.includes(platform);
+  }
+
+  /// The controls that move between platforms, and the slot each one goes to.
+  ///
+  /// Every control exists once in the page and is moved into its slot at
+  /// startup, so DOM order (and therefore Tab order and what a screen reader
+  /// reads next) matches where the control is drawn. Slots are elements with
+  /// a matching `data-slot` attribute.
+  const PLACEMENT = {
+    macos: { search: "toolbar-end", newSecret: "toolbar-actions", refresh: "toolbar-actions", account: "sidebar-foot", invites: "sidebar-top" },
+    windows: { search: "toolbar-center", newSecret: "pane-actions", refresh: "pane-actions", account: "toolbar-end", invites: "sidebar-top" },
+    linux: { search: "sidebar-search", newSecret: "pane-head-start", refresh: "account-menu", account: "pane-head-end", invites: "content-top" },
+    ios: { search: "sidebar-search", newSecret: "bottombar-end", refresh: "account-menu", account: "pane-head-end", invites: "sidebar-top" },
+    android: { search: "sidebar-search", newSecret: "fab", refresh: "account-menu", account: "search-end", invites: "sidebar-top" },
+  };
+  const PLACED_CONTROLS = ["search", "newSecret", "refresh", "account", "invites"];
+
+  /// Where each moving control goes on `platform`, as `[control, slot]` pairs
+  /// in the order they should be appended.
+  function placementFor(platform) {
+    // Own keys only: "toString" or "__proto__" must not find Object's.
+    const table = Object.hasOwn(PLACEMENT, String(platform)) ? PLACEMENT[platform] : null;
+    if (!table) throw new TypeError(`no placement for platform ${JSON.stringify(platform)}`);
+    return PLACED_CONTROLS.map((control) => [control, table[control]]);
+  }
+
+  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
 });

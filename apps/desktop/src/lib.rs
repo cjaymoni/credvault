@@ -302,6 +302,9 @@ struct AppState {
     known_keys_path: PathBuf,
     /// Bumped on every copy; a clear task only fires if it is still current.
     clipboard_generation: AtomicU64,
+    /// Digest of the last value copied, until it is cleared, so "Clear now"
+    /// can wipe the clipboard early without the value itself being kept.
+    copied_digest: Mutex<Option<[u8; 32]>>,
     startup_warnings: Mutex<Vec<String>>,
 }
 
@@ -314,6 +317,7 @@ impl AppState {
             known_keys: Mutex::new(known_keys),
             known_keys_path,
             clipboard_generation: AtomicU64::new(0),
+            copied_digest: Mutex::new(None),
             startup_warnings: Mutex::new(warning.into_iter().collect()),
         })
     }
@@ -1573,32 +1577,62 @@ fn copy_secret_value(app: AppHandle, state: &AppState, value: Zeroizing<String>)
     // plaintext is not kept alive for the whole timeout.
     let digest: [u8; 32] = Sha256::digest(value.as_bytes()).into();
     drop(value);
+    // A poisoned slot only costs "Clear now" its target; the timer below
+    // still clears the clipboard on schedule.
+    if let Ok(mut slot) = state.copied_digest.lock() {
+        *slot = Some(digest);
+    }
     // A newer copy supersedes this one; its own task takes over the timer.
     let generation = state.clipboard_generation.fetch_add(1, Ordering::SeqCst) + 1;
     tokio::spawn(async move {
         tokio::time::sleep(CLIPBOARD_CLEAR_AFTER).await;
         let state = app.state::<AppState>();
         if state.clipboard_generation.load(Ordering::SeqCst) == generation {
+            take_copied_digest(&state.copied_digest);
             clear_clipboard_if_digest_matches(&app, &digest);
         }
     });
     Ok(CLIPBOARD_CLEAR_AFTER.as_secs())
 }
 
+/// Wipe the clipboard now rather than when the timer runs out, if it still
+/// holds the last value this app copied. Returns whether anything was wiped:
+/// false when nothing is pending or the user has copied something else since.
+#[tauri::command]
+fn clear_copied_value(app: AppHandle, state: State<'_, AppState>) -> bool {
+    let Some(digest) = take_copied_digest(&state.copied_digest) else {
+        return false;
+    };
+    // Supersede the pending timer: there is nothing left for it to do.
+    state.clipboard_generation.fetch_add(1, Ordering::SeqCst);
+    clear_clipboard_if_digest_matches(&app, &digest)
+}
+
+/// Hand over the remembered digest exactly once, so a value is cleared by
+/// "Clear now" or by its timer, never both.
+fn take_copied_digest(slot: &Mutex<Option<[u8; 32]>>) -> Option<[u8; 32]> {
+    slot.lock().ok()?.take()
+}
+
 /// Wipe the clipboard only if it still holds what we put there, so we never
-/// destroy something the user copied since.
-fn clear_clipboard_if_digest_matches(app: &AppHandle, expected: &[u8; 32]) {
+/// destroy something the user copied since. Returns whether it was wiped.
+fn clear_clipboard_if_digest_matches(app: &AppHandle, expected: &[u8; 32]) -> bool {
     let clipboard = app.clipboard();
     let unchanged = match clipboard.read_text() {
         Ok(current) => Sha256::digest(current.as_bytes()).as_slice() == expected,
         Err(error) => {
             tracing::warn!(%error, "clipboard unavailable; cannot clear copied password");
-            return;
+            return false;
         }
     };
-    if unchanged {
-        if let Err(error) = clipboard.clear() {
+    if !unchanged {
+        return false;
+    }
+    match clipboard.clear() {
+        Ok(()) => true,
+        Err(error) => {
             tracing::warn!(%error, "failed to clear copied password from clipboard");
+            false
         }
     }
 }
@@ -2019,6 +2053,7 @@ pub fn run() {
             copy_password,
             reveal_field,
             copy_field,
+            clear_copied_value,
             create_secret,
             update_secret,
             delete_secret,
@@ -2039,6 +2074,20 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Clear now" and the timer must not both act on one copy: whichever
+    /// runs first takes the digest and the other finds nothing to clear.
+    #[test]
+    fn a_copied_digest_is_handed_over_once() {
+        let slot = Mutex::new(Some([7u8; 32]));
+        assert_eq!(take_copied_digest(&slot), Some([7u8; 32]));
+        assert_eq!(take_copied_digest(&slot), None);
+    }
+
+    #[test]
+    fn nothing_copied_means_nothing_to_clear() {
+        assert_eq!(take_copied_digest(&Mutex::new(None)), None);
+    }
 
     /// The server composes the sign-in URL, and the server is the party this
     /// app guards against. Only Google's own authorization page over https is

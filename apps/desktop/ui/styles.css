@@ -70,19 +70,22 @@
 }
 
 /* Dark tokens apply when the OS prefers dark and no override is set, or when
-   the user picked Dark in the app. The two blocks must stay identical. */
+   the user picked Dark in the app. The two blocks must stay identical.
+
+   `--bg` stays off pure black and `--text` off pure white, here and in every
+   per-platform palette in platform.css; that file's header says why. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0f1518;
-    --surface: #171f24;
-    --surface-2: #1d262c;
-    --surface-3: #243036;
-    --border: #28343b;
-    --border-strong: #3a4953;
-    --border-input: #5d6f7b;
+    --bg: #171e22;
+    --surface: #1f272c;
+    --surface-2: #252f35;
+    --surface-3: #2c3940;
+    --border: #313e46;
+    --border-strong: #44545f;
+    --border-input: #687b88;
     --text: #e8eef2;
     --text-2: #aebbc4;
-    --text-3: #8b9ba6;
+    --text-3: #93a3ae;
 
     --accent: #2fc4b2;
     --accent-hover: #5ad6c7;
@@ -107,7 +110,7 @@
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
     --toast-bg: #e8eef2;
-    --toast-fg: #0f1518;
+    --toast-fg: #171e22;
     --toast-icon: #0f766e;
     --badge-on-active: rgba(0, 0, 0, 0.25);
 
@@ -116,16 +119,16 @@
   }
 }
 :root[data-theme="dark"] {
-  --bg: #0f1518;
-  --surface: #171f24;
-  --surface-2: #1d262c;
-  --surface-3: #243036;
-  --border: #28343b;
-  --border-strong: #3a4953;
-  --border-input: #5d6f7b;
+  --bg: #171e22;
+  --surface: #1f272c;
+  --surface-2: #252f35;
+  --surface-3: #2c3940;
+  --border: #313e46;
+  --border-strong: #44545f;
+  --border-input: #687b88;
   --text: #e8eef2;
   --text-2: #aebbc4;
-  --text-3: #8b9ba6;
+  --text-3: #93a3ae;
 
   --accent: #2fc4b2;
   --accent-hover: #5ad6c7;
@@ -150,7 +153,7 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
   --toast-bg: #e8eef2;
-  --toast-fg: #0f1518;
+  --toast-fg: #171e22;
   --toast-icon: #0f766e;
   --badge-on-active: rgba(0, 0, 0, 0.25);
 
@@ -185,7 +188,12 @@ button { font: inherit; color: inherit; }
 .ic { width: var(--ic); height: var(--ic); flex: none; }
 
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-input:focus-visible, textarea:focus-visible {
+/* A focused text field is marked by its border turning --focus; the shadow is
+   only a halo around it, and on its own it is under 3:1 on every palette. A
+   checkbox is drawn by the platform and has no border to turn, so it must not
+   match this rule -- `outline: none` would take the browser's own ring away
+   and leave it with just that halo. It falls through to the outline above. */
+input:not([type="checkbox"]):focus-visible, textarea:focus-visible {
   outline: none;
   border-color: var(--focus);
   box-shadow: 0 0 0 3px var(--focus-ring);
@@ -212,7 +220,11 @@ input:focus-visible, textarea:focus-visible {
 
 /* ----- form controls ------------------------------------------------------- */
 
-input:not([type="search"]), input[type="search"], textarea {
+/* Checkboxes are excluded everywhere these field-box rules are repeated: a
+   checkbox is not a text field, and `appearance: none` plus a field's width,
+   height and padding turned the one in the custom-field editor into an empty
+   rectangle that never showed a tick. It is drawn below instead. */
+input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea {
   font: inherit;
   width: 100%;
   min-height: 38px;
@@ -490,13 +502,12 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
 .app {
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-  grid-template-rows: auto 1fr;
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
 }
 @media (max-width: 900px) { .app { --sidebar-w: 248px; } }
 
 .topbar {
-  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -753,11 +764,11 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
 .notice.danger .ic { color: var(--danger); }
 
 /* sharing */
-.invite-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
-.invite-form .field { margin: 0; flex: 1 1 180px; }
-.invite-form .field.wide { flex: 2 1 240px; }
-.invite-form .btn { flex: none; height: 38px; }
-
+/* The invite form has no rules of its own on purpose. It is a dialog now, so
+   it stacks like one -- `.field` margins between the rows, `.dialog-actions`
+   at the foot. The row layout it carried over from sitting inline on the
+   secret put the fingerprint beside the email and the buttons beside the
+   message whenever the dialog was wide enough not to wrap. */
 .fp-compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 12px 0; }
 .fp-box { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); }
 .fp-box .k { font-size: var(--text-caption); font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
@@ -792,12 +803,19 @@ input.mono.mismatch { border-color: var(--danger); }
   color: var(--text-2);
   white-space: nowrap;
 }
-.cf-hide input { width: auto; min-height: 0; margin: 0; }
+/* Left as the platform's own checkbox rather than restyled: it is the one
+   control here that every toolkit draws the same way its native dialogs do,
+   and `accent-color` tints it with the app's teal. Drawing our own would
+   also mean drawing the tick, and the page's CSP allows no `data:` images to
+   draw it with. */
+.cf-hide input[type="checkbox"] { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
 @media (max-width: 720px) {
   /* Two rows on a phone: the label full width, then the value sharing a line
      with Hide and Remove. */
   .custom-field { grid-template-columns: minmax(0, 1fr) auto auto; }
   .custom-field .cf-label { grid-column: 1 / -1; }
+  /* Bigger to hit with a thumb; the whole label is the target either way. */
+  .cf-hide input[type="checkbox"] { width: 20px; height: 20px; }
 }
 
 .people { list-style: none; margin: 0; padding: 0; }
@@ -878,7 +896,7 @@ input.mono.mismatch { border-color: var(--danger); }
   button, .item { -webkit-touch-callout: none; user-select: none; }
 
   /* ----- controls ----- */
-  input:not([type="search"]), input[type="search"], textarea {
+  input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea {
     /* 17px: a field below 16px makes iOS zoom the page when it takes focus */
     font-size: var(--text-body);
     min-height: var(--control-h);
@@ -918,61 +936,6 @@ input.mono.mismatch { border-color: var(--danger); }
     transform: scale(0.97);
     opacity: 0.9;
   }
-
-  /* ----- shell ----- */
-  /* minmax(0, 1fr): a bare 1fr track refuses to shrink below the longest nowrap item name */
-  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; height: 100dvh; }
-  .topbar {
-    grid-column: 1;
-    flex-wrap: nowrap;
-    gap: 4px;
-    min-height: calc(var(--topbar-h) + env(safe-area-inset-top));
-    padding: env(safe-area-inset-top) 10px 0;
-  }
-  .app[data-screen="detail"] .sidebar { display: none; }
-  .app[data-screen="list"] .main { display: none; }
-  .app[data-screen="list"] #btn-back { display: none; }
-  .app[data-screen="detail"] .brand { display: none; }
-  .app[data-screen="list"] #mobile-title { display: none; }
-  /* The back chevron is tinted and oversized, the way a phone draws the one
-     control that leaves the screen. */
-  #btn-back { display: inline-flex; width: 44px; height: 44px; margin-left: -8px; color: var(--accent); }
-  #btn-back .ic { width: 26px; height: 26px; }
-  #mobile-title {
-    display: block;
-    flex: 1;
-    min-width: 0;
-    text-align: center;
-    font-weight: 600;
-    font-size: var(--text-emphasis);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .app[data-screen="detail"] .spacer { display: none; }
-  .app[data-screen="detail"] #btn-account { visibility: hidden; } /* keeps the title centred */
-
-  /* On the list screen the nav bar is the app's home header, so the brand
-     sits at title size rather than shrunk to fit beside a sidebar. */
-  .brand.compact { gap: 12px; padding-left: 4px; }
-  .brand.compact .brand-mark { width: 36px; height: 36px; border-radius: 11px; }
-  .brand.compact .brand-mark svg { width: 21px; height: 21px; }
-  .brand.compact .brand-name { font-size: var(--text-title); font-weight: 700; }
-
-  #btn-account {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 40px;
-    height: 40px;
-    margin: 0 2px;
-    border: 0;
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--accent-soft-text);
-    cursor: pointer;
-  }
-  #btn-account .ic { width: 22px; height: 22px; }
 
   /* ----- list screen ----- */
   .sidebar { border-right: 0; background: var(--bg); }
@@ -1024,42 +987,6 @@ input.mono.mismatch { border-color: var(--danger); }
   .badge { height: 26px; padding: 0 10px; }
   .badge .ic { width: 14px; height: 14px; }
   .list-empty { padding: 48px 16px; font-size: var(--text-body); }
-
-  /* compose button */
-  #btn-new {
-    position: fixed;
-    right: 20px;
-    bottom: calc(24px + env(safe-area-inset-bottom));
-    z-index: 5;
-    width: 64px;
-    height: 64px;
-    padding: 0;
-    border-radius: 999px;
-    box-shadow: 0 10px 24px var(--accent-glow), var(--shadow-md);
-  }
-  #btn-new .ic { width: 28px; height: 28px; }
-  #btn-new .btn-text { display: none; }
-  #btn-new:active { transform: scale(0.94); }
-
-  #invites-banner { display: block; }
-  .invites-banner {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    width: calc(100% - 32px);
-    margin: 2px 16px 10px;
-    padding: 16px;
-    border: 0;
-    border-radius: var(--radius-lg);
-    background: var(--accent-soft);
-    color: var(--accent-soft-text);
-    font-size: var(--text-body);
-    font-weight: 600;
-    text-align: left;
-    cursor: pointer;
-  }
-  .invites-banner > span:not(.count-pill) { flex: 1; }
-  .invites-banner .ic:last-child { color: currentColor; opacity: 0.75; }
 
   /* ----- detail screen ----- */
   /* No bottom padding here: the form's action bar sticks to the foot of the
@@ -1114,9 +1041,6 @@ input.mono.mismatch { border-color: var(--danger); }
   .confirm-bar .actions { width: 100%; gap: 10px; }
   .confirm-bar .actions .btn { flex: 1; }
   .notice { padding: 14px; border-radius: var(--radius); }
-  .invite-form { flex-direction: column; align-items: stretch; gap: 0; }
-  .invite-form .field, .invite-form .field.wide { flex: none; }
-  .invite-form .btn { width: 100%; height: var(--control-h); }
   .fp-compare { grid-template-columns: 1fr; }
   .fp-box { padding: 14px; border-radius: var(--radius); }
   .people li { gap: 12px; padding: 14px 0; }
@@ -1256,7 +1180,11 @@ input.mono.mismatch { border-color: var(--danger); }
     justify-content: flex-start;
     padding: calc(20px + env(safe-area-inset-top)) 20px calc(16px + env(safe-area-inset-bottom));
   }
-  .auth-card { max-width: none; margin-top: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
+  /* `border: none`, not the `border: 0` used elsewhere, so the static CSS
+     checker reads the reset: it parses the keyword but not the bare 0, and
+     otherwise pairs this rule's `padding: 0` with the card border above,
+     a combination no viewport ever renders. Identical in every browser. */
+  .auth-card { max-width: none; margin-top: 0; padding: 0; border: none; background: transparent; box-shadow: none; }
   .auth .brand { gap: 12px; }
   .auth .brand-mark { width: 44px; height: 44px; border-radius: 14px; }
   .auth .brand-mark svg { width: 24px; height: 24px; }

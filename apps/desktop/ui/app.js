@@ -14,6 +14,9 @@ const THEME_KEY = "theme";
 const THEME_CHOICES = ["system", "light", "dark"];
 
 const state = { secrets: [], selected: null, editing: false, editTitle: "", authMode: "login", inviteCount: 0, formFields: [],
+  // The invitations view is open in the detail pane (reached from the
+  // invitations entry in the list), and the secret the invite dialog is for.
+  showingInvites: false, inviteFor: null,
   // What the server at the URL in the box offers, and the Google sign-in
   // waiting for a passphrase, if there is one.
   capabilities: null, google: null, user: null,
@@ -37,6 +40,52 @@ MOBILE_QUERY.addEventListener("change", () => {
   renderDetail();
 });
 const timers = { toast: null };
+
+// Set by boot.js before the page drew, from the webview's user agent.
+const PLATFORM = document.documentElement.dataset.platform || "linux";
+/// How long a toast carrying an action stays up: long enough to reach it.
+const ACTION_TOAST_MS = 10_000;
+// Both modifiers work everywhere; these name the one this platform prints.
+const NEW_SECRET_SHORTCUT = Screens.shortcutLabel(PLATFORM, "N");
+const SEARCH_SHORTCUT = Screens.shortcutLabel(PLATFORM, "K");
+
+/// The elements behind each name in Screens.placementFor().
+const PLACED = {
+  search: () => $("search-box"),
+  newSecret: () => $("btn-new"),
+  refresh: () => $("btn-refresh"),
+  account: () => $("btn-account"),
+  invites: () => $("invites-banner"),
+};
+
+/// Move each control that lives in a different place per platform into its
+/// slot. Runs once, before anything is shown; a missing slot is a markup bug
+/// and fails loudly rather than leaving a control stranded off screen.
+function placeControls() {
+  for (const [control, slotName] of Screens.placementFor(PLATFORM)) {
+    const slot = document.querySelector(`[data-slot="${slotName}"]`);
+    const element = PLACED[control]();
+    if (!slot || !element) throw new Error(`cannot place ${control} in slot ${slotName}`);
+    slot.append(element);
+  }
+}
+placeControls();
+
+/// Put the shortcut in the two tooltips that can carry one. Written here
+/// rather than in the markup because the right spelling is not known until
+/// the platform is, and on a phone there is no right spelling at all.
+function labelShortcuts() {
+  // Announced on every platform, because the shortcut works on every
+  // platform: an iPad with a keyboard attached presses ⌘N like any Mac.
+  // aria-keyshortcuts is the attribute that says so without becoming the
+  // control's name, which is the only reason the tooltip is held back below.
+  $("btn-new").setAttribute("aria-keyshortcuts", Screens.shortcutKeys(PLATFORM, "N"));
+  $("filter").setAttribute("aria-keyshortcuts", Screens.shortcutKeys(PLATFORM, "K"));
+  if (!Screens.namesShortcuts(PLATFORM)) return;
+  $("btn-new").title = `New secret (${NEW_SECRET_SHORTCUT})`;
+  $("filter").title = `Search (${SEARCH_SHORTCUT})`;
+}
+labelShortcuts();
 
 // ----- helpers ---------------------------------------------------------------
 
@@ -68,12 +117,33 @@ function icon(name) {
   return `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
 }
 
-function toast(message) {
+/// Show a short confirmation. With `action` ({ label, run }) it also carries a
+/// button, stays up long enough to reach it, and goes away once it is used.
+function toast(message, action = null) {
   const el = $("toast");
-  el.innerHTML = `${icon("check")}<span>${esc(message)}</span>`;
+  el.innerHTML = `${icon("check")}<span class="toast-text">${esc(message)}</span>`;
+  el.classList.toggle("has-action", Boolean(action));
+  if (action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "toast-action";
+    button.textContent = action.label;
+    button.onclick = async () => {
+      hideToast();
+      try { await action.run(); } catch (error) { setError("main-error", error); }
+    };
+    el.append(button);
+  }
   el.classList.add("show");
   clearTimeout(timers.toast);
-  timers.toast = setTimeout(() => el.classList.remove("show"), TOAST_MS);
+  timers.toast = setTimeout(hideToast, action ? ACTION_TOAST_MS : TOAST_MS);
+}
+function hideToast() {
+  clearTimeout(timers.toast);
+  const el = $("toast");
+  el.classList.remove("show", "has-action");
+  // An action button must not stay reachable by Tab once it is out of sight.
+  el.querySelector(".toast-action")?.remove();
 }
 /// Command errors arrive as `{ code, message }`; anything else is shown as text.
 function setError(id, error) {
@@ -155,6 +225,21 @@ async function copyText(text, label) {
   }
 }
 
+/// Open a <dialog> modally. showModal() makes everything behind it inert and
+/// gives Escape to the dialog's `cancel` event.
+function openDialog(dialog) {
+  if (dialog && !dialog.open) dialog.showModal();
+}
+function closeDialog(dialog) {
+  if (dialog?.open) dialog.close();
+}
+
+/// The first of these that is actually on screen: the same action can sit in
+/// a different place per platform, and focus has to return to the one shown.
+function firstVisible(...ids) {
+  return ids.map($).find((el) => el && el.getClientRects().length > 0) ?? null;
+}
+
 function togglePasswordInput(input, button) {
   const show = input.type === "password";
   input.type = show ? "text" : "password";
@@ -170,14 +255,60 @@ function togglePasswordInput(input, button) {
 
 function mobileTitle() {
   if (state.editing) return state.editTitle;
+  if (state.showingInvites) return "Invitations";
   const secret = state.secrets.find((s) => s.id === state.selected);
-  return secret ? secret.name : "Invitations";
+  return secret ? secret.name : "";
 }
 /// What the phone chrome has to agree on: the nav bar names the screen, and
 /// a screen that is a form keeps the invitations out of its way.
 function syncScreenChrome() {
   $("mobile-title").textContent = mobileTitle();
   $("main").classList.toggle("has-form", state.editing);
+  syncBarActions(state.editing || state.showingInvites ? null : state.secrets.find((s) => s.id === state.selected));
+}
+
+/// Edit in the top bar (GNOME, iOS, Android) and Android's "more" menu, which
+/// holds Delete. Hidden when no secret is open, while a form is, and (Edit)
+/// for a secret that is shared with this account or cannot be decrypted.
+function syncBarActions(secret) {
+  closeBarMenu();
+  const edit = $("btn-bar-edit");
+  edit.classList.toggle("hidden", !(secret && secret.is_owner && !secret.error));
+  $("btn-bar-more").classList.toggle("hidden", !secret);
+  if (secret) {
+    edit.setAttribute("aria-label", `Edit ${secret.name}`);
+    $("btn-menu-delete").textContent = secret.is_owner ? "Delete" : "Remove from vault";
+  }
+}
+
+/// The items of the "more" menu, in order.
+function barMenuItems() {
+  return [...$("bar-menu").querySelectorAll('[role="menuitem"]')];
+}
+function openBarMenu() {
+  $("bar-menu").hidden = false;
+  $("btn-bar-more").setAttribute("aria-expanded", "true");
+  barMenuItems()[0]?.focus();
+}
+/// `restoreFocus` sends focus back to the button, for Escape and for an item
+/// that was chosen; a click elsewhere or Tab leaves it where it went.
+function closeBarMenu({ restoreFocus = false } = {}) {
+  const menu = $("bar-menu");
+  if (menu.hidden) return;
+  menu.hidden = true;
+  $("btn-bar-more").setAttribute("aria-expanded", "false");
+  if (restoreFocus) $("btn-bar-more").focus();
+}
+/// The APG menu keys: arrows, Home and End move between items; Escape closes
+/// back to the button; Tab closes and lets focus move on.
+function barMenuKeydown(event) {
+  const items = barMenuItems();
+  const index = items.indexOf(document.activeElement);
+  const last = items.length - 1;
+  const moves = { ArrowDown: index >= last ? 0 : index + 1, ArrowUp: index <= 0 ? last : index - 1, Home: 0, End: last };
+  if (event.key in moves) { event.preventDefault(); items[moves[event.key]]?.focus(); return; }
+  if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeBarMenu({ restoreFocus: true }); return; }
+  if (event.key === "Tab") closeBarMenu();
 }
 function showDetailScreen() {
   syncScreenChrome();
@@ -208,7 +339,7 @@ function syncScreenAfterRefresh() {
 /// land on controls hidden under the backdrop. The trigger stays live so it
 /// can close the sheet again.
 function behindSheet() {
-  return [$("main"), document.querySelector(".sidebar"), $("btn-back"), document.querySelector(".topbar .brand"), $("mobile-title")];
+  return [document.querySelector(".sidebar"), document.querySelector(".content"), document.querySelector(".bottombar")];
 }
 function openAccountSheet() {
   const sheet = $("account-tools");
@@ -484,6 +615,8 @@ function renderGoogleLinkForm({ afterEviction = false } = {}) {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
+  state.showingInvites = false;
+  syncInvitesView();
   const linked = state.user?.google_email || null;
   state.editTitle = linked ? "Google sign-in" : "Link Google";
   renderList();
@@ -542,6 +675,8 @@ function renderSignOutOthersForm() {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
+  state.showingInvites = false;
+  syncInvitesView();
   state.editTitle = "Sign out other devices";
   renderList();
   showDetailScreen();
@@ -667,10 +802,13 @@ function showApp(user) {
   $("who-server").textContent = user.server_url;
   $("who-server").title = user.server_url;
   $("fingerprint").textContent = user.fingerprint;
+  $("acct-email").textContent = user.email;
+  $("acct-fp").textContent = user.fingerprint;
+  $("acct-initial").textContent = (Array.from(String(user.email ?? "").trim())[0] || "?").toUpperCase();
   renderGoogleChip();
   $("auth").classList.add("hidden");
   $("app").classList.remove("hidden");
-  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0;
+  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0; state.showingInvites = false;
   $("filter").value = "";
   $("app").dataset.screen = "list";
   renderDetail();
@@ -689,7 +827,9 @@ function resetToSignedOut() {
   // Dropped with the rest of it: the chip reads the signed-in account, and a
   // stale one would describe the last person to use this app.
   state.user = null;
-  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0;
+  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0; state.showingInvites = false;
+  closeDialog($("invite-dialog"));
+  closeDialog($("form-dialog"));
   syncScreenChrome();
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
   closeAccountSheet({ restoreFocus: false });
@@ -786,6 +926,10 @@ function renderList() {
   $("count").textContent = needle
     ? `${rows.length} of ${total} match`
     : `${plural(total, "secret", "secrets")}${sharedTotal ? ` · ${sharedTotal} shared with you` : ""}`;
+  // macOS repeats the count under the toolbar title and iOS in its bottom
+  // toolbar; both are the same sentence as the list's own count line.
+  $("toolbar-sub").textContent = $("count").textContent;
+  $("bottom-count").textContent = $("count").textContent;
 
   const list = $("list");
   if (!rows.length) {
@@ -819,6 +963,7 @@ function listKeydown(event) {
 function selectSecret(id) {
   state.selected = id;
   state.editing = false;
+  state.showingInvites = false;
   renderList();
   renderDetail();
   showDetailScreen();
@@ -826,6 +971,7 @@ function selectSecret(id) {
 
 function startNew() {
   state.selected = null;
+  state.showingInvites = false;
   renderList();
   renderForm(null);
   showDetailScreen();
@@ -834,9 +980,13 @@ function startNew() {
 function showInvitesScreen() {
   state.selected = null;
   state.editing = false;
+  state.showingInvites = true;
+  closeDialog($("form-dialog"));
   renderList();
   renderDetail();
   showDetailScreen();
+  renderInvitesBanner(state.inviteCount);
+  $("invites-title")?.focus();
 }
 
 // ----- invites ---------------------------------------------------------------
@@ -845,11 +995,16 @@ function renderInvites(invites) {
   const box = $("invites");
   state.inviteCount = invites.length;
   $("main").classList.toggle("has-invites", invites.length > 0);
+  // Answering the last invitation leaves nothing to show in that view.
+  if (!invites.length && state.showingInvites) {
+    state.showingInvites = false;
+    syncInvitesView();
+  }
   renderInvitesBanner(invites.length);
   if (!invites.length) { box.innerHTML = ""; return; }
   box.innerHTML = `
     <section aria-labelledby="invites-title">
-      <h2 id="invites-title" class="section-title">${icon("inbox")} Invitations <span class="count-pill">${invites.length}</span></h2>
+      <h2 id="invites-title" class="section-title" tabindex="-1">${icon("inbox")} Invitations <span class="count-pill">${invites.length}</span></h2>
       ${invites.map((i) => `
         <div class="card invite">
           <div class="invite-body">
@@ -874,18 +1029,31 @@ function renderInvites(invites) {
   }
 }
 
-/// Phone list screen: a tappable banner that opens the invitations.
+/// The invitations entry in the list. One button whose parts each platform
+/// shows or hides: a source-list row with a count on macOS and iOS, an info
+/// bar on Windows, a banner across the content on GNOME, a card on Android.
+/// "View" is drawn as a button but is text inside this one, so there is a
+/// single control to reach rather than two doing the same thing.
 function renderInvitesBanner(count) {
   const banner = $("invites-banner");
   if (!count) { banner.innerHTML = ""; return; }
+  const waiting = `${plural(count, "invitation", "invitations")} waiting`;
   banner.innerHTML = `
-    <button type="button" class="invites-banner" id="btn-invites">
-      ${icon("inbox")}
-      <span>${plural(count, "invitation", "invitations")} waiting</span>
+    <button type="button" class="invites-banner" id="btn-invites" aria-current="${state.showingInvites ? "page" : "false"}">
+      <span class="ib-icon">${icon("inbox")}</span>
+      <span class="ib-label">Invitations</span>
+      <span class="ib-sentence">${waiting}</span>
       <span class="count-pill">${count}</span>
-      ${icon("chevronRight")}
+      <span class="ib-view">View</span>
+      <span class="ib-chev">${icon("chevronRight")}</span>
     </button>`;
   $("btn-invites").onclick = showInvitesScreen;
+}
+
+/// The detail pane shows either the invitations or the selected secret.
+function syncInvitesView() {
+  $("main").classList.toggle("showing-invites", state.showingInvites);
+  $("btn-invites")?.setAttribute("aria-current", state.showingInvites ? "page" : "false");
 }
 
 // ----- detail ----------------------------------------------------------------
@@ -906,7 +1074,7 @@ function emptyDetailHtml() {
       <h2>No secret selected</h2>
       <p>${isMobile()
         ? "Pick one from your vault, or tap + to create a new one."
-        : `Pick one from the list, or press <span class="kbd">⌘N</span> / <span class="kbd">Ctrl+N</span> to create a new one.`}</p>
+        : `Pick one from the list, or press <span class="kbd">${esc(NEW_SECRET_SHORTCUT)}</span> to create a new one.`}</p>
     </div>`;
 }
 
@@ -918,7 +1086,7 @@ function kvRow(iconName, label, value, { mono = false, copyLabel = null } = {}) 
   const actions = hasValue && copyLabel
     ? `<div class="kv-actions"><button type="button" class="icon-btn" data-copy="${esc(value)}" data-copy-label="${esc(copyLabel)}" aria-label="Copy ${esc(copyLabel.toLowerCase())}" title="Copy">${icon("copy")}</button></div>`
     : "";
-  return `<div class="kv-row"><dt>${icon(iconName)} ${esc(label)}</dt><dd>${valueHtml}${actions}</dd></div>`;
+  return `<div class="kv-row"><dt>${icon(iconName)}<span class="kv-label">${esc(label)}</span></dt><dd>${valueHtml}${actions}</dd></div>`;
 }
 
 /// Extra details, in the order they were saved. A value the user marked as
@@ -938,6 +1106,7 @@ function renderDetail() {
   syncScreenChrome();
   const s = state.secrets.find((x) => x.id === state.selected);
   $("main").classList.toggle("has-selection", Boolean(s));
+  syncInvitesView();
   if (!s) {
     $("detail").innerHTML = emptyDetailHtml();
     const newButton = $("btn-empty-new");
@@ -979,7 +1148,8 @@ function renderDetail() {
       <section class="card" id="sharing" aria-labelledby="sharing-title">
         <h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3>
         <p class="muted">Loading…</p>
-      </section>` : ""}`;
+      </section>` : ""}
+    <button type="button" class="btn danger delete-bottom" id="btn-delete-bottom">${s.is_owner ? "Delete Secret" : "Remove from Vault"}<span class="ell">…</span></button>`;
 
   for (const el of $("detail").querySelectorAll("[data-copy]")) {
     el.onclick = () => copyText(el.dataset.copy, el.dataset.copyLabel);
@@ -1005,6 +1175,7 @@ function renderDetail() {
     );
   });
   $("btn-delete").onclick = () => renderDeleteConfirm(s);
+  $("btn-delete-bottom").onclick = () => renderDeleteConfirm(s);
   if (s.is_owner) {
     $("btn-edit").onclick = () => renderForm(s);
     loadSharing(s.id);
@@ -1076,7 +1247,7 @@ function secretRow(iconName, label, key) {
   const lower = esc(label.toLowerCase());
   return `
     <div class="kv-row">
-      <dt>${icon(iconName)} ${esc(label)}</dt>
+      <dt>${icon(iconName)}<span class="kv-label">${esc(label)}</span></dt>
       <dd>
         <code class="value mono" id="val-${key}" data-shown="0">${MASKED}</code>
         <span class="pw-timer hidden" id="timer-${key}" aria-live="off"></span>
@@ -1129,9 +1300,18 @@ function wireSecretRow(key, fetchValue, copyValue, stillShowing, subject = "Valu
     setError("main-error", "");
     try {
       const seconds = await copyValue();
-      toast(`${subject} copied · clipboard clears in ${seconds}s`);
+      // Android's snackbar carries the one action that fits a copy: undo it.
+      const clearAction = PLATFORM === "android" ? { label: "Clear now", run: clearClipboardNow } : null;
+      toast(`${subject} copied · clipboard clears in ${seconds}s`, clearAction);
     } catch (error) { setError("main-error", error); }
   };
+}
+
+/// Wipe the clipboard now instead of when the timer runs out. Rust only clears
+/// it if it still holds what this app put there.
+async function clearClipboardNow() {
+  const cleared = await invoke("clear_copied_value");
+  toast(cleared ? "Clipboard cleared" : "Clipboard has changed since, so it was left alone");
 }
 
 /// Inline confirmation instead of window.confirm(), which the webview may not show.
@@ -1150,7 +1330,10 @@ function renderDeleteConfirm(s) {
         <button type="button" class="btn danger solid" id="btn-delete-confirm">${verb}</button>
       </div>
     </div>`;
-  const cancel = () => { box.innerHTML = ""; const b = $("btn-delete"); if (b) b.focus(); };
+  const cancel = () => {
+    box.innerHTML = "";
+    firstVisible("btn-delete", "btn-bar-more", "btn-delete-bottom")?.focus();
+  };
   $("btn-delete-cancel").onclick = cancel;
   box.firstElementChild.addEventListener("keydown", (e) => { if (e.key === "Escape") cancel(); });
   $("btn-delete-confirm").onclick = async () => {
@@ -1201,63 +1384,29 @@ async function loadSharing(id) {
   try {
     const access = await invoke("get_access", { id });
     if (!box.isConnected || state.selected !== id) return; // user moved on
-    const members = access.members.length
-      ? access.members.map((m) => `
-          <li>${avatar(m.email, { size: "sm" })}<span class="who">${esc(m.email)}</span>
-            <button type="button" class="btn ghost danger sm" data-revoke="${m.user_id}" aria-label="Revoke access for ${esc(m.email)}">Revoke</button></li>`).join("")
-      : `<li class="only-you">Only you have access.</li>`;
-    const pending = access.invites.length ? `
-      <h3 class="sub-title">Pending invites</h3>
-      <ul class="people">${access.invites.map((i) => `
-        <li>${avatar(i.email, { size: "sm" })}<span class="who">${esc(i.email)}</span><span class="badge">Pending</span>
-          <button type="button" class="btn ghost sm" data-cancel="${i.id}" aria-label="Cancel invite for ${esc(i.email)}">Cancel</button></li>`).join("")}</ul>` : "";
+    // Members and pending invites in one list, each saying where it stands,
+    // the way every platform's own sharing list reads.
+    const members = access.members.map((m) => `
+      <li>${avatar(m.email, { size: "sm" })}<span class="who">${esc(m.email)}</span>
+        <span class="people-status">Can view</span>
+        <button type="button" class="btn danger sm" data-revoke="${m.user_id}" aria-label="Revoke access for ${esc(m.email)}"><span>Revoke<span class="ell">…</span></span></button></li>`);
+    const pending = access.invites.map((i) => `
+      <li>${avatar(i.email, { size: "sm" })}<span class="who">${esc(i.email)}</span>
+        <span class="people-status">Invite pending</span>
+        <button type="button" class="btn sm" data-cancel="${i.id}" aria-label="Cancel invite for ${esc(i.email)}">Cancel Invite</button></li>`);
+    const people = [...members, ...pending];
     box.innerHTML = `
-      <h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3>
-      <p class="card-lead">Invite someone by the email they signed up with. They get read-only access to this one secret.
-        Revoking someone re-encrypts it with a new key and cancels any pending invites.</p>
-      <form class="invite-form" id="invite-form" novalidate>
-        <div class="field">
-          <label for="invite-email">Email</label>
-          <input id="invite-email" type="email" placeholder="friend@example.com" autocomplete="off" spellcheck="false">
+      <div class="share-head">
+        <div class="share-head-text">
+          <h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3>
+          <p class="card-lead">People you invite get read-only access to this one secret. Revoking re-encrypts it with a new key.</p>
         </div>
-        <div class="field">
-          <label for="invite-fingerprint">Their key fingerprint</label>
-          <input id="invite-fingerprint" class="mono" placeholder="0000-0000-0000-0000-0000-0000"
-            autocomplete="off" spellcheck="false">
-          <p class="hint">Ask them to read it from the top of their credvault window. Leave blank for someone you have already shared with.</p>
-        </div>
-        <div class="field wide">
-          <label for="invite-message">Message <span class="label-note">(optional)</span></label>
-          <input id="invite-message" placeholder="e.g. The shared Wi-Fi password" maxlength="${UI.maxMessageLength}">
-        </div>
-        <button type="submit" class="btn primary" id="btn-invite">${icon("mail")} Invite</button>
-      </form>
-      <div id="invite-confirm"></div>
-      <h3 class="sub-title">People with access</h3>
-      <ul class="people" id="members">${members}</ul>
-      ${pending}`;
+        <button type="button" class="btn primary share-invite" id="btn-open-invite">${icon("plus")} <span>Invite Someone<span class="ell">…</span></span></button>
+      </div>
+      <div id="revoke-confirm"></div>
+      <ul class="people" id="members">${people.length ? people.join("") : `<li class="only-you">Only you have access.</li>`}</ul>`;
 
-    $("invite-form").onsubmit = async (event) => {
-      event.preventDefault();
-      const email = $("invite-email").value.trim();
-      if (!email) { setError("main-error", "Enter the email of the person to invite."); $("invite-email").focus(); return; }
-      setError("main-error", "");
-      setBusy($("btn-invite"), true);
-      try {
-        // Blank means "use the key I pinned for them"; the command says so if
-        // there is no pin to fall back on.
-        const fingerprint = $("invite-fingerprint").value.trim() || null;
-        const info = await invoke("lookup_invitee", { email, fingerprint });
-        renderInviteConfirm(id, info);
-      } catch (error) {
-        setError("main-error", error);
-        // Both of these are answered by typing the fingerprint in, so send the
-        // user straight there instead of leaving them on the email field.
-        if (error?.code === "fingerprint_required" || error?.code === "lookup_failed") $("invite-fingerprint").focus();
-      } finally {
-        setBusy($("btn-invite"), false);
-      }
-    };
+    $("btn-open-invite").onclick = () => openInviteDialog(id);
     for (const el of box.querySelectorAll("[data-revoke]")) {
       el.onclick = () => revokeMember(id, Number(el.dataset.revoke), el, []);
     }
@@ -1266,6 +1415,52 @@ async function loadSharing(id) {
     };
   } catch (error) {
     if (box.isConnected) box.innerHTML = `<h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3><div class="error">${esc(error?.message ?? error)}</div>`;
+  }
+}
+
+/// The invite dialog, emptied, for the secret `id`.
+function openInviteDialog(id) {
+  state.inviteFor = id;
+  $("invite-form").reset();
+  $("invite-form").classList.remove("hidden");
+  $("invite-message").maxLength = UI.maxMessageLength;
+  $("invite-confirm").innerHTML = "";
+  setError("invite-error", "");
+  openDialog($("invite-dialog"));
+  $("invite-email").focus();
+}
+
+/// Closing the dialog, by Cancel, Escape or a sent invite, hands focus back
+/// to the button that opened it.
+function closeInviteDialog() {
+  closeDialog($("invite-dialog"));
+  state.inviteFor = null;
+  $("btn-open-invite")?.focus();
+}
+
+/// Look the person up and show their key to confirm. Nothing is sent yet.
+async function submitInvite(event) {
+  event.preventDefault();
+  const id = state.inviteFor;
+  if (id === null) return;
+  const email = $("invite-email").value.trim();
+  if (!email) { setError("invite-error", "Enter the email of the person to invite."); $("invite-email").focus(); return; }
+  setError("invite-error", "");
+  setBusy($("btn-invite"), true);
+  try {
+    // Blank means "use the key I pinned for them"; the command says so if
+    // there is no pin to fall back on.
+    const fingerprint = $("invite-fingerprint").value.trim() || null;
+    const info = await invoke("lookup_invitee", { email, fingerprint });
+    if (state.inviteFor !== id) return; // the dialog was closed meanwhile
+    renderInviteConfirm(id, info);
+  } catch (error) {
+    setError("invite-error", error);
+    // Both of these are answered by typing the fingerprint in, so send the
+    // user straight there instead of leaving them on the email field.
+    if (error?.code === "fingerprint_required" || error?.code === "lookup_failed") $("invite-fingerprint").focus();
+  } finally {
+    setBusy($("btn-invite"), false);
   }
 }
 
@@ -1333,7 +1528,7 @@ async function revokeMember(id, userId, button, confirmed) {
 }
 
 function renderRevokeConfirm(id, userId, members) {
-  const box = $("invite-confirm");
+  const box = $("revoke-confirm");
   const changed = members.some((m) => m.status === "changed");
   const rows = members.map((m) => `
     <li>${avatar(m.email, { size: "sm" })}<span class="who">${esc(m.email)}</span>
@@ -1342,7 +1537,7 @@ function renderRevokeConfirm(id, userId, members) {
   box.innerHTML = `
     <div class="card" style="margin-top:14px" role="region" aria-label="Confirm who keeps access">
       <h3 class="card-title">${icon("key")} Confirm who keeps access</h3>
-      <p class="card-lead">Revoking re-encrypts this secret for everyone who keeps access, and this device has not confirmed these keys yet. Ask each person to read the <strong>Your key</strong> fingerprint from their credvault window and continue only if every one matches.</p>
+      <p class="card-lead">Revoking re-encrypts this secret for everyone who keeps access, and this device has not confirmed these keys yet. Ask each person to read the <strong>Your key</strong> fingerprint from their credvault account settings and continue only if every one matches.</p>
       ${changed ? `<div class="notice danger">${icon("alert")}<div>A key marked <strong>Changed</strong> differs from one you confirmed before. Either they re-created their account, or the server is lying. Do not continue unless they read the new fingerprint to you directly.</div></div>` : ""}
       <ul class="people">${rows}</ul>
       ${changedKeyChallenge(members)}
@@ -1378,23 +1573,44 @@ function renderInviteConfirm(id, info) {
     : known
       ? `<div class="notice">${icon("check")}<div>Matches the key you confirmed before.</div></div>`
       : `<div class="notice">${icon("info")}<div>This key's fingerprint is the one you entered, checked on this device. Continue only if that fingerprint came from them directly rather than from anything the server told you.</div></div>`;
+  // The confirmation replaces the form inside the dialog: one step at a time.
+  $("invite-form").classList.add("hidden");
   $("invite-confirm").innerHTML = `
-    <div class="card" style="margin-top:14px" role="region" aria-label="Confirm fingerprint">
-      <h3 class="card-title">${icon("key")} Confirm ${esc(info.email)}'s key</h3>
+    <div class="confirm-step" role="region" aria-label="Confirm fingerprint">
+      <h2 class="dialog-title">Confirm ${esc(info.email)}'s key</h2>
       ${compare}
       ${guidance}
-      <div class="actions">
+      <div class="error" id="invite-confirm-error" role="alert"></div>
+      <div class="dialog-actions">
         ${changed
           ? `<button type="button" class="btn danger solid" id="btn-invite-confirm">New fingerprint confirmed, invite anyway</button>`
           : `<button type="button" class="btn primary" id="btn-invite-confirm">${icon("check")} Fingerprint matches, invite</button>`}
         <button type="button" class="btn" id="btn-invite-cancel">Cancel</button>
       </div>
     </div>`;
-  $("btn-invite-cancel").onclick = () => { $("invite-confirm").innerHTML = ""; $("invite-email").focus(); };
+  $("btn-invite-cancel").onclick = () => {
+    $("invite-confirm").innerHTML = "";
+    $("invite-form").classList.remove("hidden");
+    $("invite-email").focus();
+  };
   $("btn-invite-confirm").onclick = async () => {
+    const button = $("btn-invite-confirm");
     // The whole key goes back, not the fingerprint: the command compares bytes.
     const args = { id, email: info.email, message: $("invite-message").value.trim(), confirmedPublicKey: info.public_key };
-    if (await act("invite", args, `Invited ${info.email}`, $("btn-invite-confirm"))) loadSharing(id);
+    setError("invite-confirm-error", "");
+    setBusy(button, true);
+    try {
+      await invoke("invite", args);
+    } catch (error) {
+      // Shown inside the dialog: the page's own error line is behind it.
+      setError("invite-confirm-error", error);
+      if (button.isConnected) setBusy(button, false);
+      return;
+    }
+    toast(`Invited ${info.email}`);
+    closeInviteDialog();
+    await refresh();
+    loadSharing(id);
   };
   // The lookup already required this fingerprint, so there is nothing left to
   // retype here; a changed key still defaults to Cancel.
@@ -1411,6 +1627,8 @@ function renderPassphraseForm() {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
   state.editing = true;
+  state.showingInvites = false;
+  syncInvitesView();
   state.editTitle = "Change passphrase";
   renderList();
   showDetailScreen();
@@ -1572,7 +1790,11 @@ function renderForm(existing) {
   syncScreenChrome();
   $("main").classList.add("has-selection");
   const s = existing || { name: "", username: "", url: "", notes: "" };
-  $("detail").innerHTML = `
+  // Windows edits a secret in a dialog over the vault; every other platform
+  // uses the detail pane, which on a phone is its own screen.
+  const inDialog = PLATFORM === "windows";
+  const host = inDialog ? $("form-dialog") : $("detail");
+  host.innerHTML = `
     <form class="card form" id="secret-form" novalidate aria-labelledby="form-title">
       <h2 id="form-title" class="card-title pane-title">${existing ? icon("edit") : icon("plus")} ${esc(state.editTitle)}</h2>
       <p class="card-lead">${existing ? "Changes are re-encrypted on this device before they are saved." : "Everything except the name is encrypted on this device before it is saved."}</p>
@@ -1616,7 +1838,13 @@ function renderForm(existing) {
     </form>`;
 
   const form = $("secret-form");
-  const cancel = () => { state.editing = false; renderDetail(); };
+  const cancel = () => {
+    state.editing = false;
+    if (inDialog) { closeDialog(host); host.innerHTML = ""; }
+    renderDetail();
+    if (inDialog) firstVisible("btn-edit", "btn-new")?.focus();
+  };
+  if (inDialog) openDialog(host);
   $("btn-toggle-pw").onclick = () => togglePasswordInput($("f-password"), $("btn-toggle-pw"));
   $("btn-generate").onclick = async () => {
     setError("form-error", "");
@@ -1679,6 +1907,7 @@ function renderForm(existing) {
         toast("Secret created");
       }
       state.editing = false;
+      if (inDialog) { closeDialog(host); host.innerHTML = ""; }
       await refresh();
       renderDetail();
     } catch (error) {
@@ -1715,6 +1944,22 @@ $("btn-back").onclick = goBack;
 $("btn-account").onclick = () => ($("app").classList.contains("account-open") ? closeAccountSheet() : openAccountSheet());
 $("account-backdrop").onclick = () => closeAccountSheet();
 $("btn-new").onclick = startNew;
+// The top-bar Edit and Delete act on the open secret through the same
+// buttons the detail pane draws, so there is one code path for each.
+$("btn-bar-edit").onclick = () => $("btn-edit")?.click();
+$("btn-bar-more").onclick = () => ($("bar-menu").hidden ? openBarMenu() : closeBarMenu({ restoreFocus: true }));
+$("bar-menu").addEventListener("keydown", barMenuKeydown);
+$("btn-menu-delete").onclick = () => { closeBarMenu({ restoreFocus: true }); $("btn-delete")?.click(); };
+// A press anywhere outside the menu and its button closes it.
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest?.(".bar-menu-wrap")) closeBarMenu();
+});
+$("invite-form").onsubmit = submitInvite;
+$("btn-invite-close").onclick = closeInviteDialog;
+// Escape closes a dialog natively; route it through the same paths as the
+// buttons so state and focus are put back the same way.
+$("invite-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeInviteDialog(); });
+$("form-dialog").addEventListener("cancel", (event) => { event.preventDefault(); $("btn-cancel")?.click(); });
 $("btn-fingerprint").onclick = () => copyText($("fingerprint").textContent, "Your key fingerprint");
 $("filter").oninput = renderList;
 $("list").addEventListener("keydown", listKeydown);

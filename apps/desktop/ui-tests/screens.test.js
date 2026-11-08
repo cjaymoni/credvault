@@ -160,3 +160,157 @@ test("a budget that is not a number is refused rather than ignored", () => {
   assert.throws(() => serverSummaryText(long, "x", NaN), /budget/);
   assert.throws(() => serverSummaryText(long, "x", "30"), /budget/);
 });
+
+// ----- which platform's look -------------------------------------------------
+//
+// Real user agents of each webview the app runs in. The look follows the
+// platform, so a misread costs the wrong styling, never safety, but it should
+// still be right.
+
+const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts } = require("../ui/screens.js");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const USER_AGENTS = {
+  macos: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+  windows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+  linux: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+  ios: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+  android: "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/130.0.0.0 Mobile Safari/537.36",
+};
+
+test("each webview's user agent maps to its own platform", () => {
+  for (const [platform, ua] of Object.entries(USER_AGENTS)) {
+    assert.equal(platformFrom(ua), platform, ua);
+  }
+});
+
+test("Android is not mistaken for Linux, nor iOS for macOS", () => {
+  assert.equal(platformFrom(USER_AGENTS.android), "android"); // its UA also says Linux
+  assert.equal(platformFrom(USER_AGENTS.ios), "ios"); // its UA also says Mac OS X
+});
+
+test("an iPad, which reports itself as a Mac, is told apart by touch points", () => {
+  assert.equal(platformFrom(USER_AGENTS.macos, 5), "ios");
+  assert.equal(platformFrom(USER_AGENTS.macos, 0), "macos");
+});
+
+test("an unknown or missing user agent falls back to the Linux look", () => {
+  for (const ua of ["", null, undefined, "SomethingElse/1.0"]) assert.equal(platformFrom(ua), "linux");
+});
+
+test("a preview override wins only when it names a known platform", () => {
+  assert.equal(resolvePlatform("android", USER_AGENTS.macos), "android");
+  for (const bad of [null, "", "beos", "__proto__", "toString"]) {
+    assert.equal(resolvePlatform(bad, USER_AGENTS.windows), "windows", String(bad));
+  }
+});
+
+test("every platform places every moving control, each in a slot the page has", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../ui/index.html"), "utf8");
+  const slots = new Set([...html.matchAll(/data-slot="([^"]+)"/g)].map((m) => m[1]));
+  for (const platform of PLATFORMS) {
+    const placement = placementFor(platform);
+    assert.deepEqual(placement.map(([control]) => control), ["search", "newSecret", "refresh", "account", "invites"], platform);
+    for (const [control, slot] of placement) assert.ok(slots.has(slot), `${platform}: ${control} -> missing slot ${slot}`);
+  }
+});
+
+test("asking for a platform with no layout fails loudly", () => {
+  assert.throws(() => placementFor("beos"), TypeError);
+  assert.throws(() => placementFor("toString"), TypeError);
+  assert.throws(() => placementFor("__proto__"), TypeError);
+  assert.throws(() => placementFor(undefined), TypeError);
+});
+
+// ----- how a shortcut is spelled ---------------------------------------------
+//
+// Both modifiers are accepted on every platform, so this only decides which
+// one is printed. Printing the wrong one is the kind of detail the native
+// look exists to get right.
+
+/// What each platform should print, spelled out rather than derived, so the
+/// test fails if the rule changes and not only if the code does.
+const SPELLINGS = {
+  macos: "\u2318N",
+  ios: "\u2318N",
+  windows: "Ctrl+N",
+  linux: "Ctrl+N",
+  android: "Ctrl+N",
+};
+
+test("the shortcut is spelled the way the platform's own apps spell it", () => {
+  for (const [platform, expected] of Object.entries(SPELLINGS)) {
+    assert.equal(shortcutLabel(platform, "N"), expected, platform);
+  }
+  assert.equal(shortcutLabel("macos", "K"), "\u2318K");
+  // Both spellings name the key in upper case, whatever case they are given.
+  assert.equal(shortcutLabel("macos", "n"), "\u2318N");
+  assert.equal(shortcutKeys("macos", "n"), "Meta+N");
+});
+
+test("no platform the app knows is missing from the table above", () => {
+  assert.deepEqual([...PLATFORMS].sort(), Object.keys(SPELLINGS).sort());
+});
+
+test("an unknown platform gets Ctrl rather than a label from Object's prototype", () => {
+  for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
+    assert.equal(shortcutLabel(unknown, "N"), "Ctrl+N", String(unknown));
+  }
+});
+
+test("the announced spelling uses the spec's key names, not the printed glyph", () => {
+  assert.equal(shortcutKeys("macos", "N"), "Meta+N");
+  assert.equal(shortcutKeys("ios", "K"), "Meta+K");
+  assert.equal(shortcutKeys("windows", "N"), "Control+N");
+  assert.equal(shortcutKeys("linux", "N"), "Control+N");
+  assert.equal(shortcutKeys("android", "N"), "Control+N");
+});
+
+test("the printed shortcut and the announced one agree on which modifier it is", () => {
+  for (const platform of [...PLATFORMS, "beos", "", null, undefined, "__proto__"]) {
+    for (const key of ["N", "k"]) {
+      const printed = shortcutLabel(platform, key).startsWith("\u2318");
+      const announced = shortcutKeys(platform, key).startsWith("Meta");
+      assert.equal(printed, announced, `${platform} ${key}`);
+    }
+  }
+});
+
+test("an announced shortcut with no key fails loudly, the same as a printed one", () => {
+  assert.throws(() => shortcutKeys("macos"), TypeError);
+  assert.throws(() => shortcutKeys("macos", ""), TypeError);
+  assert.throws(() => shortcutKeys("windows", 7), TypeError);
+});
+
+test("a shortcut with no key fails loudly rather than naming one that is undefined", () => {
+  assert.throws(() => shortcutLabel("macos"), TypeError);
+  assert.throws(() => shortcutLabel("macos", ""), TypeError);
+  assert.throws(() => shortcutLabel("macos", null), TypeError);
+  assert.throws(() => shortcutLabel("windows", 7), TypeError);
+});
+
+// ----- which platforms print a shortcut in the interface ---------------------
+//
+// The desktop looks do; the phone looks do not, whatever is plugged into the
+// device. A platform the app does not know gets the Linux look, but not the
+// Linux convention: an unrecognised user agent is more likely to be something
+// unusual than a desktop, and a shortcut named wrongly is worse than one left
+// unnamed, because it can become a control's whole accessible name.
+
+test("only the desktop looks name a shortcut", () => {
+  assert.equal(namesShortcuts("macos"), true);
+  assert.equal(namesShortcuts("windows"), true);
+  assert.equal(namesShortcuts("linux"), true);
+  assert.equal(namesShortcuts("ios"), false);
+  assert.equal(namesShortcuts("android"), false);
+});
+
+test("every platform the app knows gets an answer from the list, not from Object", () => {
+  for (const platform of PLATFORMS) {
+    assert.equal(typeof namesShortcuts(platform), "boolean", platform);
+  }
+  for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
+    assert.equal(namesShortcuts(unknown), false, String(unknown));
+  }
+});

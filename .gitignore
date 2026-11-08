@@ -8,6 +8,15 @@ apps/desktop/gen/schemas/
 # deployment secrets
 deploy/.env
 
+# Local development secrets. .env.local says of itself "Gitignored. Keep it
+# that way: the Google secret below is a real credential" -- and until this
+# line it was not, so one `git add -A` would have published it. .history is
+# the editor's local-history directory, which keeps a copy of every version
+# of every file it has seen, including that one.
+.env.local
+.history/
+.impeccable/
+
 # Security review notes stay out of a public repository: an unfixed finding
 # written down here is a map of where to look. Keep them local, or in a
 # private tracker, until they are closed.

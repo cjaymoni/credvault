@@ -70,19 +70,22 @@
 }
 
 /* Dark tokens apply when the OS prefers dark and no override is set, or when
-   the user picked Dark in the app. The two blocks must stay identical. */
+   the user picked Dark in the app. The two blocks must stay identical.
+
+   `--bg` stays off pure black and `--text` off pure white, here and in every
+   per-platform palette in platform.css; that file's header says why. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0f1518;
-    --surface: #171f24;
-    --surface-2: #1d262c;
-    --surface-3: #243036;
-    --border: #28343b;
-    --border-strong: #3a4953;
-    --border-input: #5d6f7b;
+    --bg: #171e22;
+    --surface: #1f272c;
+    --surface-2: #252f35;
+    --surface-3: #2c3940;
+    --border: #313e46;
+    --border-strong: #44545f;
+    --border-input: #687b88;
     --text: #e8eef2;
     --text-2: #aebbc4;
-    --text-3: #8b9ba6;
+    --text-3: #93a3ae;
 
     --accent: #2fc4b2;
     --accent-hover: #5ad6c7;
@@ -107,7 +110,7 @@
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
     --toast-bg: #e8eef2;
-    --toast-fg: #0f1518;
+    --toast-fg: #171e22;
     --toast-icon: #0f766e;
     --badge-on-active: rgba(0, 0, 0, 0.25);
 
@@ -116,16 +119,16 @@
   }
 }
 :root[data-theme="dark"] {
-  --bg: #0f1518;
-  --surface: #171f24;
-  --surface-2: #1d262c;
-  --surface-3: #243036;
-  --border: #28343b;
-  --border-strong: #3a4953;
-  --border-input: #5d6f7b;
+  --bg: #171e22;
+  --surface: #1f272c;
+  --surface-2: #252f35;
+  --surface-3: #2c3940;
+  --border: #313e46;
+  --border-strong: #44545f;
+  --border-input: #687b88;
   --text: #e8eef2;
   --text-2: #aebbc4;
-  --text-3: #8b9ba6;
+  --text-3: #93a3ae;
 
   --accent: #2fc4b2;
   --accent-hover: #5ad6c7;
@@ -150,7 +153,7 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
   --toast-bg: #e8eef2;
-  --toast-fg: #0f1518;
+  --toast-fg: #171e22;
   --toast-icon: #0f766e;
   --badge-on-active: rgba(0, 0, 0, 0.25);
 

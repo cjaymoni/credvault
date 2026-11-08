@@ -167,7 +167,7 @@ test("a budget that is not a number is refused rather than ignored", () => {
 // platform, so a misread costs the wrong styling, never safety, but it should
 // still be right.
 
-const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, hasKeyboard } = require("../ui/screens.js");
+const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, namesShortcuts } = require("../ui/screens.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -263,18 +263,27 @@ test("a shortcut with no key fails loudly rather than naming one that is undefin
   assert.throws(() => shortcutLabel("windows", 7), TypeError);
 });
 
-// ----- which platforms have a keyboard to press the shortcut on --------------
+// ----- which platforms print a shortcut in the interface ---------------------
+//
+// The desktop looks do; the phone looks do not, whatever is plugged into the
+// device. A platform the app does not know gets the Linux look, but not the
+// Linux convention: an unrecognised user agent is more likely to be something
+// unusual than a desktop, and a shortcut named wrongly is worse than one left
+// unnamed, because it can become a control's whole accessible name.
 
-test("only the platforms with a keyboard name a shortcut", () => {
-  assert.equal(hasKeyboard("macos"), true);
-  assert.equal(hasKeyboard("windows"), true);
-  assert.equal(hasKeyboard("linux"), true);
-  assert.equal(hasKeyboard("ios"), false);
-  assert.equal(hasKeyboard("android"), false);
+test("only the desktop looks name a shortcut", () => {
+  assert.equal(namesShortcuts("macos"), true);
+  assert.equal(namesShortcuts("windows"), true);
+  assert.equal(namesShortcuts("linux"), true);
+  assert.equal(namesShortcuts("ios"), false);
+  assert.equal(namesShortcuts("android"), false);
 });
 
-test("an unknown platform is not assumed to have a keyboard from Object's prototype", () => {
+test("every platform the app knows gets an answer from the list, not from Object", () => {
+  for (const platform of PLATFORMS) {
+    assert.equal(typeof namesShortcuts(platform), "boolean", platform);
+  }
   for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
-    assert.equal(hasKeyboard(unknown), false, String(unknown));
+    assert.equal(namesShortcuts(unknown), false, String(unknown));
   }
 });

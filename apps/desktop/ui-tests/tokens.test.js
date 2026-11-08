@@ -9,15 +9,28 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
+const { PLATFORMS } = require("../ui/screens.js");
 
-const STYLESHEETS = ["../ui/styles.css", "../ui/platform.css"];
+const UI_DIR = path.join(__dirname, "../ui");
+/// Every stylesheet, read from disk rather than listed, so a palette moved
+/// into a new file cannot slip past these tests.
+const STYLESHEETS = fs.readdirSync(UI_DIR).filter((name) => name.endsWith(".css")).sort();
+
+// ----- a small CSS reader ----------------------------------------------------
+//
+// These two stylesheets are written in a narrow dialect: no strings or url()
+// in a declaration value, no statement at-rules, no native nesting. The
+// reader below assumes all three, and assertStylesheetDialect() fails loudly
+// if one stops holding, because each assumption fails differently -- a quote
+// invents declarations silently, a brace inside a string throws, and a
+// statement at-rule would swallow the rule after it.
 
 /// Every rule in a stylesheet, flattened, as `{ at, selector, declarations }`.
 ///
 /// `at` is the enclosing at-rule preludes outermost first, so a rule inside
 /// `@media (prefers-color-scheme: dark)` can be told from the same selector
-/// written at the top level. `declarations` is only the custom properties, in
-/// source order, which is all these tests care about.
+/// written at the top level. `declarations` is only the custom properties,
+/// which is all these tests care about.
 function rules(css, at = []) {
   const found = [];
   let i = 0;
@@ -31,7 +44,7 @@ function rules(css, at = []) {
       if (css[close] === "{") depth += 1;
       else if (css[close] === "}" && (depth -= 1) === 0) break;
     }
-    assert.ok(close < css.length, `unbalanced braces after ${prelude}`);
+    assert.ok(close < css.length, `unbalanced braces in or before: ${prelude}`);
     const body = css.slice(open + 1, close);
     if (prelude.startsWith("@")) found.push(...rules(body, [...at, prelude]));
     else found.push({ at, selector: prelude, declarations: customProperties(body) });
@@ -47,9 +60,38 @@ function stripComments(css) {
   return css.replace(/\/\*[\s\S]*?\*\//g, "");
 }
 
-const ALL_RULES = STYLESHEETS.flatMap((file) =>
-  rules(stripComments(fs.readFileSync(path.join(__dirname, file), "utf8"))),
-);
+/// Fail with a useful message if a stylesheet outgrows the reader above.
+/// Takes CSS with its comments already gone, and assumes no comment opened or
+/// closed inside a string -- the one assumption here that is not checked.
+function assertStylesheetDialect(name, css) {
+  for (const atRule of ["@import", "@charset", "@layer"]) {
+    assert.ok(
+      !css.includes(atRule),
+      `${name}: ${atRule} has no block, so the reader in this file would swallow the rule after it. Extend it.`,
+    );
+  }
+  assert.ok(
+    !css.includes("url("),
+    `${name}: url() can hold a ; or a brace, which the reader in this file splits on. Extend it.`,
+  );
+  // Quotes themselves are fine and everywhere -- `[data-platform="macos"]`, a
+  // font stack naming "SF Pro Text". What the reader cannot survive is one of
+  // its own delimiters inside a string: a `;` invents a declaration that is
+  // not there, a brace throws.
+  for (const [quoted] of css.matchAll(/"[^"]*"|'[^']*'/g)) {
+    assert.ok(
+      !/[;{}]/.test(quoted),
+      `${name}: ${quoted} holds a delimiter the reader in this file splits on. Extend it.`,
+    );
+  }
+}
+
+const ALL_RULES = [];
+for (const name of STYLESHEETS) {
+  const css = stripComments(fs.readFileSync(path.join(UI_DIR, name), "utf8"));
+  assertStylesheetDialect(name, css);
+  ALL_RULES.push(...rules(css));
+}
 
 const DARK_MEDIA = "@media (prefers-color-scheme: dark)";
 
@@ -64,6 +106,13 @@ function declarationsFor(selector, { inDarkMedia }) {
   ).flatMap((rule) => rule.declarations);
 }
 
+/// What a palette resolves to, which is what the browser uses: a later
+/// declaration of the same token wins, and the order they were written in
+/// stops mattering once they are all read.
+function resolve(declarations) {
+  return Object.fromEntries(declarations);
+}
+
 /// Each palette: the copy under `prefers-color-scheme` and the copy the in-app
 /// Dark setting pins with `data-theme`.
 const DARK_PALETTES = [
@@ -75,20 +124,47 @@ const DARK_PALETTES = [
   ["android", ':root[data-platform="android"]:not([data-theme="light"])', ':root[data-platform="android"][data-theme="dark"]'],
 ];
 
+// ----- the table above has to cover the stylesheets --------------------------
+//
+// Every test below walks DARK_PALETTES, so a palette the stylesheets define
+// but the table never names is not checked by any of them -- it would pass
+// black, white and drifted without a word. This is the same hole the shortcut
+// table in screens.test.js closes, read off the CSS instead of a constant.
+
+/// A top-level `[data-theme="dark"]` block that actually carries tokens.
+/// `:root[data-theme="dark"] { color-scheme: dark; }` declares none, so the
+/// length check leaves it out.
+const DARK_SELECTOR = /^:root[^,{]*\[data-theme="dark"\]$/;
+
+test("the table above names every dark palette the stylesheets define", () => {
+  const inStylesheets = ALL_RULES.filter(
+    (rule) => rule.at.length === 0 && DARK_SELECTOR.test(rule.selector) && rule.declarations.length > 0,
+  ).map((rule) => rule.selector);
+  assert.deepStrictEqual(
+    [...new Set(inStylesheets)].sort(),
+    DARK_PALETTES.map(([, , themeSelector]) => themeSelector).sort(),
+  );
+});
+
+test("the palettes are the platforms the app knows, and nothing else", () => {
+  const named = DARK_PALETTES.map(([name]) => name).filter((name) => name !== "the shared fallback");
+  assert.deepStrictEqual([...named].sort(), [...PLATFORMS].sort());
+});
+
 // ----- the two copies of every dark palette ----------------------------------
 //
 // The OS-preference copy and the in-app-setting copy are maintained by hand
 // and must agree. Six palettes is twelve blocks, and a value changed in one
 // of a pair is invisible until someone switches theme mode.
 
-test("every dark palette declares the same tokens in both of its blocks", () => {
+test("every dark palette resolves to the same tokens in both of its blocks", () => {
   for (const [name, mediaSelector, themeSelector] of DARK_PALETTES) {
     const underPreference = declarationsFor(mediaSelector, { inDarkMedia: true });
     const underSetting = declarationsFor(themeSelector, { inDarkMedia: false });
-    // Guard against a selector in the table above going stale: two empty
-    // lists are equal, and would pass without checking anything.
+    // Guard against a selector in the table going stale: two empty lists are
+    // equal, and would pass without checking anything.
     assert.ok(underPreference.length > 0, `${name}: no block matched ${mediaSelector}`);
-    assert.deepEqual(underSetting, underPreference, name);
+    assert.deepStrictEqual(resolve(underSetting), resolve(underPreference), name);
   }
 });
 
@@ -96,34 +172,59 @@ test("every dark palette declares the same tokens in both of its blocks", () => 
 //
 // Pure white on pure black is 21:1, which halos the type and smears on an
 // OLED panel. platform.css's header says why each background sits above black
-// and each primary text below white; this is that rule, checkable.
+// and each primary text below white; this is that rule, checkable. The
+// invariant is about the colour, not how it was spelled, so values are read
+// to rgb first -- `black` and `rgb(0, 0, 0)` are the same mistake as `#000`.
 
-const PURE_BLACK = ["#000", "#000000"];
-const PURE_WHITE = ["#fff", "#ffffff"];
+const BLACK = [0, 0, 0];
+const WHITE = [255, 255, 255];
+const KEYWORDS = { black: BLACK, white: WHITE };
 const BACKGROUND_TOKENS = ["--bg", "--content-bg", "--sidebar-bg"];
 
+/// `value` as `[r, g, b]`, or null if it is written in a form this test does
+/// not read. Alpha is dropped: a token these tests cover is always opaque.
+function toRgb(value) {
+  const text = value.trim().toLowerCase();
+  if (Object.hasOwn(KEYWORDS, text)) return KEYWORDS[text];
+  const hex = /^#([0-9a-f]+)$/.exec(text);
+  if (hex) {
+    const digits = hex[1];
+    const expanded = digits.length <= 4 ? [...digits].map((d) => d + d).join("") : digits;
+    if (expanded.length !== 6 && expanded.length !== 8) return null;
+    return [0, 2, 4].map((at) => parseInt(expanded.slice(at, at + 2), 16));
+  }
+  const functional = /^rgba?\(([^)]*)\)$/.exec(text);
+  if (functional) {
+    const channels = functional[1].split(/[\s,/]+/).filter(Boolean).slice(0, 3).map(Number);
+    if (channels.length === 3 && channels.every(Number.isFinite)) return channels;
+  }
+  return null;
+}
+
 test("no dark palette uses pure black for a background or pure white for text", () => {
-  for (const [name, , themeSelector] of DARK_PALETTES) {
-    const declarations = declarationsFor(themeSelector, { inDarkMedia: false });
-    assert.ok(declarations.length > 0, `${name}: no block matched ${themeSelector}`);
-    const declared = new Map(declarations);
-    // A palette inherits any token it does not set, so only what it declares
-    // is its to answer for.
-    for (const token of BACKGROUND_TOKENS) {
-      if (!declared.has(token)) continue;
-      const value = declared.get(token).toLowerCase();
-      assert.ok(!PURE_BLACK.includes(value), `${name}: ${token} is ${value}`);
-    }
-    if (declared.has("--text")) {
-      const value = declared.get("--text").toLowerCase();
-      assert.ok(!PURE_WHITE.includes(value), `${name}: --text is ${value}`);
+  for (const [name, mediaSelector, themeSelector] of DARK_PALETTES) {
+    // Both copies, rather than one and a lean on the test above: these tests
+    // are independent, and a run where that one fails must not leave this one
+    // reporting green on a block it never read.
+    for (const [selector, inDarkMedia] of [[mediaSelector, true], [themeSelector, false]]) {
+      const declared = resolve(declarationsFor(selector, { inDarkMedia }));
+      assert.ok(Object.keys(declared).length > 0, `${name}: no block matched ${selector}`);
+      for (const token of [...BACKGROUND_TOKENS, "--text"]) {
+        // A palette inherits any token it does not set, so only what it
+        // declares is its to answer for.
+        if (!Object.hasOwn(declared, token)) continue;
+        const rgb = toRgb(declared[token]);
+        assert.ok(rgb, `${name}: ${token} is ${declared[token]}, which this test cannot read. Extend toRgb().`);
+        const forbidden = token === "--text" ? WHITE : BLACK;
+        assert.notDeepStrictEqual(rgb, forbidden, `${name}: ${token} is ${declared[token]}`);
+      }
     }
   }
 });
 
 test("every dark palette sets a background, so the rule above has something to check", () => {
   for (const [name, , themeSelector] of DARK_PALETTES) {
-    const declared = new Map(declarationsFor(themeSelector, { inDarkMedia: false }));
-    assert.ok(declared.has("--bg"), `${name}: declares no --bg`);
+    const declared = resolve(declarationsFor(themeSelector, { inDarkMedia: false }));
+    assert.ok(Object.hasOwn(declared, "--bg"), `${name}: declares no --bg`);
   }
 });

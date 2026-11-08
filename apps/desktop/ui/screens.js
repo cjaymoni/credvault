@@ -131,17 +131,19 @@
     return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${key}` : `Ctrl+${key}`;
   }
 
-  /// The platforms whose windows come with a keyboard.
-  const KEYBOARD_PLATFORMS = ["macos", "windows", "linux"];
+  /// The platforms whose own apps print shortcuts in the interface at all.
+  const SHORTCUT_NAMING_PLATFORMS = ["macos", "windows", "linux"];
 
-  /// Whether a shortcut is worth naming on `platform`.
+  /// Whether `platform` is one that names shortcuts in its interface.
   ///
-  /// A phone has no ⌘ or Ctrl to press, so printing one names a key that is
-  /// not there. It matters beyond the tooltip: the new-secret button's own
-  /// label is hidden on three of the five looks, which leaves `title` as the
-  /// whole of what a screen reader reads out.
-  function hasKeyboard(platform) {
-    return KEYBOARD_PLATFORMS.includes(platform);
+  /// This is a convention, not a claim about the hardware: an iPad with a
+  /// keyboard attached can press ⌘N perfectly well, and the handler takes it,
+  /// but iOS and Android apps do not print shortcuts on their controls and
+  /// neither does this one. Naming one costs more than the tooltip, because
+  /// the new-secret button's own label is hidden on three of the five looks,
+  /// which leaves `title` as the whole of what a screen reader reads out.
+  function namesShortcuts(platform) {
+    return SHORTCUT_NAMING_PLATFORMS.includes(platform);
   }
 
   /// The controls that move between platforms, and the slot each one goes to.
@@ -168,5 +170,5 @@
     return PLACED_CONTROLS.map((control) => [control, table[control]]);
   }
 
-  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, hasKeyboard };
+  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, namesShortcuts };
 });

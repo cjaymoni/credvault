@@ -75,9 +75,15 @@ placeControls();
 /// rather than in the markup because the right spelling is not known until
 /// the platform is, and on a phone there is no right spelling at all.
 function labelShortcuts() {
-  if (!Screens.hasKeyboard(PLATFORM)) return;
+  if (!Screens.namesShortcuts(PLATFORM)) return;
   $("btn-new").title = `New secret (${NEW_SECRET_SHORTCUT})`;
   $("filter").title = `Search (${SEARCH_SHORTCUT})`;
+  // aria-keyshortcuts, not the label: the button's accessible name is its
+  // own, and announcing the shortcut separately is what this attribute is
+  // for. The names are the spec's, which has no ⌘.
+  const modifier = PLATFORM === "macos" ? "Meta" : "Control";
+  $("btn-new").setAttribute("aria-keyshortcuts", `${modifier}+N`);
+  $("filter").setAttribute("aria-keyshortcuts", `${modifier}+K`);
 }
 labelShortcuts();
 

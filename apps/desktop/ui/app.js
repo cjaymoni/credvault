@@ -45,6 +45,9 @@ const timers = { toast: null };
 const PLATFORM = document.documentElement.dataset.platform || "linux";
 /// How long a toast carrying an action stays up: long enough to reach it.
 const ACTION_TOAST_MS = 10_000;
+// Both modifiers work everywhere; these name the one this platform prints.
+const NEW_SECRET_SHORTCUT = Screens.shortcutLabel(PLATFORM, "N");
+const SEARCH_SHORTCUT = Screens.shortcutLabel(PLATFORM, "K");
 
 /// The elements behind each name in Screens.placementFor().
 const PLACED = {
@@ -67,6 +70,15 @@ function placeControls() {
   }
 }
 placeControls();
+
+/// Name the shortcuts in the two tooltips that carry one. Written here rather
+/// than in the markup because the right spelling is not known until the
+/// platform is.
+function labelShortcuts() {
+  $("btn-new").title = `New secret (${NEW_SECRET_SHORTCUT})`;
+  $("filter").title = `Search (${SEARCH_SHORTCUT})`;
+}
+labelShortcuts();
 
 // ----- helpers ---------------------------------------------------------------
 
@@ -1055,7 +1067,7 @@ function emptyDetailHtml() {
       <h2>No secret selected</h2>
       <p>${isMobile()
         ? "Pick one from your vault, or tap + to create a new one."
-        : `Pick one from the list, or press <span class="kbd">⌘N</span> / <span class="kbd">Ctrl+N</span> to create a new one.`}</p>
+        : `Pick one from the list, or press <span class="kbd">${esc(NEW_SECRET_SHORTCUT)}</span> to create a new one.`}</p>
     </div>`;
 }
 

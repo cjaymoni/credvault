@@ -226,7 +226,7 @@
 [data-platform="macos"] .btn.primary { font-weight: 500; }
 [data-platform="macos"] .btn.sm { height: 22px; padding: 0 10px; font-size: 0.75rem; }
 [data-platform="macos"] .btn.block { height: 28px; }
-[data-platform="macos"] input:not([type="search"]), [data-platform="macos"] textarea { min-height: 24px; padding: 3px 7px; border-radius: 5px; border-color: var(--border-input); }
+[data-platform="macos"] input:not([type="search"]):not([type="checkbox"]), [data-platform="macos"] textarea { min-height: 24px; padding: 3px 7px; border-radius: 5px; border-color: var(--border-input); }
 [data-platform="macos"] textarea { min-height: 72px; }
 [data-platform="macos"] .input-row > .icon-btn, [data-platform="macos"] .input-row > .btn { height: 24px; }
 [data-platform="macos"] .segmented { padding: 2px; border-radius: 7px; }
@@ -324,7 +324,7 @@
 [data-platform="windows"] .btn { height: 32px; padding: 0 12px; border-radius: 4px; border-color: var(--border); border-bottom-color: var(--border-strong); background: var(--surface); font-weight: 400; }
 [data-platform="windows"] .btn.primary { border-color: rgba(0, 0, 0, 0.08); background: var(--accent); }
 [data-platform="windows"] .btn.sm { height: 32px; }
-[data-platform="windows"] input:not([type="search"]), [data-platform="windows"] textarea { min-height: 32px; padding: 5px 11px; border-radius: 4px; border-color: var(--border); border-bottom-color: var(--border-input); }
+[data-platform="windows"] input:not([type="search"]):not([type="checkbox"]), [data-platform="windows"] textarea { min-height: 32px; padding: 5px 11px; border-radius: 4px; border-color: var(--border); border-bottom-color: var(--border-input); }
 [data-platform="windows"] .input-row > .icon-btn, [data-platform="windows"] .input-row > .btn { height: 32px; }
 /* Detail: a header, then each value as its own settings card. */
 [data-platform="windows"] #detail > .card, [data-platform="windows"] #sharing { padding: 0; border: 0; background: transparent; box-shadow: none; }
@@ -381,7 +381,11 @@
   --bg: #fafafb; --content-bg: #fafafb; --sidebar-bg: #ebebed;
   --surface: #ffffff; --surface-2: #f6f6f7; --surface-3: #e3e3e6; --sel: rgba(0, 0, 6, 0.1); --banner: #d6efec; --btn-fill: rgba(0, 0, 6, 0.08);
   --border: rgba(0, 0, 6, 0.07); --border-strong: rgba(0, 0, 6, 0.15); --border-input: #727279;
-  --text: #2e2e33; --text-2: #5e5e66; --text-3: #5e5e66;
+  /* Secondary text is darker than the grey GNOME itself uses, because the
+     tightest pairing is the subtitle of a *selected* row: --sel darkens the
+     sidebar to #d4d4d6, and #5e5e66 reaches only 4.34:1 there. #5a5a62 gives
+     4.62:1 on the selection and more on every lighter surface. */
+  --text: #2e2e33; --text-2: #5a5a62; --text-3: #5a5a62;
   --accent: #0f766e; --accent-hover: #0b5f58; --tint: #0f766e; --on-accent: #ffffff;
   --accent-soft: #dcefed; --accent-soft-text: #0a4a44;
   --danger: #c01c28; --danger-hover: #a51722; --danger-soft: #fbe5e7; --danger-border: #f1b4ae; --on-danger: #ffffff;
@@ -472,7 +476,7 @@
 [data-platform="linux"] .btn.danger:not(.solid) { color: var(--danger); }
 [data-platform="linux"] #sharing .btn.share-invite { background: var(--btn-fill); color: var(--text); }
 [data-platform="linux"] .delete-bottom { display: block; margin: 24px auto 0; }
-[data-platform="linux"] input:not([type="search"]), [data-platform="linux"] textarea { border-radius: 9px; border-color: var(--border-input); }
+[data-platform="linux"] input:not([type="search"]):not([type="checkbox"]), [data-platform="linux"] textarea { border-radius: 9px; border-color: var(--border-input); }
 [data-platform="linux"] .auth { background: var(--bg); }
 
 /* ===== iOS ================================================================== */

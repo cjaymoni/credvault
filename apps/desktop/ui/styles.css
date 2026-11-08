@@ -212,7 +212,11 @@ input:focus-visible, textarea:focus-visible {
 
 /* ----- form controls ------------------------------------------------------- */
 
-input:not([type="search"]), input[type="search"], textarea {
+/* Checkboxes are excluded everywhere these field-box rules are repeated: a
+   checkbox is not a text field, and `appearance: none` plus a field's width,
+   height and padding turned the one in the custom-field editor into an empty
+   rectangle that never showed a tick. It is drawn below instead. */
+input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea {
   font: inherit;
   width: 100%;
   min-height: 38px;
@@ -752,11 +756,11 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
 .notice.danger .ic { color: var(--danger); }
 
 /* sharing */
-.invite-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
-.invite-form .field { margin: 0; flex: 1 1 180px; }
-.invite-form .field.wide { flex: 2 1 240px; }
-.invite-form .btn { flex: none; height: 38px; }
-
+/* The invite form has no rules of its own on purpose. It is a dialog now, so
+   it stacks like one -- `.field` margins between the rows, `.dialog-actions`
+   at the foot. The row layout it carried over from sitting inline on the
+   secret put the fingerprint beside the email and the buttons beside the
+   message whenever the dialog was wide enough not to wrap. */
 .fp-compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 12px 0; }
 .fp-box { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); }
 .fp-box .k { font-size: var(--text-caption); font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
@@ -791,12 +795,19 @@ input.mono.mismatch { border-color: var(--danger); }
   color: var(--text-2);
   white-space: nowrap;
 }
-.cf-hide input { width: auto; min-height: 0; margin: 0; }
+/* Left as the platform's own checkbox rather than restyled: it is the one
+   control here that every toolkit draws the same way its native dialogs do,
+   and `accent-color` tints it with the app's teal. Drawing our own would
+   also mean drawing the tick, and the page's CSP allows no `data:` images to
+   draw it with. */
+.cf-hide input[type="checkbox"] { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
 @media (max-width: 720px) {
   /* Two rows on a phone: the label full width, then the value sharing a line
      with Hide and Remove. */
   .custom-field { grid-template-columns: minmax(0, 1fr) auto auto; }
   .custom-field .cf-label { grid-column: 1 / -1; }
+  /* Bigger to hit with a thumb; the whole label is the target either way. */
+  .cf-hide input[type="checkbox"] { width: 20px; height: 20px; }
 }
 
 .people { list-style: none; margin: 0; padding: 0; }
@@ -877,7 +888,7 @@ input.mono.mismatch { border-color: var(--danger); }
   button, .item { -webkit-touch-callout: none; user-select: none; }
 
   /* ----- controls ----- */
-  input:not([type="search"]), input[type="search"], textarea {
+  input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea {
     /* 17px: a field below 16px makes iOS zoom the page when it takes focus */
     font-size: var(--text-body);
     min-height: var(--control-h);
@@ -1022,9 +1033,6 @@ input.mono.mismatch { border-color: var(--danger); }
   .confirm-bar .actions { width: 100%; gap: 10px; }
   .confirm-bar .actions .btn { flex: 1; }
   .notice { padding: 14px; border-radius: var(--radius); }
-  .invite-form { flex-direction: column; align-items: stretch; gap: 0; }
-  .invite-form .field, .invite-form .field.wide { flex: none; }
-  .invite-form .btn { width: 100%; height: var(--control-h); }
   .fp-compare { grid-template-columns: 1fr; }
   .fp-box { padding: 14px; border-radius: var(--radius); }
   .people li { gap: 12px; padding: 14px 0; }
@@ -1164,7 +1172,11 @@ input.mono.mismatch { border-color: var(--danger); }
     justify-content: flex-start;
     padding: calc(20px + env(safe-area-inset-top)) 20px calc(16px + env(safe-area-inset-bottom));
   }
-  .auth-card { max-width: none; margin-top: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
+  /* `border: none`, not the `border: 0` used elsewhere, so the static CSS
+     checker reads the reset: it parses the keyword but not the bare 0, and
+     otherwise pairs this rule's `padding: 0` with the card border above,
+     a combination no viewport ever renders. Identical in every browser. */
+  .auth-card { max-width: none; margin-top: 0; padding: 0; border: none; background: transparent; box-shadow: none; }
   .auth .brand { gap: 12px; }
   .auth .brand-mark { width: 44px; height: 44px; border-radius: 14px; }
   .auth .brand-mark svg { width: 24px; height: 24px; }

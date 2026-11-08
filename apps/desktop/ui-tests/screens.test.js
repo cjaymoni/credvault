@@ -167,7 +167,7 @@ test("a budget that is not a number is refused rather than ignored", () => {
 // platform, so a misread costs the wrong styling, never safety, but it should
 // still be right.
 
-const { PLATFORMS, platformFrom, resolvePlatform, placementFor } = require("../ui/screens.js");
+const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel } = require("../ui/screens.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -221,4 +221,34 @@ test("asking for a platform with no layout fails loudly", () => {
   assert.throws(() => placementFor("toString"), TypeError);
   assert.throws(() => placementFor("__proto__"), TypeError);
   assert.throws(() => placementFor(undefined), TypeError);
+});
+
+// ----- how a shortcut is spelled ---------------------------------------------
+//
+// Both modifiers are accepted on every platform, so this only decides which
+// one is printed. Printing the wrong one is the kind of detail the native
+// look exists to get right.
+
+test("the shortcut is spelled the way the platform's own apps spell it", () => {
+  assert.equal(shortcutLabel("macos", "N"), "\u2318N");
+  assert.equal(shortcutLabel("ios", "K"), "\u2318K");
+  assert.equal(shortcutLabel("windows", "N"), "Ctrl+N");
+  assert.equal(shortcutLabel("linux", "N"), "Ctrl+N");
+  assert.equal(shortcutLabel("android", "N"), "Ctrl+N");
+});
+
+test("every platform the app knows gets a label, and an unknown one gets Ctrl", () => {
+  for (const platform of PLATFORMS) {
+    assert.match(shortcutLabel(platform, "N"), /^(\u2318N|Ctrl\+N)$/, platform);
+  }
+  for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
+    assert.equal(shortcutLabel(unknown, "N"), "Ctrl+N", String(unknown));
+  }
+});
+
+test("a shortcut with no key fails loudly rather than naming one that is undefined", () => {
+  assert.throws(() => shortcutLabel("macos"), TypeError);
+  assert.throws(() => shortcutLabel("macos", ""), TypeError);
+  assert.throws(() => shortcutLabel("macos", null), TypeError);
+  assert.throws(() => shortcutLabel("windows", 7), TypeError);
 });

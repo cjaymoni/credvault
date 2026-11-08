@@ -111,6 +111,26 @@
     return PLATFORMS.includes(override) ? override : platformFrom(userAgent, maxTouchPoints);
   }
 
+  /// The platforms whose own apps print ⌘ rather than Ctrl.
+  const COMMAND_KEY_PLATFORMS = ["macos", "ios"];
+
+  /// How to write the shortcut for `key` on `platform`, e.g. `⌘N` or `Ctrl+N`.
+  ///
+  /// The handler accepts `metaKey` or `ctrlKey` on every platform, so both
+  /// shortcuts always work and this only picks which one to *name*. Naming
+  /// both, as the interface used to, puts a key no Mac has in front of a Mac
+  /// user and vice versa.
+  ///
+  /// An unknown platform gets Ctrl, matching the Linux look it is given.
+  /// A missing key is a bug rather than a label, and says so: printing
+  /// "⌘undefined" in a tooltip would be worse than failing here.
+  function shortcutLabel(platform, key) {
+    if (typeof key !== "string" || !key) {
+      throw new TypeError("shortcutLabel needs the key the shortcut is pressed with");
+    }
+    return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${key}` : `Ctrl+${key}`;
+  }
+
   /// The controls that move between platforms, and the slot each one goes to.
   ///
   /// Every control exists once in the page and is moved into its slot at
@@ -135,5 +155,5 @@
     return PLACED_CONTROLS.map((control) => [control, table[control]]);
   }
 
-  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor };
+  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel };
 });

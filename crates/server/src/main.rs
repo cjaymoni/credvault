@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
+use credvault_core::api::{check_opaque_oauth_value, MAX_OPAQUE_VALUE_LEN};
 use credvault_server::oauth::{GoogleConfig, GoogleProvider};
 use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use zeroize::Zeroizing;
@@ -60,9 +61,29 @@ fn google_provider(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<Option<Arc<GoogleProvider>>, Box<dyn std::error::Error>> {
-    let present = |value: Option<String>| value.filter(|text| !text.trim().is_empty());
+    // Trimmed, not merely tested for whitespace: a value out of a .env file or
+    // a compose file routinely arrives with a trailing newline, and neither of
+    // these credentials can legitimately begin or end with whitespace.
+    let present = |value: Option<String>| value.map(|text| text.trim().to_string()).filter(|text| !text.is_empty());
     match (present(client_id), present(client_secret)) {
         (Some(id), Some(secret)) => {
+            // The client id is handed to the app and goes straight into an
+            // authorization URL, where the app refuses anything outside the
+            // set `check_opaque_oauth_value` names -- with a sentence telling
+            // the user not to trust this server with their Google password.
+            // A stray character in the configuration would otherwise produce
+            // that accusation on every sign-in, aimed at the operator's own
+            // server, with nothing at startup having said so. The other three
+            // values in that response are generated here and pinned by
+            // `generated_values_satisfy_the_contract_the_client_enforces`;
+            // this is the one that comes from outside.
+            if check_opaque_oauth_value(&id).is_err() {
+                return Err(format!(
+                    "CREDVAULT_GOOGLE_CLIENT_ID is not a client id: it may hold only letters, digits \
+                     and the marks - . _ ~, and at most {MAX_OPAQUE_VALUE_LEN} characters"
+                )
+                .into());
+            }
             let provider = GoogleProvider::new(GoogleConfig::new(id, Zeroizing::new(secret)))?;
             Ok(Some(Arc::new(provider)))
         }
@@ -217,6 +238,25 @@ mod tests {
         assert!(google_provider(Some(String::new()), Some(String::new())).unwrap().is_none());
         assert!(google_provider(Some("  ".into()), Some("\t".into())).unwrap().is_none());
         assert!(google_provider(Some("id".into()), Some("secret".into())).unwrap().is_some());
+    }
+
+    /// A client id the app will refuse has to stop the server, because the
+    /// alternative is that it starts, looks healthy, and tells every user on
+    /// every sign-in not to trust it.
+    #[test]
+    fn a_client_id_the_app_would_refuse_stops_the_server() {
+        // The shapes a .env or compose file actually produces.
+        for bad in ["id with a space", "\"quoted-id\"", "id&scope=drive", "id/../x", &"x".repeat(600)] {
+            let built = google_provider(Some(bad.to_string()), Some("secret".into()));
+            assert!(built.is_err(), "{bad:?} must not start the server");
+            let message = built.err().unwrap().to_string();
+            assert!(message.contains("CREDVAULT_GOOGLE_CLIENT_ID"), "the refusal must name the flag: {message}");
+        }
+        // A real one, and the same one with the newline a .env file adds,
+        // which is trimmed rather than refused.
+        for good in ["1234567890-abcdef.apps.googleusercontent.com", "1234567890-abcdef.apps.googleusercontent.com\n"] {
+            assert!(google_provider(Some(good.to_string()), Some("secret\n".into())).unwrap().is_some(), "{good:?}");
+        }
     }
 
     #[test]

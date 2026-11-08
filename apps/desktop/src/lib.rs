@@ -776,7 +776,7 @@ fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
         Ok(()) => return Ok(()),
         Err(NotAnOpaqueValue::Empty) => "empty".to_string(),
         Err(NotAnOpaqueValue::TooLong) => {
-            format!("longer than the {MAX_OAUTH_PARAMETER_LEN} characters this protocol allows")
+            format!("longer than the {MAX_OPAQUE_VALUE_LEN} characters this protocol allows")
         }
         Err(NotAnOpaqueValue::BadCharacters) => "spelled with characters this protocol does not allow there — \
              letters, digits, and the four marks - . _ ~ are the whole set"
@@ -793,11 +793,32 @@ fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
 
 /// Build the URL the system browser will be sent to.
 ///
+/// The redirect can only be this app's own listener address: a
+/// [`RedirectListener`] is obtainable from `bind` alone, which formats it from
+/// a literal path and the port the OS just gave it. That is the one value
+/// [`compose_with_redirect`] does not screen, and taking the listener rather
+/// than a string is what makes its provenance a fact about the type instead of
+/// a fact about the single call site.
+///
+/// # Errors
+/// `oauth` if any server-supplied value fails
+/// [`check_authorization_parameter`].
+fn compose_authorization_url(started: &OAuthStartResponse, listener: &RedirectListener) -> CommandResult<String> {
+    compose_with_redirect(started, listener.redirect_uri())
+}
+
+/// The composition itself, split from [`compose_authorization_url`] so the
+/// redirect can be an arbitrary string here and nowhere else.
+///
+/// That split is what lets `a_value_cannot_escape_the_parameter_it_was_put_in`
+/// push reserved characters through the unscreened slot: a newtype a test can
+/// mint would not be an invariant, and one it cannot mint would delete that
+/// test. Callers outside this module get the safe signature above.
+///
 /// Everything that decides *where* the browser goes and *what is asked for*
 /// is a constant: the endpoint, and with it the scheme and the host; the
 /// scope; the prompt. The server contributes only values that are opaque to
-/// both sides, and the redirect is this app's own listener address rather
-/// than anything the server echoed back.
+/// both sides.
 ///
 /// Keep this a `parse_with_params` over a literal base. That is the whole
 /// invariant: the base fixes the scheme, host and path beyond the reach of
@@ -807,7 +828,7 @@ fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
 /// # Errors
 /// `oauth` if any server-supplied value fails
 /// [`check_authorization_parameter`].
-fn compose_authorization_url(started: &OAuthStartResponse, redirect_uri: &str) -> CommandResult<String> {
+fn compose_with_redirect(started: &OAuthStartResponse, redirect_uri: &str) -> CommandResult<String> {
     // Destructured rather than read field by field, so that a field added to
     // `OAuthStartResponse` later stops this compiling until someone decides
     // whether it belongs in the URL and what checks it. `started.client_id`
@@ -874,7 +895,7 @@ async fn authorize_with_google(
     // Google password into Google's own window, where they can see the URL.
     // Which window that is, is this app's to decide and not the server's; see
     // `compose_authorization_url`.
-    let authorization_url = compose_authorization_url(&started, &redirect_uri)?;
+    let authorization_url = compose_authorization_url(&started, &listener)?;
     app.opener()
         .open_url(authorization_url, None::<&str>)
         .map_err(|e| CommandError::new("oauth", format!("could not open your browser: {e}")))?;
@@ -2187,7 +2208,7 @@ mod tests {
     /// the scheme, the host, the path, the scope or the prompt.
     #[test]
     fn the_composed_url_is_googles_own_sign_in_page() {
-        let url = compose_authorization_url(&start_response(), REDIRECT).unwrap();
+        let url = compose_with_redirect(&start_response(), REDIRECT).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
         assert_eq!(parsed.scheme(), "https");
         assert_eq!(parsed.host_str(), Some("accounts.google.com"));
@@ -2226,7 +2247,7 @@ mod tests {
     #[test]
     fn a_value_cannot_escape_the_parameter_it_was_put_in() {
         let hostile = "http://127.0.0.1:49152/callback?x=1&scope=https://www.googleapis.com/auth/drive&prompt=none#f";
-        let url = compose_authorization_url(&start_response(), hostile).unwrap();
+        let url = compose_with_redirect(&start_response(), hostile).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
 
         assert_eq!(parsed.host_str(), Some("accounts.google.com"));
@@ -2252,7 +2273,7 @@ mod tests {
             "token\nnewline",
             "tokén",
             "token%2Fencoded",
-            &"x".repeat(MAX_OAUTH_PARAMETER_LEN + 1),
+            &"x".repeat(MAX_OPAQUE_VALUE_LEN + 1),
         ] {
             for field in ["client_id", "state", "nonce", "code_challenge"] {
                 let mut started = start_response();
@@ -2266,7 +2287,7 @@ mod tests {
                     // without ever having touched it.
                     other => unreachable!("{other} is not a field this test knows how to doctor"),
                 }
-                let error = compose_authorization_url(&started, REDIRECT)
+                let error = compose_with_redirect(&started, REDIRECT)
                     .expect_err("a value outside the permitted set must be refused");
                 assert_eq!(error.code, "oauth", "{field} of {bad:?}");
                 // Nothing is opened, so the sentence is the entire product of
@@ -2279,12 +2300,11 @@ mod tests {
     /// A real response passes. A check that refuses everything is not a check.
     #[test]
     fn an_ordinary_response_composes() {
-        assert!(compose_authorization_url(&start_response(), REDIRECT).is_ok());
-        for token in ["A-Za-z0-9", "with.dots", "with_underscores", "with~tildes", &"x".repeat(MAX_OAUTH_PARAMETER_LEN)]
-        {
+        assert!(compose_with_redirect(&start_response(), REDIRECT).is_ok());
+        for token in ["A-Za-z0-9", "with.dots", "with_underscores", "with~tildes", &"x".repeat(MAX_OPAQUE_VALUE_LEN)] {
             let mut started = start_response();
             started.nonce = token.into();
-            assert!(compose_authorization_url(&started, REDIRECT).is_ok(), "{token} must be accepted");
+            assert!(compose_with_redirect(&started, REDIRECT).is_ok(), "{token} must be accepted");
         }
     }
 

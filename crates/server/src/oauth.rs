@@ -411,6 +411,8 @@ pub fn purpose_from_storage(text: &str) -> ApiResult<OAuthPurpose> {
 
 #[cfg(test)]
 mod tests {
+    use credvault_core::api::check_opaque_oauth_value;
+
     use super::*;
 
     fn claims(nonce: Option<&str>, email: Option<&str>, verified: bool) -> IdTokenClaims {
@@ -524,29 +526,21 @@ mod tests {
     /// enforced by the trait having one method, not by a test.
     #[test]
     fn the_provider_publishes_its_client_id_and_never_its_secret() {
-        const SECRET: &str = "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";
         let provider =
-            GoogleProvider::new(GoogleConfig::new("client-123".into(), Zeroizing::new(SECRET.into()))).unwrap();
+            GoogleProvider::new(GoogleConfig::new("client-123".into(), Zeroizing::new("secret".into()))).unwrap();
         assert_eq!(provider.client_id(), "client-123");
 
-        // The two config fields sit next to each other, so a future edit
-        // reaching for the wrong one is the thing worth guarding against. An
-        // `assert_ne!(provider.client_id(), SECRET)` on the line below would
-        // not do it: the equality above fails first, so that guard could never
-        // be the one to fire. Check the whole surface a client is handed
-        // instead, which also covers the secret arriving through some field
-        // other than this one.
-        let (state, nonce) = new_state_and_nonce();
-        let (_verifier, code_challenge) = pkce_pair();
-        let published = serde_json::to_string(&credvault_core::api::OAuthStartResponse {
-            client_id: provider.client_id().to_string(),
-            state,
-            nonce,
-            code_challenge,
-            app_secret: new_app_secret(),
-        })
-        .expect("the start response must serialize");
-        assert!(!published.contains(SECRET), "the client secret must never reach a client: {published}");
+        // Nothing here asserts the secret is absent from what a client gets,
+        // because nothing here can. The only method that publishes anything
+        // is the one pinned above, so a mutation that returned the secret
+        // from it would fail that assertion first and never reach a second
+        // one -- which is the defect the `assert_ne!` that used to sit here
+        // had, and building a response by hand in this test inherits it: the
+        // other fields are minted locally from functions that never see this
+        // config, so no edit to the server could make them carry the secret.
+        // The guard that can fire is
+        // `the_start_response_carries_no_part_of_the_servers_credential` in
+        // tests/oauth.rs, which reads the bytes the real handler sends.
     }
 
     /// The client refuses any value outside `check_opaque_oauth_value` before
@@ -560,7 +554,7 @@ mod tests {
         let (_verifier, code_challenge) = pkce_pair();
         for (name, value) in [("state", &state), ("nonce", &nonce), ("code_challenge", &code_challenge)] {
             assert_eq!(
-                credvault_core::api::check_opaque_oauth_value(value),
+                check_opaque_oauth_value(value),
                 Ok(()),
                 "{name} must be a value the client will accept, and {value} is not"
             );

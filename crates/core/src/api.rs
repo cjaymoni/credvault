@@ -445,7 +445,7 @@ fn sign_in_purpose() -> OAuthPurpose {
 /// characters and the longest Google client id seen is under 80 — and low
 /// enough that a value built to be a payload rather than a token is refused
 /// before it reaches a browser.
-pub const MAX_OAUTH_PARAMETER_LEN: usize = 512;
+pub const MAX_OPAQUE_VALUE_LEN: usize = 512;
 
 /// Why a value is not one [`OAuthStartResponse`] may carry.
 ///
@@ -460,7 +460,7 @@ pub enum NotAnOpaqueValue {
 }
 
 /// Whether a value is one [`OAuthStartResponse`] may carry: non-empty, no
-/// longer than [`MAX_OAUTH_PARAMETER_LEN`], and spelled only in RFC 3986's
+/// longer than [`MAX_OPAQUE_VALUE_LEN`], and spelled only in RFC 3986's
 /// unreserved characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`).
 ///
 /// This lives in core because both halves of the protocol depend on it and
@@ -480,11 +480,17 @@ pub fn check_opaque_oauth_value(value: &str) -> Result<(), NotAnOpaqueValue> {
     if value.is_empty() {
         return Err(NotAnOpaqueValue::Empty);
     }
-    if value.len() > MAX_OAUTH_PARAMETER_LEN {
-        return Err(NotAnOpaqueValue::TooLong);
-    }
+    // Before the length, so that the reason given for a non-ASCII value is
+    // the charset rather than the length. `len()` counts bytes, so a value of
+    // 300 multi-byte characters is over the limit while having fewer
+    // characters than it names, and the refusal the client builds from
+    // `TooLong` says "characters". Checking the charset first means only
+    // all-ASCII values ever reach that message, where the two agree.
     if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')) {
         return Err(NotAnOpaqueValue::BadCharacters);
+    }
+    if value.len() > MAX_OPAQUE_VALUE_LEN {
+        return Err(NotAnOpaqueValue::TooLong);
     }
     Ok(())
 }
@@ -835,13 +841,13 @@ mod tests {
             "G844yM5uFc7EGLBZZiEUXkE",                      // a base64url token
             "1234567890-abcdef.apps.googleusercontent.com", // a Google client id
             "with-dashes_and_underscores.and~tildes",
-            &"x".repeat(MAX_OAUTH_PARAMETER_LEN),
+            &"x".repeat(MAX_OPAQUE_VALUE_LEN),
         ] {
             assert_eq!(check_opaque_oauth_value(ok), Ok(()), "{ok} is a value a correct server sends");
         }
 
         assert_eq!(check_opaque_oauth_value(""), Err(NotAnOpaqueValue::Empty));
-        assert_eq!(check_opaque_oauth_value(&"x".repeat(MAX_OAUTH_PARAMETER_LEN + 1)), Err(NotAnOpaqueValue::TooLong));
+        assert_eq!(check_opaque_oauth_value(&"x".repeat(MAX_OPAQUE_VALUE_LEN + 1)), Err(NotAnOpaqueValue::TooLong));
         for bad in [
             "has space",
             "padded=",     // base64 standard alphabet

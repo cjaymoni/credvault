@@ -224,8 +224,9 @@ and makes it worse: a protocol-3 app refuses a protocol-2 server outright, at
 the check it runs before any credential is sent, so the people on that device
 lose passphrase sign-in as well and gain nothing — they could not sign in with
 Google either way. A Google-created account cannot be given a passphrase in
-advance to escape through, because changing a passphrase requires proving the
-old one and those accounts have none.
+advance to escape through: the passphrase-change route refuses those accounts
+outright, because they have no password to change and no second route sets
+one.
 
 So: if every account on the server signs in with a passphrase, update the
 server first and the apps at your leisure. If any account signs in only with

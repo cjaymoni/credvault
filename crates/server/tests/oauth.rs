@@ -24,6 +24,12 @@ const REDIRECT: &str = "http://127.0.0.1:49152/callback";
 /// to the client, which puts it in the authorization URL it builds.
 const STUB_CLIENT_ID: &str = "stub-client-id.apps.googleusercontent.com";
 
+/// The stub's half of the credential, held the way `GoogleProvider` holds
+/// Google's: in the provider, beside the id it does publish, one edit away
+/// from it. Nothing on the trait returns it, which is what
+/// `the_start_response_carries_no_part_of_the_servers_credential` checks.
+const STUB_CLIENT_SECRET: &str = "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-not-travel";
+
 /// One exchange the stub was asked to perform, kept so tests can check that
 /// what the server generated at `/oauth/start` is what it later redeems with.
 #[derive(Clone)]
@@ -37,10 +43,23 @@ struct RecordedExchange {
 /// Stands in for Google. Hands out identities for codes it was told about,
 /// and records what it was asked so tests can check the parameters the server
 /// generated actually reach the provider.
-#[derive(Default)]
 struct StubProvider {
     identities: Mutex<HashMap<String, VerifiedIdentity>>,
     exchanges: Mutex<Vec<RecordedExchange>>,
+    client_secret: String,
+}
+
+/// Spelled out rather than derived so the secret is a real value. `Default`
+/// would give it the empty string, which every response contains, and the
+/// test that looks for it would pass or fail for reasons of its own.
+impl Default for StubProvider {
+    fn default() -> Self {
+        Self {
+            identities: Mutex::default(),
+            exchanges: Mutex::default(),
+            client_secret: STUB_CLIENT_SECRET.to_string(),
+        }
+    }
 }
 
 impl StubProvider {
@@ -301,6 +320,32 @@ async fn the_identity_is_followed_not_the_address() {
     let started = server.start("sign_in").await;
     let response = server.callback(&started, "code-3").await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+/// The server is the confidential client: it holds the provider credential and
+/// redeems the code itself, so no part of that credential belongs in anything
+/// a client receives.
+///
+/// This reads the bytes the real handler sends rather than a response built in
+/// a test, which is the whole point. `oauth_start` fills the response field by
+/// field, so a guard that only pins `client_id()` cannot fail for any of the
+/// others, and one that builds the struct itself mints those others from
+/// functions that never see the configuration. Only the served body covers
+/// the handler, serde, and whatever field is added next.
+#[tokio::test]
+async fn the_start_response_carries_no_part_of_the_servers_credential() {
+    let stub = Arc::new(StubProvider::default());
+    let server = spawn(Arc::clone(&stub)).await;
+
+    let body = server.start_response("sign_in", None).await.text().await.unwrap();
+
+    // Without this the test would also pass against an error page, an empty
+    // body, or a route that stopped answering.
+    assert!(
+        body.contains(STUB_CLIENT_ID),
+        "the client id is published, so its absence means this read the wrong thing"
+    );
+    assert!(!body.contains(&stub.client_secret), "the provider credential must never reach a client");
 }
 
 /// What `/oauth/start` hands the client has to be the same attempt the server

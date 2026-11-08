@@ -111,10 +111,16 @@ Argon2id on your device. The server stores no password for such an account.
   A verified Google address is not by itself permission to have an account on
   someone else's server.
 - The sign-in page opens in your system browser, not in the app's window, so
-  you can see the URL you are typing a Google password into. The app checks
-  that address before opening it and refuses anything that is not Google's own
-  authorization page over https, because the server is what composes it. The
-  app listens on a loopback port for the redirect and nothing else.
+  you can see the URL you are typing a Google password into. The app builds
+  that address itself, from Google's endpoint held as a constant in the app
+  and the opaque values the server returns, so the page you land on and the
+  permissions it asks for are not the server's to choose. The one thing still
+  the server's is the OAuth client it is registered as with Google. The app
+  listens on a loopback port for the redirect and nothing else.
+- The consent screen names the app the server is registered as with Google.
+  That name comes from whoever runs the server, so on a server you do not
+  trust it can read as anything; what it can ask for is still only your
+  address.
 - The client secret stays on the server, which performs the code exchange, so
   it is never shipped inside the app.
 
@@ -181,20 +187,42 @@ numbers and nothing else — not the build version, which would only tell a
 passer-by which advisories to look up.
 
 ```json
-{ "status": "ok", "protocol": 2, "min_client_protocol": 1 }
+{ "status": "ok", "protocol": 3, "min_client_protocol": 1 }
 ```
 
 `protocol` is what the server speaks; `min_client_protocol` is the oldest
 client it serves. The app reads both before it derives a key or sends a
 credential, and stops with a plain message when the two cannot work together.
-A server ahead of the app that still serves the app's protocol works normally.
+A server ahead of the app works normally for everything the app's protocol
+covers.
 
-Protocol 2 added the passphrase proof on linking, the unlink route, and the
-replacement session that signing out other devices hands back. This app
-will not talk to a protocol-1 server at all: that server would accept a link
-request, ignore the proof, and answer in a shape the app reads as failure —
-leaving a Google sign-in on the account that the app cannot show you and that
-server cannot remove. Update the server, then the app.
+Protocol 3 moved the Google sign-in URL. The server used to compose the address
+the browser opens and the app checked it; now the server sends only the parts
+the app cannot know, and the app builds the address from its own constants. The
+page the browser goes to, and the permissions it asks for, are no longer
+anything a server can choose. Protocol 2 added the passphrase proof on linking,
+the unlink route, and the replacement session that signing out other devices
+hands back.
+
+This app will not talk to a server older than protocol 3. A protocol-2 server
+answers the sign-in request in the old shape and the app cannot build an address
+from it; a protocol-1 server would also accept a link request, ignore the proof,
+and answer in a shape the app reads as failure — leaving a Google sign-in on the
+account that the app cannot show you and that server cannot remove.
+
+**Upgrading to protocol 3.** The sentence above about a newer server working
+normally has one exception, and it decides the order to update in. An app older
+than protocol 3 connects to a protocol-3 server, unlocks the vault and works
+throughout — until someone presses "Continue with Google", where it looks for
+an authorization address the server no longer sends and fails without a useful
+message. For an account that has a passphrase, that is an annoyance until the
+app is updated. For an account created *through* Google, whose link is the only
+thing that opens it, it is no way in at all.
+
+So: if every account on the server signs in with a passphrase, update the
+server first and the apps at your leisure. If any account signs in only with
+Google, update those apps first, or accept that those people cannot sign in
+until you do.
 
 **The encryption scheme**, on every encrypted blob — your private key, each
 secret's key, each secret's contents. It covers the key derivation behind the

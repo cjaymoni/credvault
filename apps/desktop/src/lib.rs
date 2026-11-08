@@ -729,55 +729,124 @@ fn clear_pending_google(state: &AppState) {
     }
 }
 
-/// The only host this app will send someone to sign in at.
-const GOOGLE_AUTHORIZATION_HOST: &str = "accounts.google.com";
+/// Google's authorization endpoint, held here rather than taken from the
+/// server.
+///
+/// This app opens the page a user types a Google password into, and the
+/// server is the party it guards against everywhere else. While the server
+/// composed that URL, the page was its to choose, and a host ending in
+/// `.attacker.example` but beginning `accounts.google.com` reads like
+/// Google's to someone who has just been told the system browser is the safe
+/// place to type the password. Because the string goes to the platform URL
+/// handler rather than to a browser, the scheme was the server's too —
+/// `file://host/share/x` on Windows is a UNC path that authenticates outward
+/// to whoever answers.
+///
+/// A literal here ends that whole class rather than checking for it one shape
+/// at a time. See `compose_authorization_url`.
+const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
-/// Refuse to open anything but Google's own sign-in page.
+/// What the sign-in asks Google for: who the user is, and nothing else.
 ///
-/// The server composes this URL, and the server is the party this app guards
-/// against. Unchecked, it is a page of the server's choosing opened by a
-/// password manager that has just told the user the system browser is the safe
-/// place to type a Google password — and, because the string goes to the
-/// platform URL handler rather than to a browser, a scheme of the server's
-/// choosing too: `file://host/share/x` on Windows is a UNC path that
-/// authenticates outward to whoever answers.
+/// Widening this needs a new build of the app, which is the point — a server
+/// that could name the scope could ask the user's browser to grant it their
+/// Drive while they thought they were signing in.
+const GOOGLE_SCOPE: &str = "openid email";
+
+/// The longest a server-supplied authorization parameter may be. Real ones
+/// are 43 characters of base64url, or a client id of about 70.
+const MAX_AUTHORIZATION_PARAMETER_LEN: usize = 512;
+
+/// Check one of the opaque values the server supplies for the authorization
+/// URL.
 ///
-/// Scheme, host and port are what matter. The query carries `state`, `nonce`
-/// and the PKCE challenge, which are the server's to choose and are checked
-/// when the callback comes back.
+/// This is not what stops a parameter escaping its slot — `parse_with_params`
+/// percent-encodes every value, so `&scope=...` arriving in a nonce reaches
+/// Google as one oddly spelled nonce. It is a second layer, and it earns its
+/// place twice: it bounds what can be handed to `ShellExecuteW` or
+/// `/usr/bin/open`, and it would still refuse the reserved characters if the
+/// composition below were ever rewritten with `format!`.
+///
+/// The permitted set is RFC 3986's unreserved characters, which covers both
+/// base64url tokens and a Google client id.
 ///
 /// # Errors
-/// `oauth` if the URL does not parse, is not `https`, names a port, or is not
-/// Google's authorization host.
-fn check_authorization_url(url: &str) -> CommandResult<()> {
-    let parsed = url::Url::parse(url)
-        .map_err(|e| CommandError::new("oauth", format!("the server sent a sign-in address that is not a URL: {e}")))?;
-    // Google's sign-in page is on the default port. Nothing is gained by
-    // allowing another, and `accounts.google.com:8443` in a warning is worth
-    // naming rather than passing over.
-    let is_googles_page = parsed.scheme() == "https"
-        && parsed.port().is_none()
-        && parsed.host_str().is_some_and(|host| host.eq_ignore_ascii_case(GOOGLE_AUTHORIZATION_HOST));
-    if !is_googles_page {
-        // `javascript:` and `mailto:` have no host at all, and a sentence with
-        // a hole where the destination should be is the last thing this
-        // particular warning can afford.
-        let destination = match parsed.host_str() {
-            Some(host) => match parsed.port() {
-                Some(port) => format!("{host} on port {port}"),
-                None => host.to_string(),
-            },
-            None => format!("a {} address naming no host", parsed.scheme()),
-        };
-        return Err(CommandError::new(
+/// `oauth` if the value is empty, over [`MAX_AUTHORIZATION_PARAMETER_LEN`],
+/// or holds anything outside that set.
+fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
+    let refuse = |why: &str| {
+        Err(CommandError::new(
             "oauth",
             format!(
-                "this server tried to send you to {destination} to sign in, not to {GOOGLE_AUTHORIZATION_HOST}. \
-                 Nothing was opened. Do not trust this server with your Google password."
+                "this server sent a sign-in {name} that is {why}. Nothing was opened. \
+                 Do not trust this server with your Google password."
             ),
-        ));
+        ))
+    };
+    if value.is_empty() {
+        return refuse("empty");
+    }
+    if value.len() > MAX_AUTHORIZATION_PARAMETER_LEN {
+        return refuse("longer than any real one");
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')) {
+        return refuse("spelled with characters a real one never contains");
     }
     Ok(())
+}
+
+/// Build the URL the system browser will be sent to.
+///
+/// Everything that decides *where* the browser goes and *what is asked for*
+/// is a constant: the endpoint, and with it the scheme and the host; the
+/// scope; the prompt. The server contributes only values that are opaque to
+/// both sides, and the redirect is this app's own listener address rather
+/// than anything the server echoed back.
+///
+/// Keep this a `parse_with_params` over a literal base. That is the whole
+/// invariant: the base fixes the scheme, host and path beyond the reach of
+/// anything the server sends, and every value it does send is percent-encoded
+/// into the one slot it was given. A `format!` would hand all of that back.
+///
+/// # Errors
+/// `oauth` if any server-supplied value fails
+/// [`check_authorization_parameter`].
+fn compose_authorization_url(started: &OAuthStartResponse, redirect_uri: &str) -> CommandResult<String> {
+    let parameters = [
+        ("client_id", started.client_id.as_str()),
+        ("state", started.state.as_str()),
+        ("nonce", started.nonce.as_str()),
+        ("code_challenge", started.code_challenge.as_str()),
+    ];
+    for (name, value) in parameters {
+        check_authorization_parameter(name, value)?;
+    }
+    // Composed from the array that was just checked, so a value cannot be
+    // validated and then a different one used. The binding is positional:
+    // reordering the array above swaps two of these silently, and what catches
+    // that is `the_composed_url_is_googles_own_sign_in_page`, which gives each
+    // parameter a distinct value.
+    let [client_id, state, nonce, code_challenge] = parameters.map(|(_, value)| value);
+    let url = url::Url::parse_with_params(
+        GOOGLE_AUTHORIZATION_ENDPOINT,
+        [
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("response_type", "code"),
+            ("scope", GOOGLE_SCOPE),
+            ("state", state),
+            ("nonce", nonce),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", "S256"),
+            // Always show the chooser: without it a user with several Google
+            // accounts silently signs in as whichever one the browser has.
+            ("prompt", "select_account"),
+        ],
+    )
+    // The base is a literal, so this is unreachable unless someone edits it
+    // into something that is not a URL.
+    .map_err(|e| CommandError::new("oauth", format!("could not build the sign-in address: {e}")))?;
+    Ok(url.to_string())
 }
 
 /// Run the browser half of a sign-in and hand back the code it produced.
@@ -790,16 +859,19 @@ async fn authorize_with_google(
     let listener = RedirectListener::bind()
         .await
         .map_err(|e| CommandError::new("oauth", format!("could not listen for the sign-in response: {e}")))?;
-    let started =
-        api.oauth_start(&OAuthStartRequest { redirect_uri: listener.redirect_uri().to_string(), purpose }).await?;
+    // One string for both the request and the composition below. The server
+    // stores what it is sent here and gives it to Google again at the
+    // exchange, so the URL the browser follows has to carry the same bytes.
+    let redirect_uri = listener.redirect_uri().to_string();
+    let started = api.oauth_start(&OAuthStartRequest { redirect_uri: redirect_uri.clone(), purpose }).await?;
 
     // The system browser, not the app webview: the user should be typing a
     // Google password into Google's own window, where they can see the URL.
-    // Which window that is, is checked here rather than taken on the server's
-    // word; see `check_authorization_url`.
-    check_authorization_url(&started.authorization_url)?;
+    // Which window that is, is this app's to decide and not the server's; see
+    // `compose_authorization_url`.
+    let authorization_url = compose_authorization_url(&started, &redirect_uri)?;
     app.opener()
-        .open_url(started.authorization_url.clone(), None::<&str>)
+        .open_url(authorization_url, None::<&str>)
         .map_err(|e| CommandError::new("oauth", format!("could not open your browser: {e}")))?;
 
     let code = listener.wait_for_code(&started.state).await.map_err(|e| CommandError::new("oauth", e.to_string()))?;
@@ -2075,6 +2147,9 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// The loopback address the app's own redirect listener hands out.
+    const REDIRECT: &str = "http://127.0.0.1:49152/callback";
+
     /// "Clear now" and the timer must not both act on one copy: whichever
     /// runs first takes the digest and the other finds nothing to clear.
     #[test]
@@ -2089,59 +2164,118 @@ mod tests {
         assert_eq!(take_copied_digest(&Mutex::new(None)), None);
     }
 
-    /// The server composes the sign-in URL, and the server is the party this
-    /// app guards against. Only Google's own authorization page over https is
-    /// opened; everything else is refused before the platform URL handler sees
-    /// the string.
-    #[test]
-    fn only_googles_own_sign_in_page_is_opened() {
-        let google = "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=y";
-        assert!(check_authorization_url(google).is_ok());
-        // Case and a different path or query are Google's business, not ours.
-        assert!(check_authorization_url("https://ACCOUNTS.GOOGLE.COM/anything?a=b").is_ok());
-
-        for refused in [
-            // The phishing shape: a host that merely reads like Google's.
-            "https://accounts.google.com.attacker.example/signin",
-            "https://accounts-google.com/o/oauth2/v2/auth",
-            // Credentials in the authority, which hide the real host.
-            "https://accounts.google.com@attacker.example/o/oauth2/v2/auth",
-            // A homograph host punycodes to something that is not Google.
-            "https://accounts.googlé.com/o/oauth2/v2/auth",
-            // Cleartext, even to the right host.
-            "http://accounts.google.com/o/oauth2/v2/auth",
-            // Schemes that are not a browser at all. The Windows one reaches
-            // ShellExecuteW as a UNC path and authenticates outward.
-            "file://attacker.example/share/payload.exe",
-            "smb://attacker.example/share",
-            "javascript:alert(1)",
-            "mailto:someone@attacker.example",
-            // The right host on a port Google's sign-in page is not on.
-            "https://accounts.google.com:8443/o/oauth2/v2/auth",
-            // Not a URL.
-            "",
-            "not a url",
-        ] {
-            let error = check_authorization_url(refused).expect_err("{refused} must be refused");
-            assert_eq!(error.code, "oauth", "{refused}");
+    /// A response of the shape `/oauth/start` returns, with values that pass
+    /// the parameter check so a test can doctor one of them and see only that
+    /// change refused.
+    fn start_response() -> OAuthStartResponse {
+        OAuthStartResponse {
+            client_id: "1234567890-abcdef.apps.googleusercontent.com".into(),
+            state: "state-token".into(),
+            nonce: "nonce-token".into(),
+            code_challenge: "challenge-token".into(),
+            app_secret: Zeroizing::new("app-secret".into()),
         }
     }
 
-    /// The message is the whole product of this check: nothing is opened, so
-    /// all the user gets is the sentence. It has to name where the server
-    /// tried to send them, including for the schemes that have no host.
+    /// Where the browser goes, and what it asks for, are this app's to decide.
+    /// The server used to send the whole URL; what it sends now cannot reach
+    /// the scheme, the host, the path, the scope or the prompt.
     #[test]
-    fn the_refusal_names_where_the_server_tried_to_send_you() {
-        let host = check_authorization_url("https://accounts.google.com.attacker.example/x").unwrap_err();
-        assert!(host.message.contains("accounts.google.com.attacker.example"), "{}", host.message);
+    fn the_composed_url_is_googles_own_sign_in_page() {
+        let url = compose_authorization_url(&start_response(), REDIRECT).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("accounts.google.com"));
+        assert_eq!(parsed.port(), None);
+        assert_eq!(parsed.path(), "/o/oauth2/v2/auth");
 
-        let port = check_authorization_url("https://accounts.google.com:8443/x").unwrap_err();
-        assert!(port.message.contains("port 8443"), "{}", port.message);
+        let parameters: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(parameters["client_id"], "1234567890-abcdef.apps.googleusercontent.com");
+        assert_eq!(parameters["redirect_uri"], REDIRECT);
+        assert_eq!(parameters["response_type"], "code");
+        assert_eq!(parameters["scope"], "openid email");
+        assert_eq!(parameters["state"], "state-token");
+        assert_eq!(parameters["nonce"], "nonce-token");
+        assert_eq!(parameters["code_challenge"], "challenge-token");
+        assert_eq!(parameters["code_challenge_method"], "S256");
+        // Without this a user with several Google accounts is signed in as
+        // whichever one the browser already holds, with nothing to notice.
+        assert_eq!(parameters["prompt"], "select_account");
+        assert_eq!(parameters.len(), 9, "an unexpected parameter is as much a change as a missing one");
+    }
 
-        // No host at all: the sentence must not come out with a hole in it.
-        let hostless = check_authorization_url("javascript:alert(1)").unwrap_err();
-        assert!(hostless.message.contains("javascript"), "{}", hostless.message);
-        assert!(!hostless.message.contains("send you to  "), "{}", hostless.message);
+    /// The property the server-supplied values rest on: the composition
+    /// encodes into one slot rather than concatenating, so no value can add a
+    /// parameter or truncate the URL with a fragment.
+    ///
+    /// The redirect is the app's own address and so is not an attack — it is
+    /// simply the one parameter the character check does not screen, which
+    /// makes it the only way to put a reserved character through the
+    /// composition and watch what comes out.
+    #[test]
+    fn a_value_cannot_escape_the_parameter_it_was_put_in() {
+        let hostile = "http://127.0.0.1:49152/callback?x=1&scope=https://www.googleapis.com/auth/drive&prompt=none#f";
+        let url = compose_authorization_url(&start_response(), hostile).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+
+        assert_eq!(parsed.host_str(), Some("accounts.google.com"));
+        assert_eq!(parsed.fragment(), None, "a # in a value must not end the URL early");
+        let parameters: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(parameters.len(), 9);
+        assert_eq!(parameters["redirect_uri"], hostile, "the whole string belongs in its own slot");
+        assert_eq!(parameters["scope"], "openid email");
+        assert_eq!(parameters["prompt"], "select_account");
+    }
+
+    /// The second layer. These values are opaque tokens and a client id;
+    /// anything that is not one of those is refused before the platform URL
+    /// handler is handed anything at all.
+    #[test]
+    fn values_that_are_not_opaque_tokens_are_refused() {
+        for bad in [
+            "",
+            "&scope=https://www.googleapis.com/auth/drive",
+            "token#fragment",
+            "token?query",
+            "token with spaces",
+            "token\nnewline",
+            "tokén",
+            "token%2Fencoded",
+            &"x".repeat(MAX_AUTHORIZATION_PARAMETER_LEN + 1),
+        ] {
+            for field in ["client_id", "state", "nonce", "code_challenge"] {
+                let mut started = start_response();
+                match field {
+                    "client_id" => started.client_id = bad.into(),
+                    "state" => started.state = bad.into(),
+                    "nonce" => started.nonce = bad.into(),
+                    "code_challenge" => started.code_challenge = bad.into(),
+                    // A catch-all arm would quietly send a newly listed field
+                    // to whichever one it named, and the test would pass
+                    // without ever having touched it.
+                    other => unreachable!("{other} is not a field this test knows how to doctor"),
+                }
+                let error = compose_authorization_url(&started, REDIRECT)
+                    .expect_err("a value outside the permitted set must be refused");
+                assert_eq!(error.code, "oauth", "{field} of {bad:?}");
+                // Nothing is opened, so the sentence is the entire product of
+                // the refusal; it has to say which value was wrong.
+                assert!(error.message.contains(field), "{field} of {bad:?}: {}", error.message);
+            }
+        }
+    }
+
+    /// A real response passes. A check that refuses everything is not a check.
+    #[test]
+    fn an_ordinary_response_composes() {
+        assert!(compose_authorization_url(&start_response(), REDIRECT).is_ok());
+        for token in
+            ["A-Za-z0-9", "with.dots", "with_underscores", "with~tildes", &"x".repeat(MAX_AUTHORIZATION_PARAMETER_LEN)]
+        {
+            let mut started = start_response();
+            started.nonce = token.into();
+            assert!(compose_authorization_url(&started, REDIRECT).is_ok(), "{token} must be accepted");
+        }
     }
 
     #[test]

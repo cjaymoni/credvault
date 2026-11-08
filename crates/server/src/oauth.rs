@@ -33,8 +33,11 @@ use crate::error::{ApiError, ApiResult};
 /// Google's discovery document, pinned rather than fetched. These endpoints
 /// have been stable for a decade, and fetching them at runtime would add a
 /// network dependency on the path of every sign-in for no security gain.
+///
+/// The authorization endpoint is not here: the browser half of the flow is
+/// composed by the client, out of a constant of its own, so that a server
+/// cannot name the page a user types a Google password into.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
-pub const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 pub const GOOGLE_JWKS_URI: &str = "https://www.googleapis.com/oauth2/v3/certs";
 
@@ -69,15 +72,6 @@ pub struct VerifiedIdentity {
     pub email: String,
 }
 
-/// What a client needs to send the user to the provider.
-#[derive(Debug, Clone)]
-pub struct AuthorizationRequest {
-    pub state: String,
-    pub nonce: String,
-    pub code_challenge: String,
-    pub redirect_uri: String,
-}
-
 /// What the provider needs to turn a code into an identity.
 pub struct ExchangeRequest {
     pub code: Zeroizing<String>,
@@ -92,8 +86,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Implemented by [`GoogleProvider`] in production and by a stub in tests, so
 /// handler behaviour can be tested without reaching the network.
 pub trait OAuthProvider: Send + Sync + 'static {
-    /// The URL to open in the user's browser.
-    fn authorization_url(&self, request: &AuthorizationRequest) -> String;
+    /// The OAuth client this server is registered as, which the client needs
+    /// to compose the authorization URL. Everything else in that URL is
+    /// either the client's own constant or a value the handler generates, so
+    /// this is all a provider contributes to it.
+    fn client_id(&self) -> &str;
 
     /// Exchange an authorization code and return the identity it proves.
     fn exchange<'a>(&'a self, request: ExchangeRequest) -> BoxFuture<'a, ApiResult<VerifiedIdentity>>;
@@ -229,7 +226,6 @@ pub struct GoogleConfig {
     pub client_id: String,
     pub client_secret: Zeroizing<String>,
     pub issuer: String,
-    pub auth_endpoint: String,
     pub token_endpoint: String,
     pub jwks_uri: String,
 }
@@ -240,7 +236,6 @@ impl GoogleConfig {
             client_id,
             client_secret,
             issuer: GOOGLE_ISSUER.to_string(),
-            auth_endpoint: GOOGLE_AUTH_ENDPOINT.to_string(),
             token_endpoint: GOOGLE_TOKEN_ENDPOINT.to_string(),
             jwks_uri: GOOGLE_JWKS_URI.to_string(),
         }
@@ -363,28 +358,8 @@ impl GoogleProvider {
 }
 
 impl OAuthProvider for GoogleProvider {
-    fn authorization_url(&self, request: &AuthorizationRequest) -> String {
-        let params = [
-            ("client_id", self.config.client_id.as_str()),
-            ("redirect_uri", request.redirect_uri.as_str()),
-            ("response_type", "code"),
-            ("scope", "openid email"),
-            ("state", request.state.as_str()),
-            ("nonce", request.nonce.as_str()),
-            ("code_challenge", request.code_challenge.as_str()),
-            ("code_challenge_method", "S256"),
-            // Always show the chooser: without it a user with several Google
-            // accounts silently signs in as whichever one the browser has.
-            ("prompt", "select_account"),
-        ];
-        match Url::parse_with_params(&self.config.auth_endpoint, params) {
-            Ok(url) => url.to_string(),
-            // The endpoint is a constant, so this cannot happen in practice.
-            Err(error) => {
-                tracing::error!(%error, "google auth endpoint is not a valid URL");
-                String::new()
-            }
-        }
+    fn client_id(&self) -> &str {
+        &self.config.client_id
     }
 
     fn exchange<'a>(&'a self, request: ExchangeRequest) -> BoxFuture<'a, ApiResult<VerifiedIdentity>> {
@@ -542,29 +517,21 @@ mod tests {
         assert_eq!(validation.leeway, CLOCK_SKEW_SECS);
     }
 
+    /// The parameters that used to be asserted here are now composed by the
+    /// client, and `compose_authorization_url` in the desktop crate owns that
+    /// contract along with its tests. What is left on this side is the single
+    /// value a provider contributes to that URL. That it is the only one is
+    /// enforced by the trait having one method, not by a test.
     #[test]
-    fn authorization_url_carries_every_parameter() {
+    fn the_provider_publishes_its_client_id_and_never_its_secret() {
         let provider =
             GoogleProvider::new(GoogleConfig::new("client-123".into(), Zeroizing::new("sec".into()))).unwrap();
-        let url = provider.authorization_url(&AuthorizationRequest {
-            state: "st".into(),
-            nonce: "no".into(),
-            code_challenge: "ch".into(),
-            redirect_uri: "http://127.0.0.1:49152/callback".into(),
-        });
-        let parsed = Url::parse(&url).unwrap();
-        let params: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(params["client_id"], "client-123");
-        assert_eq!(params["redirect_uri"], "http://127.0.0.1:49152/callback");
-        assert_eq!(params["response_type"], "code");
-        assert_eq!(params["scope"], "openid email");
-        assert_eq!(params["state"], "st");
-        assert_eq!(params["nonce"], "no");
-        assert_eq!(params["code_challenge"], "ch");
-        assert_eq!(params["code_challenge_method"], "S256");
-        assert_eq!(params["prompt"], "select_account");
-        // The secret is never part of a URL the user's browser will follow.
-        assert!(!url.contains("sec"));
+        assert_eq!(provider.client_id(), "client-123");
+        // This value is handed to a client and ends up in a URL a browser
+        // follows. The two config fields sit next to each other, so the cheap
+        // guard against a future edit reaching for the wrong one stays here
+        // even though no URL is composed on this side any more.
+        assert_ne!(provider.client_id(), "sec", "the secret must never be what is published");
     }
 
     #[test]

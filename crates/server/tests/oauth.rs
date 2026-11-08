@@ -13,12 +13,26 @@ use credvault_core::kdf::ServerAddress;
 use credvault_core::{Identity, MasterKey};
 use credvault_server::api::*;
 use credvault_server::error::ApiError;
-use credvault_server::oauth::{AuthorizationRequest, BoxFuture, ExchangeRequest, OAuthProvider, VerifiedIdentity};
+use credvault_server::oauth::{BoxFuture, ExchangeRequest, OAuthProvider, VerifiedIdentity};
 use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use reqwest::{Client, StatusCode};
 use sqlx::SqlitePool;
 
 const REDIRECT: &str = "http://127.0.0.1:49152/callback";
+
+/// The OAuth client the stub is registered as. The server passes this through
+/// to the client, which puts it in the authorization URL it builds.
+const STUB_CLIENT_ID: &str = "stub-client-id.apps.googleusercontent.com";
+
+/// One exchange the stub was asked to perform, kept so tests can check that
+/// what the server generated at `/oauth/start` is what it later redeems with.
+#[derive(Clone)]
+struct RecordedExchange {
+    code: String,
+    code_verifier: String,
+    nonce: String,
+    redirect_uri: String,
+}
 
 /// Stands in for Google. Hands out identities for codes it was told about,
 /// and records what it was asked so tests can check the parameters the server
@@ -26,8 +40,7 @@ const REDIRECT: &str = "http://127.0.0.1:49152/callback";
 #[derive(Default)]
 struct StubProvider {
     identities: Mutex<HashMap<String, VerifiedIdentity>>,
-    issued: Mutex<HashMap<String, AuthorizationRequest>>,
-    exchanges: Mutex<Vec<(String, String, String)>>,
+    exchanges: Mutex<Vec<RecordedExchange>>,
 }
 
 impl StubProvider {
@@ -44,30 +57,25 @@ impl StubProvider {
             .insert(code.to_string(), VerifiedIdentity { subject: subject.into(), email: email.into() });
     }
 
-    /// The authorization request the server built for `state`.
-    fn issued_for(&self, state: &str) -> AuthorizationRequest {
-        self.issued.lock().unwrap().get(state).expect("no authorization url issued for that state").clone()
-    }
-
-    /// (code, code_verifier, nonce) for every exchange attempted.
-    fn exchanges(&self) -> Vec<(String, String, String)> {
+    /// Every exchange attempted, in order.
+    fn exchanges(&self) -> Vec<RecordedExchange> {
         self.exchanges.lock().unwrap().clone()
     }
 }
 
 impl OAuthProvider for StubProvider {
-    fn authorization_url(&self, request: &AuthorizationRequest) -> String {
-        self.issued.lock().unwrap().insert(request.state.clone(), request.clone());
-        format!("https://stub.invalid/auth?state={}", request.state)
+    fn client_id(&self) -> &str {
+        STUB_CLIENT_ID
     }
 
     fn exchange<'a>(&'a self, request: ExchangeRequest) -> BoxFuture<'a, Result<VerifiedIdentity, ApiError>> {
         Box::pin(async move {
-            self.exchanges.lock().unwrap().push((
-                request.code.to_string(),
-                request.code_verifier.to_string(),
-                request.nonce.clone(),
-            ));
+            self.exchanges.lock().unwrap().push(RecordedExchange {
+                code: request.code.to_string(),
+                code_verifier: request.code_verifier.to_string(),
+                nonce: request.nonce.clone(),
+                redirect_uri: request.redirect_uri.clone(),
+            });
             self.identities
                 .lock()
                 .unwrap()
@@ -295,27 +303,65 @@ async fn the_identity_is_followed_not_the_address() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
+/// What `/oauth/start` hands the client has to be the same attempt the server
+/// later redeems the code against, because the client is what puts those
+/// values in front of the provider.
 #[tokio::test]
-async fn parameters_generated_by_the_server_reach_the_provider() {
+async fn the_parameters_handed_to_the_client_are_the_ones_the_attempt_is_redeemed_with() {
     let stub = StubProvider::with_code("code-1", "sub", "kat@example.com");
     let server = spawn(Arc::clone(&stub)).await;
 
     let started = server.start("sign_in").await;
-    assert!(started.authorization_url.contains(&started.state));
-    let issued = stub.issued_for(&started.state);
-    assert_eq!(issued.redirect_uri, REDIRECT);
-    assert!(!issued.nonce.is_empty());
-    assert_ne!(issued.nonce, started.state);
+    assert_eq!(started.client_id, STUB_CLIENT_ID);
+    assert!(!started.state.is_empty());
+    assert!(!started.nonce.is_empty());
+    assert!(!started.code_challenge.is_empty());
+    // Three values drawn separately. One reused as another would quietly undo
+    // what the second one is for.
+    assert_ne!(started.nonce, started.state);
+    assert_ne!(started.code_challenge, started.state);
+    assert_ne!(started.code_challenge, started.nonce);
 
     server.callback(&started, "code-1").await;
     let exchanges = stub.exchanges();
     assert_eq!(exchanges.len(), 1);
-    let (code, verifier, nonce) = &exchanges[0];
-    assert_eq!(code, "code-1");
-    assert_eq!(nonce, &issued.nonce, "the nonce must be the one this attempt issued");
-    // The verifier is the secret half of the challenge that was published.
-    assert!(!verifier.is_empty());
-    assert_ne!(verifier, &issued.code_challenge);
+    let exchange = &exchanges[0];
+    assert_eq!(exchange.code, "code-1");
+    assert_eq!(exchange.nonce, started.nonce, "the nonce must be the one this attempt issued");
+    // The redirect the provider is given at exchange has to match the one the
+    // client composed its URL with, or the provider refuses the code. The
+    // client uses its own listener address, so this is where the two meet.
+    assert_eq!(exchange.redirect_uri, REDIRECT);
+    // The verifier is the secret half of the challenge the client published.
+    assert!(!exchange.code_verifier.is_empty());
+    assert_ne!(exchange.code_verifier, started.code_challenge);
+}
+
+/// A loopback redirect survives the server's parsing unchanged. The client
+/// sends this string, then composes its authorization URL with the same one;
+/// if the server stored a normalised variant instead, the provider would see
+/// two different redirects and refuse the exchange.
+#[tokio::test]
+async fn the_redirect_the_client_sends_is_the_redirect_that_comes_back_out() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@example.com");
+    let server = spawn(Arc::clone(&stub)).await;
+
+    let started = server.start("sign_in").await;
+    server.callback(&started, "code-1").await;
+    assert_eq!(stub.exchanges()[0].redirect_uri, REDIRECT, "the stored redirect must be byte-for-byte the sent one");
+}
+
+/// `OAuthStartResponse` is not `Clone` — it holds a secret, and a type that
+/// copies one on request invites doing so. The tests that doctor one field of
+/// a real response need the other four, so they spell the copy out here.
+fn clone_start(started: &OAuthStartResponse) -> OAuthStartResponse {
+    OAuthStartResponse {
+        client_id: started.client_id.clone(),
+        state: started.state.clone(),
+        nonce: started.nonce.clone(),
+        code_challenge: started.code_challenge.clone(),
+        app_secret: started.app_secret.clone(),
+    }
 }
 
 /// The passphrase every `password_session` account is created with.
@@ -369,11 +415,7 @@ async fn a_state_is_single_use_and_tied_to_what_it_was_started_for() {
     assert_eq!(stub.exchanges().len(), 1, "a mismatched purpose must not reach the provider");
 
     // Nor can an invented state, nor the right state with the wrong secret.
-    let invented = OAuthStartResponse {
-        state: "not-a-real-state".into(),
-        app_secret: started.app_secret.clone(),
-        authorization_url: String::new(),
-    };
+    let invented = OAuthStartResponse { state: "not-a-real-state".into(), ..clone_start(&started) };
     assert_eq!(server.callback(&invented, "code-1").await.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -386,11 +428,7 @@ async fn a_callback_without_the_app_secret_is_refused() {
     let server = spawn(Arc::clone(&stub)).await;
     let started = server.start("sign_in").await;
 
-    let stolen = OAuthStartResponse {
-        state: started.state.clone(),
-        app_secret: zeroize::Zeroizing::new("guessed".into()),
-        authorization_url: String::new(),
-    };
+    let stolen = OAuthStartResponse { app_secret: zeroize::Zeroizing::new("guessed".into()), ..clone_start(&started) };
     assert_eq!(server.callback(&stolen, "code-1").await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(stub.exchanges().len(), 0, "a wrong secret must not reach the provider");
 

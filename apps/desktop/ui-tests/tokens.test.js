@@ -54,10 +54,17 @@ function rules(css, at = []) {
     assert.ok(close < css.length, `unbalanced braces in or before: ${prelude}`);
     const body = css.slice(open + 1, close);
     if (prelude.startsWith("@")) {
+      // The name is not enough: @layer has both a block form and a statement
+      // form, and a statement at-rule leaves its `;` in the prelude of what
+      // the reader then mistakes for its block -- which is the rule after it.
+      assert.ok(
+        !prelude.includes(";"),
+        `${prelude}: a statement at-rule, so the reader in this file swallows the rule after it. Extend it.`,
+      );
       const name = prelude.split(/[\s(]/)[0];
       assert.ok(
         BLOCK_AT_RULES.includes(name),
-        `${name} is not an at-rule the reader in this file handles. If it carries no block it swallows the rule after it. Extend it.`,
+        `${name} is not an at-rule the reader in this file handles. Extend it.`,
       );
       found.push(...rules(body, [...at, prelude]));
     } else {
@@ -93,6 +100,18 @@ const COMMENT_OR_QUOTED = /\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/
 /// Fail with a useful message if a stylesheet outgrows the reader above.
 /// `raw` is the file as written; `css` is the same with comments gone.
 function assertStylesheetDialect(name, raw, css) {
+  // Checked against the file before comments were stripped, because a comment
+  // delimiter inside a string would have made stripComments() cut in the
+  // wrong place and there would be nothing left to find. Comments are matched
+  // first so that an apostrophe in one -- "the platform's own apps" -- is read
+  // as prose rather than as the start of a string.
+  for (const [token] of raw.matchAll(COMMENT_OR_QUOTED)) {
+    if (token.startsWith("/*")) continue;
+    assert.ok(
+      !token.includes("/*") && !token.includes("*/"),
+      `${name}: ${token} holds a comment delimiter, so stripComments() cuts in the wrong place. Extend it.`,
+    );
+  }
   assert.ok(
     !css.includes("url("),
     `${name}: url() can hold a ; or a brace, which the reader in this file splits on. Extend it.`,
@@ -106,18 +125,6 @@ function assertStylesheetDialect(name, raw, css) {
       `${name}: ${quoted} holds a delimiter the reader in this file splits on. Extend it.`,
     );
   }
-  // Checked against the file before comments were stripped, because a comment
-  // delimiter inside a string would have made stripComments() cut in the
-  // wrong place and there would be nothing left to find. Comments are matched
-  // first so that an apostrophe in one -- "the platform's own apps" -- is read
-  // as prose rather than as the start of a string.
-  for (const [token] of raw.matchAll(COMMENT_OR_QUOTED)) {
-    if (token.startsWith("/*")) continue;
-    assert.ok(
-      !token.includes("/*") && !token.includes("*/"),
-      `${name}: ${token} holds a comment delimiter, so stripComments() cuts in the wrong place. Extend it.`,
-    );
-  }
 }
 
 const ALL_RULES = [];
@@ -129,6 +136,14 @@ for (const name of STYLESHEETS) {
 }
 
 const DARK_MEDIA = "@media (prefers-color-scheme: dark)";
+/// Any query that asks for the dark preference, not just the bare one: a
+/// combined `… and (min-width: 721px)` is still a dark palette, and matching
+/// the prelude as a string would let it fall outside every net below.
+const inDarkPreference = (rule) => rule.at.some((at) => at.includes("prefers-color-scheme: dark"));
+/// Written without an enclosing at-rule. The setting-side copy is top level,
+/// so a conditional override of a few tokens is a separate rule rather than
+/// something that merges into the palette and reads as drift.
+const atTopLevel = (rule) => rule.at.length === 0;
 
 /// The custom properties one selector declares, merged in source order across
 /// however many blocks carry it. `:root[data-theme="dark"]` is written twice
@@ -137,7 +152,7 @@ function declarationsFor(selector, { inDarkMedia }) {
   return ALL_RULES.filter(
     (rule) =>
       rule.selector === selector &&
-      (inDarkMedia ? rule.at.includes(DARK_MEDIA) : !rule.at.includes(DARK_MEDIA)),
+      (inDarkMedia ? inDarkPreference(rule) : atTopLevel(rule)),
   ).flatMap((rule) => rule.declarations);
 }
 
@@ -170,21 +185,48 @@ const DARK_PALETTES = [
 // around today's house style turns a palette it does not recognise into one
 // that simply is not there.
 
-/// A rule that carries tokens and so is part of some palette.
+/// A rule that carries tokens, and so is part of some palette or override.
 const carriesTokens = (rule) => rule.declarations.length > 0;
 
-test("the table above names every dark palette the stylesheets define", () => {
-  const underPreference = ALL_RULES.filter((rule) => rule.at.includes(DARK_MEDIA) && carriesTokens(rule));
-  const underSetting = ALL_RULES.filter(
-    (rule) =>
-      !rule.at.includes(DARK_MEDIA) &&
-      rule.selector.includes("data-theme") &&
-      !rule.selector.includes("light") &&
-      carriesTokens(rule),
-  );
-  const unique = (found) => [...new Set(found.map((rule) => rule.selector))].sort();
-  assert.deepStrictEqual(unique(underPreference), DARK_PALETTES.map(([, media]) => media).sort());
-  assert.deepStrictEqual(unique(underSetting), DARK_PALETTES.map(([, , theme]) => theme).sort());
+/// One rule, as `context||selector`. Context matters: `:root` at the top
+/// level is the light defaults, and `:root` inside the phone query is an
+/// override of a few of them.
+const whereAndWhat = (rule) => `${rule.at.join(" >> ")}||${rule.selector}`;
+
+/// The token-carrying rules that are deliberately not dark palettes: the
+/// light defaults each platform starts from, and the blocks that override a
+/// few tokens for a width. Anything carrying tokens that is in neither this
+/// list nor DARK_PALETTES fails the test below, so a new one is a decision
+/// somebody makes on purpose rather than a palette that quietly goes
+/// unchecked.
+const NOT_A_PALETTE = [
+  "||:root",
+  '||:root[data-platform="macos"]',
+  '||:root[data-platform="windows"]',
+  '||:root[data-platform="linux"]',
+  '||:root[data-platform="ios"]',
+  '||:root[data-platform="android"]',
+  "@media (max-width: 720px)||:root",
+  "@media (max-width: 900px)||.app",
+  '@media (min-width: 721px)||[data-platform="ios"] .app, [data-platform="android"] .app',
+];
+
+/// Where the table says each palette's two copies are written.
+function paletteKeys() {
+  return DARK_PALETTES.flatMap(([, media, theme]) => [`${DARK_MEDIA}||${media}`, `||${theme}`]);
+}
+
+test("every rule that carries tokens is a palette the table names, or a listed exception", () => {
+  const accounted = new Set([...paletteKeys(), ...NOT_A_PALETTE]);
+  const unaccounted = ALL_RULES.filter(carriesTokens)
+    .map(whereAndWhat)
+    .filter((key) => !accounted.has(key));
+  assert.deepStrictEqual([...new Set(unaccounted)], [], "add each to DARK_PALETTES or to NOT_A_PALETTE");
+});
+
+test("every palette the table names is actually in the stylesheets", () => {
+  const present = new Set(ALL_RULES.filter(carriesTokens).map(whereAndWhat));
+  assert.deepStrictEqual(paletteKeys().filter((key) => !present.has(key)), []);
 });
 
 test("the palettes are the platforms the app knows, and nothing else", () => {
@@ -231,10 +273,20 @@ const CHANNEL_MAX = 255;
 function isTranslucent(value) {
   const text = value.trim().toLowerCase();
   if (text === "transparent") return true;
+  // #rgba and #rrggbbaa. Material writes 87% white as #ffffffde.
+  const hex = /^#([0-9a-f]+)$/.exec(text);
+  if (hex) {
+    const digits = hex[1];
+    if (digits.length === 4) return parseInt(digits[3] + digits[3], 16) < 255;
+    if (digits.length === 8) return parseInt(digits.slice(6), 16) < 255;
+    return false;
+  }
   const functional = /^rgba?\(([^)]*)\)$/.exec(text);
   if (!functional) return false;
   const parts = functional[1].split(/[\s,/]+/).filter(Boolean);
-  return parts.length > 3 && Number(parts[3]) < 1;
+  if (parts.length <= 3) return false;
+  const alpha = parts[3].endsWith("%") ? Number(parts[3].slice(0, -1)) / 100 : Number(parts[3]);
+  return Number.isFinite(alpha) && alpha < 1;
 }
 
 /// `value` as `[r, g, b]`, or null if it is written in a form this test does

@@ -244,6 +244,9 @@ test("the shortcut is spelled the way the platform's own apps spell it", () => {
     assert.equal(shortcutLabel(platform, "N"), expected, platform);
   }
   assert.equal(shortcutLabel("macos", "K"), "\u2318K");
+  // Both spellings name the key in upper case, whatever case they are given.
+  assert.equal(shortcutLabel("macos", "n"), "\u2318N");
+  assert.equal(shortcutKeys("macos", "n"), "Meta+N");
 });
 
 test("no platform the app knows is missing from the table above", () => {
@@ -266,9 +269,11 @@ test("the announced spelling uses the spec's key names, not the printed glyph", 
 
 test("the printed shortcut and the announced one agree on which modifier it is", () => {
   for (const platform of [...PLATFORMS, "beos", "", null, undefined, "__proto__"]) {
-    const printed = shortcutLabel(platform, "N").startsWith("\u2318");
-    const announced = shortcutKeys(platform, "N").startsWith("Meta");
-    assert.equal(printed, announced, String(platform));
+    for (const key of ["N", "k"]) {
+      const printed = shortcutLabel(platform, key).startsWith("\u2318");
+      const announced = shortcutKeys(platform, key).startsWith("Meta");
+      assert.equal(printed, announced, `${platform} ${key}`);
+    }
   }
 });
 

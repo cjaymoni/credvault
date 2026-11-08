@@ -128,7 +128,10 @@
     if (typeof key !== "string" || !key) {
       throw new TypeError("shortcutLabel needs the key the shortcut is pressed with");
     }
-    return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${key}` : `Ctrl+${key}`;
+    // Upper case in both spellings: a shortcut is written ⌘N, not ⌘n, and
+    // aria-keyshortcuts takes the key's own name, which is "N".
+    const named = key.toUpperCase();
+    return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${named}` : `Ctrl+${named}`;
   }
 
   /// The same shortcut in the spelling `aria-keyshortcuts` takes, e.g.

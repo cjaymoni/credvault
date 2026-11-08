@@ -28,9 +28,17 @@ const STYLESHEETS = fs.readdirSync(UI_DIR).filter((name) => name.endsWith(".css"
 // swallows the rule after it, a `;` in a string invents declarations that are
 // not there -- and two of the three fail silently, so all three are asserted
 // rather than trusted.
+//
+// What is *not* assumed is the closing `;` of a declaration, which CSS makes
+// optional on the last one in a block. Requiring it, as this once did, hid
+// the last token of every block -- and a rule whose tokens were all hidden
+// dropped out of the accounting below entirely, which is the one way left for
+// a pure-black palette to pass without a word.
 
 /// The at-rules the reader understands, all of which wrap a block.
-const BLOCK_AT_RULES = ["@media", "@supports", "@keyframes", "@font-face", "@layer"];
+/// @font-face is deliberately absent: it wraps a block the reader does not
+/// descend into, so listing it would claim a handling that is not there.
+const BLOCK_AT_RULES = ["@media", "@supports", "@keyframes", "@layer"];
 
 /// Every rule in a stylesheet, flattened, as `{ at, selector, declarations }`.
 ///
@@ -81,8 +89,10 @@ function rules(css, at = []) {
   }
 }
 
+/// `$` is safe as an ending because rules() has already asserted the body
+/// holds no nested block, so it can only be the end of this declaration list.
 function customProperties(body) {
-  return [...body.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]);
+  return [...body.matchAll(/(--[\w-]+)\s*:\s*([^;]+?)\s*(?:;|$)/g)].map((m) => [m[1], m[2].trim()]);
 }
 
 function stripComments(css) {
@@ -139,7 +149,8 @@ const DARK_MEDIA = "@media (prefers-color-scheme: dark)";
 /// Any query that asks for the dark preference, not just the bare one: a
 /// combined `… and (min-width: 721px)` is still a dark palette, and matching
 /// the prelude as a string would let it fall outside every net below.
-const inDarkPreference = (rule) => rule.at.some((at) => at.includes("prefers-color-scheme: dark"));
+const inDarkPreference = (rule) =>
+  rule.at.some((at) => at.includes("prefers-color-scheme: dark") && !/\bnot\b/.test(at));
 /// Written without an enclosing at-rule. The setting-side copy is top level,
 /// so a conditional override of a few tokens is a separate rule rather than
 /// something that merges into the palette and reads as drift.
@@ -227,6 +238,15 @@ test("every rule that carries tokens is a palette the table names, or a listed e
 test("every palette the table names is actually in the stylesheets", () => {
   const present = new Set(ALL_RULES.filter(carriesTokens).map(whereAndWhat));
   assert.deepStrictEqual(paletteKeys().filter((key) => !present.has(key)), []);
+});
+
+test("every listed exception is actually in the stylesheets", () => {
+  const present = new Set(ALL_RULES.filter(carriesTokens).map(whereAndWhat));
+  assert.deepStrictEqual(
+    NOT_A_PALETTE.filter((key) => !present.has(key)),
+    [],
+    "remove it from NOT_A_PALETTE, or it will excuse whatever takes that selector next",
+  );
 });
 
 test("the palettes are the platforms the app knows, and nothing else", () => {

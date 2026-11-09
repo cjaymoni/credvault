@@ -63,9 +63,15 @@ const REDACTED: &str = "<redacted>";
 /// older client would misread. A field that older peers can ignore safely is
 /// additive and needs no bump.
 ///
-/// 2 is this branch and has not been released — no tag, and `main` serves 1 —
-/// so the three contract changes below are one version rather than three.
-/// Once a build serving 2 reaches anyone, the next change is a 3.
+/// 2 was never tagged, but `main` has served it since it merged, so a build
+/// speaking it can be running somewhere. That is the condition the paragraph
+/// under 2 set for the next change being a 3 rather than an edit to 2.
+///
+/// 3: `/oauth/start` answers with the parts of an authorization request —
+/// `client_id`, `nonce` and `code_challenge` — where it answered with a
+/// finished `authorization_url`. The client composes the URL itself, so the
+/// endpoint, the scheme, the host, the scope and the prompt are its own
+/// constants rather than the server's choice. See F-12 in the security audit.
 ///
 /// 2: `/oauth/link` gained a required `current_auth_hash` and now answers with
 /// a profile where it answered `204`; `/oauth/unlink` is new and answers with
@@ -73,29 +79,53 @@ const REDACTED: &str = "<redacted>";
 /// have minted; `DELETE /sessions` answers with a fresh session too, and now
 /// spares the caller's rather than ending it, so the request that evicts
 /// someone can be followed immediately by the one that locks them out.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The oldest server protocol a client built from this source will talk to.
 ///
-/// 2, because a protocol-1 server answers the link request *successfully* and
-/// this client cannot tell. The old handler takes the callback fields and
-/// ignores the `current_auth_hash` it does not know about, writes the identity
-/// row, and answers `204`; the client then fails to read a profile out of an
-/// empty body and reports that linking failed. The link exists, the account
-/// holder believes it does not, that server returns no `google_email` so
-/// nothing displays it, and it has no `/oauth/unlink` to remove it with —
-/// which is the invisible, unremovable, standalone credential F-13 exists to
-/// prevent, reached by nothing worse than updating the app before the server.
+/// 3, because a protocol-2 server answers `/oauth/start` with a finished URL
+/// and none of the three values this client needs to build one. The response
+/// does not deserialise, and the sign-in fails somewhere with nothing useful
+/// to say about which side is behind.
+///
+/// There is deliberately no fallback to the old `authorization_url`. A client
+/// that used the server's URL whenever the new fields were absent could be
+/// put back on that path by a server that simply left them out, and the whole
+/// of what protocol 3 removes is the server's say over where the browser
+/// goes. A property a server can talk you out of is not one.
+///
+/// It was 2 for the reason below, which still holds and is covered by this.
+/// A protocol-1 server answers the link request *successfully* and the client
+/// cannot tell: the old handler takes the callback fields, ignores the
+/// `current_auth_hash` it does not know about, writes the identity row and
+/// answers `204`; the client then fails to read a profile out of an empty
+/// body and reports that linking failed. The link exists, the account holder
+/// believes it does not, that server returns no `google_email` so nothing
+/// displays it, and it has no `/oauth/unlink` to remove it with — which is
+/// the invisible, unremovable, standalone credential F-13 exists to prevent,
+/// reached by nothing worse than updating the app before the server.
 ///
 /// Refusing at `check_protocol` says so before any credential is sent, which
 /// is what that path is for.
-pub const MIN_SERVER_PROTOCOL: u32 = 2;
+pub const MIN_SERVER_PROTOCOL: u32 = 3;
 
 /// The oldest client protocol a server built from this source still serves.
 ///
 /// Raising this locks out installed clients, so it moves only when serving
-/// them would be wrong rather than merely inconvenient. Still 1: a protocol-1
-/// client is refused when it tries to link, and works for everything else.
+/// them would be wrong rather than merely inconvenient. Still 1.
+///
+/// An older client fails at `/oauth/start`, where the answer no longer
+/// carries the `authorization_url` it looks for, and a protocol-1 client
+/// fails at `/oauth/link` as it already did, because that handler requires a
+/// `current_auth_hash` it does not send. Everything else works, including
+/// unlocking the vault — which is why raising this would be the worse trade:
+/// it would lock those clients out of their secrets to spare them an error on
+/// one route.
+///
+/// Both failures are sign-ins that do not happen, which is the safe
+/// direction: unlike the link request that moved this file's other minimum,
+/// nothing is written and nothing is believed. What it costs an operator
+/// mid-upgrade is written down in the README, under Versions.
 pub const MIN_CLIENT_PROTOCOL: u32 = 1;
 
 // A build where either minimum has overtaken the version it was raised
@@ -409,13 +439,94 @@ fn sign_in_purpose() -> OAuthPurpose {
     OAuthPurpose::SignIn
 }
 
+/// The longest an opaque value in [`OAuthStartResponse`] may be.
+///
+/// Comfortably above every real one — a base64url token of 32 bytes is 43
+/// characters and the longest Google client id seen is under 80 — and low
+/// enough that a value built to be a payload rather than a token is refused
+/// before it reaches a browser.
+pub const MAX_OPAQUE_VALUE_LEN: usize = 512;
+
+/// Why a value is not one [`OAuthStartResponse`] may carry.
+///
+/// The client turns each of these into its own sentence, so they are separate
+/// rather than one boolean.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotAnOpaqueValue {
+    Empty,
+    TooLong,
+    /// Holds something outside the permitted set.
+    BadCharacters,
+}
+
+/// Whether a value is one [`OAuthStartResponse`] may carry: non-empty, no
+/// longer than [`MAX_OPAQUE_VALUE_LEN`], and spelled only in RFC 3986's
+/// unreserved characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`).
+///
+/// This lives in core because both halves of the protocol depend on it and
+/// neither can see the other: the server emits values inside this set, and the
+/// client refuses values outside it before composing an authorization URL.
+/// Two copies would be one base64 alphabet away from every sign-in failing
+/// with the client accusing the operator's own server of hostility. The server
+/// pins its side in `generated_values_satisfy_the_contract_the_client_enforces`
+/// and the client pins its side in `values_that_are_not_opaque_tokens_are_refused`.
+///
+/// The set is the intersection of what a base64url token uses and what a
+/// Google client id uses, so widening it needs a reason on both sides.
+///
+/// # Errors
+/// [`NotAnOpaqueValue`] saying which of the three rules the value broke.
+pub fn check_opaque_oauth_value(value: &str) -> Result<(), NotAnOpaqueValue> {
+    if value.is_empty() {
+        return Err(NotAnOpaqueValue::Empty);
+    }
+    // Before the length, so that the reason given for a non-ASCII value is
+    // the charset rather than the length. `len()` counts bytes, so a value of
+    // 300 multi-byte characters is over the limit while having fewer
+    // characters than it names, and the refusal the client builds from
+    // `TooLong` says "characters". Checking the charset first means only
+    // all-ASCII values ever reach that message, where the two agree.
+    if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')) {
+        return Err(NotAnOpaqueValue::BadCharacters);
+    }
+    if value.len() > MAX_OPAQUE_VALUE_LEN {
+        return Err(NotAnOpaqueValue::TooLong);
+    }
+    Ok(())
+}
+
+/// The parts of an authorization request that the client cannot know, and
+/// nothing else.
+///
+/// This used to carry the finished `authorization_url` and the client checked
+/// it before opening it. The client now composes it from its own constants,
+/// so the endpoint, the scheme, the host, the scope and the prompt are no
+/// longer the server's to choose — not the page the browser opens, not the
+/// permissions it asks for, and not whether an account chooser is shown. The
+/// three values below are opaque to both sides; see F-12 in the security
+/// audit for what that leaves a hostile server, which is not nothing.
+///
+/// Every field but `app_secret` reaches an authorization URL, and each one
+/// must satisfy [`check_opaque_oauth_value`]. That is the contract a server
+/// implementing this endpoint has to meet, and the client enforces it.
 #[derive(Serialize, Deserialize)]
 pub struct OAuthStartResponse {
-    /// Open this in the system browser.
-    pub authorization_url: String,
+    /// The OAuth client the server is registered with at the provider. Not a
+    /// secret — it travels in the authorization URL — and not something the
+    /// client can pin, because the registration belongs to whoever runs the
+    /// server.
+    pub client_id: String,
     /// Echoed back by the provider; the client returns it with the code so the
     /// server can find the attempt it belongs to.
     pub state: String,
+    /// Bound into the id token and checked by the server when the code is
+    /// exchanged. The client only carries it.
+    pub nonce: String,
+    /// The public half of the server's PKCE pair. The server keeps the
+    /// verifier because the server is the confidential client that redeems the
+    /// code, which is why this does not bind the flow to the app and
+    /// `app_secret` has to.
+    pub code_challenge: String,
     /// Proof that the caller is the client that began this flow.
     ///
     /// `state` and `code` both travel through the browser, so they are visible
@@ -431,8 +542,10 @@ pub struct OAuthStartResponse {
 impl fmt::Debug for OAuthStartResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OAuthStartResponse")
-            .field("authorization_url", &self.authorization_url)
+            .field("client_id", &self.client_id)
             .field("state", &self.state)
+            .field("nonce", &self.nonce)
+            .field("code_challenge", &self.code_challenge)
             .field("app_secret", &REDACTED)
             .finish()
     }
@@ -713,9 +826,46 @@ mod tests {
     /// two-line edit rather than something to remember.
     #[test]
     fn the_protocol_numbers_are_what_this_source_documents() {
-        assert_eq!(PROTOCOL_VERSION, 2);
-        assert_eq!(MIN_SERVER_PROTOCOL, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(MIN_SERVER_PROTOCOL, 3);
         assert_eq!(MIN_CLIENT_PROTOCOL, 1);
+    }
+
+    /// The set is the intersection of what the server's base64url tokens use
+    /// and what a Google client id uses. Both ends of that intersection are
+    /// pinned here, because widening it weakens the client's second layer and
+    /// narrowing it refuses values a correct server sends.
+    #[test]
+    fn an_opaque_oauth_value_is_a_token_or_a_client_id_and_nothing_else() {
+        for ok in [
+            // A `random_token()` output: 32 bytes of base64url, 43 characters.
+            "G844yM5uFc7EGLBZZiEUXkEKMUQIsMUUVEZQIeSx4Yg",
+            "1234567890-abcdef.apps.googleusercontent.com", // a Google client id
+            "with-dashes_and_underscores.and~tildes",
+            &"x".repeat(MAX_OPAQUE_VALUE_LEN),
+        ] {
+            assert_eq!(check_opaque_oauth_value(ok), Ok(()), "{ok} is a value a correct server sends");
+        }
+
+        assert_eq!(check_opaque_oauth_value(""), Err(NotAnOpaqueValue::Empty));
+        assert_eq!(check_opaque_oauth_value(&"x".repeat(MAX_OPAQUE_VALUE_LEN + 1)), Err(NotAnOpaqueValue::TooLong));
+        // 300 characters, 600 bytes: over the byte limit, under the count the
+        // `TooLong` sentence would name. The charset is the true reason, and
+        // this is the only case that tells the two orderings apart — without
+        // it the check order above is free to drift back.
+        assert_eq!(check_opaque_oauth_value(&"é".repeat(300)), Err(NotAnOpaqueValue::BadCharacters));
+        for bad in [
+            "has space",
+            "padded=",     // base64 standard alphabet
+            "slash/plus+", // the other two standard-alphabet characters
+            "&scope=https://www.googleapis.com/auth/drive",
+            "javascript:alert(1)",
+            "percent%2Fencoded", // already encoded, so encoding it again changes it
+            "new\nline",
+            "unicodé",
+        ] {
+            assert_eq!(check_opaque_oauth_value(bad), Err(NotAnOpaqueValue::BadCharacters), "{bad} must be refused");
+        }
     }
 
     #[test]

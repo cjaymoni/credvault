@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
+use credvault_core::api::{check_opaque_oauth_value, NotAnOpaqueValue, MAX_OPAQUE_VALUE_LEN};
+
+/// How much of a rejected client id the startup error quotes back. Enough
+/// to recognise the value by, short enough that a huge variable cannot be
+/// printed in full.
+const ECHOED_PREFIX_LEN: usize = 80;
 use credvault_server::oauth::{GoogleConfig, GoogleProvider};
 use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use zeroize::Zeroizing;
@@ -60,9 +66,69 @@ fn google_provider(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<Option<Arc<GoogleProvider>>, Box<dyn std::error::Error>> {
-    let present = |value: Option<String>| value.filter(|text| !text.trim().is_empty());
+    // Trimmed, not merely tested for whitespace: a value out of a .env file or
+    // a compose file routinely arrives with a trailing newline, and neither of
+    // these credentials can legitimately begin or end with whitespace.
+    let present = |value: Option<String>| value.map(|text| text.trim().to_string()).filter(|text| !text.is_empty());
     match (present(client_id), present(client_secret)) {
         (Some(id), Some(secret)) => {
+            // The client id is handed to the app and goes straight into an
+            // authorization URL, where the app refuses anything outside the
+            // set `check_opaque_oauth_value` names -- with a sentence telling
+            // the user not to trust this server with their Google password.
+            // A stray character in the configuration would otherwise produce
+            // that accusation on every sign-in, aimed at the operator's own
+            // server, with nothing at startup having said so. The other three
+            // values in that response are generated here and pinned by
+            // `generated_values_satisfy_the_contract_the_client_enforces`;
+            // this is the one that comes from outside.
+            // The reason is kept rather than both rules being recited, so an
+            // operator with an over-long id is not also lectured about
+            // punctuation.
+            //
+            // What is echoed back is bounded and truncated, because this line
+            // is reached exactly when the value is *not* a client id: the
+            // likely cause is the two Google variables being swapped, and the
+            // secret one is declared `hide_env_values` precisely so it is
+            // never printed. A prefix is enough to recognise a swap by.
+            if let Err(reason) = check_opaque_oauth_value(&id) {
+                let detail = match reason {
+                    NotAnOpaqueValue::Empty => "empty".to_string(),
+                    NotAnOpaqueValue::TooLong => {
+                        format!(
+                            "{} characters long, and at most {MAX_OPAQUE_VALUE_LEN} are allowed",
+                            id.chars().count()
+                        )
+                    }
+                    NotAnOpaqueValue::BadCharacters => {
+                        let shown: String = id.chars().take(ECHOED_PREFIX_LEN).collect();
+                        let ellipsis = if id.chars().count() > ECHOED_PREFIX_LEN { "..." } else { "" };
+                        format!(
+                            "spelled with characters a client id cannot hold; it may use only \
+                             letters, digits and the marks - . _ ~, and this one begins {shown:?}{ellipsis}"
+                        )
+                    }
+                };
+                return Err(format!("CREDVAULT_GOOGLE_CLIENT_ID is {detail}").into());
+            }
+            // The other half never reaches a URL, so it is not held to the same
+            // set — but an invisible character inside it is a copy-paste
+            // artefact that no Google secret has, and leaving it produces a
+            // sign-in that fails at the token exchange saying only that it
+            // could not be completed. Same reasoning as the id: fail where an
+            // operator is reading. The value is never quoted back.
+            //
+            // An allow-list rather than a deny-list of whitespace and control
+            // characters, because the artefacts most worth catching are in
+            // neither Unicode category: a BOM out of a Windows-authored .env
+            // is not `White_Space`, so `trim` leaves it too, and a zero-width
+            // space is not `Cc`. Printable ASCII covers `GOCSPX-` plus
+            // base64url with nothing to reason about.
+            if !secret.chars().all(|c| c.is_ascii_graphic()) {
+                return Err("CREDVAULT_GOOGLE_CLIENT_SECRET holds a character no Google client secret \
+                            does — it is printable ASCII throughout"
+                    .into());
+            }
             let provider = GoogleProvider::new(GoogleConfig::new(id, Zeroizing::new(secret)))?;
             Ok(Some(Arc::new(provider)))
         }
@@ -217,6 +283,60 @@ mod tests {
         assert!(google_provider(Some(String::new()), Some(String::new())).unwrap().is_none());
         assert!(google_provider(Some("  ".into()), Some("\t".into())).unwrap().is_none());
         assert!(google_provider(Some("id".into()), Some("secret".into())).unwrap().is_some());
+    }
+
+    /// A client id the app will refuse has to stop the server, because the
+    /// alternative is that it starts, looks healthy, and tells every user on
+    /// every sign-in not to trust it.
+    #[test]
+    fn a_client_id_the_app_would_refuse_stops_the_server() {
+        // The shapes a .env or compose file actually produces.
+        for bad in ["id with a space", "\"quoted-id\"", "id&scope=drive", "id/../x", &"x".repeat(600)] {
+            let built = google_provider(Some(bad.to_string()), Some("secret".into()));
+            assert!(built.is_err(), "{bad:?} must not start the server");
+            let message = built.err().unwrap().to_string();
+            assert!(message.contains("CREDVAULT_GOOGLE_CLIENT_ID"), "the refusal must name the flag: {message}");
+        }
+        // A real one, and the same one with the newline a .env file adds,
+        // which is trimmed rather than refused.
+        for good in ["1234567890-abcdef.apps.googleusercontent.com", "1234567890-abcdef.apps.googleusercontent.com\n"] {
+            assert!(google_provider(Some(good.to_string()), Some("secret\n".into())).unwrap().is_some(), "{good:?}");
+        }
+    }
+
+    /// A secret with a newline in it reaches Google and comes back as a
+    /// failed exchange the user is told nothing useful about, so it stops the
+    /// server too. Unlike the id, it is never quoted back.
+    #[test]
+    fn a_secret_carrying_whitespace_stops_the_server_without_printing_it() {
+        const SECRET: &str = "GOCSPX-wrapped\nacross-lines";
+        let built = google_provider(Some("client-id".into()), Some(SECRET.to_string()));
+        let message = built.err().expect("an interior newline must stop the server").to_string();
+        assert!(message.contains("CREDVAULT_GOOGLE_CLIENT_SECRET"), "the refusal must name the flag: {message}");
+        assert!(!message.contains("GOCSPX"), "the refusal must not quote the secret: {message}");
+        // The characters a deny-list of whitespace and control categories
+        // misses, and that `trim` leaves in place: a BOM from a Windows-saved
+        // .env, and a zero-width space from a web console.
+        for invisible in ["\u{feff}GOCSPX-fine", "GOCSPX-fi\u{200b}ne"] {
+            let built = google_provider(Some("client-id".into()), Some(invisible.to_string()));
+            assert!(built.is_err(), "an invisible character must stop the server: {invisible:?}");
+        }
+
+        // Surrounding whitespace is still trimmed rather than refused, which
+        // is the common case and not a mistake worth stopping for.
+        assert!(google_provider(Some("client-id".into()), Some("  GOCSPX-fine\n".into())).unwrap().is_some());
+    }
+
+    /// The rejected id is quoted back so a swap of the two Google variables is
+    /// recognisable, which means it has to be bounded: this line is reached
+    /// precisely when the value is not what it claims to be.
+    #[test]
+    fn a_rejected_client_id_is_quoted_back_but_not_in_full() {
+        let huge = format!("{}!", "a".repeat(5_000));
+        let message = google_provider(Some(huge), Some("secret".into())).err().unwrap().to_string();
+        assert!(message.len() < 400, "a huge variable must not be printed in full: {} chars", message.len());
+        assert!(message.contains("aaa"), "enough must be shown to recognise the value: {message}");
+        assert!(message.ends_with("\"..."), "a truncated value must say so: {message}");
     }
 
     #[test]

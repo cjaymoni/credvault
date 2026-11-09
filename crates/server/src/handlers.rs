@@ -1130,13 +1130,16 @@ pub async fn oauth_start(
         .execute(&state.pool)
         .await?;
 
-    let authorization_url = provider.authorization_url(&oauth::AuthorizationRequest {
-        state: state_token.clone(),
+    // The client composes the authorization URL out of these and its own
+    // constants. Nothing here names a page, a scheme or a scope, which is the
+    // point: see `OAuthStartResponse`.
+    Ok(Json(OAuthStartResponse {
+        client_id: provider.client_id().to_string(),
+        state: state_token,
         nonce,
         code_challenge,
-        redirect_uri,
-    });
-    Ok(Json(OAuthStartResponse { authorization_url, state: state_token, app_secret }))
+        app_secret,
+    }))
 }
 
 /// One authorization attempt, taken out of the table as it is read.

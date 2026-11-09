@@ -321,6 +321,27 @@ mod tests {
         }
     }
 
+    /// This address goes two ways at once: the app sends it to the server,
+    /// which stores it by parsing it and replays the parsed form to Google at
+    /// the token exchange, and the app also composes the authorization URL
+    /// with the string as written. If parsing changed it — a stripped default
+    /// port, an added trailing slash — the two requests would name different
+    /// redirects and Google would refuse the code, with nothing on either side
+    /// to say why.
+    ///
+    /// `validate_loopback_redirect` on the server is the other half of this
+    /// and rejects anything without an explicit port, so the one shape that
+    /// would normalise differently cannot arrive. This end pins that the shape
+    /// produced here is the one that survives.
+    #[tokio::test]
+    async fn the_listener_address_survives_the_round_trip_through_a_url_parser() {
+        let listener = RedirectListener::bind().await.unwrap();
+        let written = listener.redirect_uri();
+        let parsed = url::Url::parse(written).expect("the listener must produce a URL");
+        assert_eq!(parsed.to_string(), written, "parsing must not rewrite the redirect");
+        assert!(parsed.port().is_some(), "an explicit port is what keeps the parse an identity");
+    }
+
     #[tokio::test]
     async fn the_listener_answers_one_callback_and_ignores_other_paths() {
         let listener = RedirectListener::bind().await.unwrap();

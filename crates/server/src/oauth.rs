@@ -525,7 +525,7 @@ mod tests {
     /// value a provider contributes to that URL. That it is the only one is
     /// enforced by the trait having one method, not by a test.
     #[test]
-    fn the_provider_publishes_its_client_id_and_never_its_secret() {
+    fn the_provider_publishes_only_its_client_id() {
         let provider =
             GoogleProvider::new(GoogleConfig::new("client-123".into(), Zeroizing::new("secret".into()))).unwrap();
         assert_eq!(provider.client_id(), "client-123");
@@ -540,7 +540,9 @@ mod tests {
         // config, so no edit to the server could make them carry the secret.
         // The guard that can fire is
         // `the_start_response_carries_no_part_of_the_servers_credential` in
-        // tests/oauth.rs, which reads the bytes the real handler sends.
+        // tests/oauth.rs, which reads the bytes the handler serves. It covers
+        // the handler and serde rather than this type: it drives a stub, so
+        // no `GoogleProvider` is ever built in it.
     }
 
     /// The client refuses any value outside `check_opaque_oauth_value` before

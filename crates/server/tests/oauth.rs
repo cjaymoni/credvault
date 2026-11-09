@@ -327,11 +327,18 @@ async fn the_identity_is_followed_not_the_address() {
 /// a client receives.
 ///
 /// This reads the bytes the real handler sends rather than a response built in
-/// a test, which is the whole point. `oauth_start` fills the response field by
-/// field, so a guard that only pins `client_id()` cannot fail for any of the
-/// others, and one that builds the struct itself mints those others from
-/// functions that never see the configuration. Only the served body covers
-/// the handler, serde, and whatever field is added next.
+/// a test. `oauth_start` fills the response field by field, so a guard that
+/// only pins `client_id()` cannot fail for any of the others, and one that
+/// builds the struct itself mints those others from functions that never see
+/// the configuration.
+///
+/// What it covers is the handler and serde, for anything `OAuthProvider` can
+/// hand them: widen that trait with a method that returns the credential, and
+/// the compiler makes `StubProvider` implement it with the field sitting right
+/// there. What it does not cover is a leak that bypasses the trait — the real
+/// `GoogleProvider` is never built in an integration test, `GoogleConfig`'s
+/// secret is a `pub` field anything in the crate can read directly, and no
+/// test watches the logs.
 #[tokio::test]
 async fn the_start_response_carries_no_part_of_the_servers_credential() {
     let stub = Arc::new(StubProvider::default());

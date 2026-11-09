@@ -838,7 +838,8 @@ mod tests {
     #[test]
     fn an_opaque_oauth_value_is_a_token_or_a_client_id_and_nothing_else() {
         for ok in [
-            "G844yM5uFc7EGLBZZiEUXkE",                      // a base64url token
+            // A `random_token()` output: 32 bytes of base64url, 43 characters.
+            "G844yM5uFc7EGLBZZiEUXkEKMUQIsMUUVEZQIeSx4Yg",
             "1234567890-abcdef.apps.googleusercontent.com", // a Google client id
             "with-dashes_and_underscores.and~tildes",
             &"x".repeat(MAX_OPAQUE_VALUE_LEN),
@@ -848,6 +849,11 @@ mod tests {
 
         assert_eq!(check_opaque_oauth_value(""), Err(NotAnOpaqueValue::Empty));
         assert_eq!(check_opaque_oauth_value(&"x".repeat(MAX_OPAQUE_VALUE_LEN + 1)), Err(NotAnOpaqueValue::TooLong));
+        // 300 characters, 600 bytes: over the byte limit, under the count the
+        // `TooLong` sentence would name. The charset is the true reason, and
+        // this is the only case that tells the two orderings apart — without
+        // it the check order above is free to drift back.
+        assert_eq!(check_opaque_oauth_value(&"é".repeat(300)), Err(NotAnOpaqueValue::BadCharacters));
         for bad in [
             "has space",
             "padded=",     // base64 standard alphabet

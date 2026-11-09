@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use credvault_core::api::{check_opaque_oauth_value, MAX_OPAQUE_VALUE_LEN};
+use credvault_core::api::{check_opaque_oauth_value, NotAnOpaqueValue, MAX_OPAQUE_VALUE_LEN};
 use credvault_server::oauth::{GoogleConfig, GoogleProvider};
 use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use zeroize::Zeroizing;
@@ -77,12 +77,35 @@ fn google_provider(
             // values in that response are generated here and pinned by
             // `generated_values_satisfy_the_contract_the_client_enforces`;
             // this is the one that comes from outside.
-            if check_opaque_oauth_value(&id).is_err() {
-                return Err(format!(
-                    "CREDVAULT_GOOGLE_CLIENT_ID is not a client id: it may hold only letters, digits \
-                     and the marks - . _ ~, and at most {MAX_OPAQUE_VALUE_LEN} characters"
-                )
-                .into());
+            // The reason is kept rather than both rules being recited, so
+            // an operator with an over-long id is not also lectured about
+            // punctuation. The value is not a secret, so it can be quoted back.
+            if let Err(reason) = check_opaque_oauth_value(&id) {
+                let detail = match reason {
+                    NotAnOpaqueValue::Empty => "empty".to_string(),
+                    NotAnOpaqueValue::TooLong => {
+                        format!(
+                            "{} characters long, and at most {MAX_OPAQUE_VALUE_LEN} are allowed",
+                            id.chars().count()
+                        )
+                    }
+                    NotAnOpaqueValue::BadCharacters => format!(
+                        "spelled with characters a client id cannot hold; it may use only letters, \
+                         digits and the marks - . _ ~, and this one is {id:?}"
+                    ),
+                };
+                return Err(format!("CREDVAULT_GOOGLE_CLIENT_ID is {detail}").into());
+            }
+            // The other half never reaches a URL, so it is not held to the same
+            // set — but whitespace or a control character inside it is a
+            // copy-paste artefact that no Google secret has, and leaving it
+            // produces a sign-in that fails at the token exchange saying only
+            // that it could not be completed. Same reasoning as the id: fail
+            // where an operator is reading. The value is never quoted back.
+            if secret.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err("CREDVAULT_GOOGLE_CLIENT_SECRET holds whitespace or a control character, \
+                            which no Google client secret does"
+                    .into());
             }
             let provider = GoogleProvider::new(GoogleConfig::new(id, Zeroizing::new(secret)))?;
             Ok(Some(Arc::new(provider)))
@@ -257,6 +280,21 @@ mod tests {
         for good in ["1234567890-abcdef.apps.googleusercontent.com", "1234567890-abcdef.apps.googleusercontent.com\n"] {
             assert!(google_provider(Some(good.to_string()), Some("secret\n".into())).unwrap().is_some(), "{good:?}");
         }
+    }
+
+    /// A secret with a newline in it reaches Google and comes back as a
+    /// failed exchange the user is told nothing useful about, so it stops the
+    /// server too. Unlike the id, it is never quoted back.
+    #[test]
+    fn a_secret_carrying_whitespace_stops_the_server_without_printing_it() {
+        const SECRET: &str = "GOCSPX-wrapped\nacross-lines";
+        let built = google_provider(Some("client-id".into()), Some(SECRET.to_string()));
+        let message = built.err().expect("an interior newline must stop the server").to_string();
+        assert!(message.contains("CREDVAULT_GOOGLE_CLIENT_SECRET"), "the refusal must name the flag: {message}");
+        assert!(!message.contains("GOCSPX"), "the refusal must not quote the secret: {message}");
+        // Surrounding whitespace is still trimmed rather than refused, which
+        // is the common case and not a mistake worth stopping for.
+        assert!(google_provider(Some("client-id".into()), Some("  GOCSPX-fine\n".into())).unwrap().is_some());
     }
 
     #[test]

@@ -743,7 +743,7 @@ fn clear_pending_google(state: &AppState) {
 /// to whoever answers.
 ///
 /// A literal here ends that whole class rather than checking for it one shape
-/// at a time. See `compose_authorization_url`.
+/// at a time. See `authorization_url::compose`.
 const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 
 /// What the sign-in asks Google for: who the user is, and nothing else.
@@ -753,126 +753,279 @@ const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth
 /// Drive while they thought they were signing in.
 const GOOGLE_SCOPE: &str = "openid email";
 
-/// Check one of the opaque values the server supplies for the authorization
-/// URL.
+/// Composing the authorization URL.
 ///
-/// This is not what stops a parameter escaping its slot — `parse_with_params`
-/// percent-encodes every value, so `&scope=...` arriving in a nonce reaches
-/// Google as one oddly spelled nonce. It is a second layer, and it earns its
-/// place twice: it bounds what can be handed to `ShellExecuteW` or
-/// `/usr/bin/open`, and it would still refuse the reserved characters if the
-/// composition below were ever rewritten with `format!`.
-///
-/// The rule itself is [`check_opaque_oauth_value`] in core, where the server
-/// can see it too. What is here is only the wording: a refusal is the entire
-/// product of this function, so each reason gets its own sentence, and the
-/// one that means "a value outside the published contract" says what the
-/// contract is rather than only that it was broken.
-///
-/// # Errors
-/// `oauth` if the value is not one [`OAuthStartResponse`] may carry.
-fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
-    let why = match check_opaque_oauth_value(value) {
-        Ok(()) => return Ok(()),
-        Err(NotAnOpaqueValue::Empty) => "empty".to_string(),
-        Err(NotAnOpaqueValue::TooLong) => {
-            format!("longer than the {MAX_OPAQUE_VALUE_LEN} characters this protocol allows")
-        }
-        Err(NotAnOpaqueValue::BadCharacters) => "spelled with characters this protocol does not allow there — \
-             letters, digits, and the four marks - . _ ~ are the whole set"
-            .to_string(),
-    };
-    Err(CommandError::new(
-        "oauth",
-        format!(
-            "this server sent a sign-in {name} that is {why}. Nothing was opened. \
-             Do not trust this server with your Google password."
-        ),
-    ))
-}
+/// A module rather than two functions side by side, because side by side
+/// they had identical visibility: every caller in this file could reach the
+/// one taking an arbitrary redirect, and the safe signature was a suggestion
+/// a comment made rather than a rule the compiler kept. Only [`compose`]
+/// leaves this module, and it takes the listener.
+mod authorization_url {
+    use super::*;
 
-/// Build the URL the system browser will be sent to.
-///
-/// The redirect can only be this app's own listener address: a
-/// [`RedirectListener`] is obtainable from `bind` alone, which formats it from
-/// a literal path and the port the OS just gave it. That is the one value
-/// [`compose_with_redirect`] does not screen, and taking the listener rather
-/// than a string is what makes its provenance a fact about the type instead of
-/// a fact about the single call site.
-///
-/// # Errors
-/// `oauth` if any server-supplied value fails
-/// [`check_authorization_parameter`].
-fn compose_authorization_url(started: &OAuthStartResponse, listener: &RedirectListener) -> CommandResult<String> {
-    compose_with_redirect(started, listener.redirect_uri())
-}
-
-/// The composition itself, split from [`compose_authorization_url`] so the
-/// redirect can be an arbitrary string here and nowhere else.
-///
-/// That split is what lets `a_value_cannot_escape_the_parameter_it_was_put_in`
-/// push reserved characters through the unscreened slot: a newtype a test can
-/// mint would not be an invariant, and one it cannot mint would delete that
-/// test. Callers outside this module get the safe signature above.
-///
-/// Everything that decides *where* the browser goes and *what is asked for*
-/// is a constant: the endpoint, and with it the scheme and the host; the
-/// scope; the prompt. The server contributes only values that are opaque to
-/// both sides.
-///
-/// Keep this a `parse_with_params` over a literal base. That is the whole
-/// invariant: the base fixes the scheme, host and path beyond the reach of
-/// anything the server sends, and every value it does send is percent-encoded
-/// into the one slot it was given. A `format!` would hand all of that back.
-///
-/// # Errors
-/// `oauth` if any server-supplied value fails
-/// [`check_authorization_parameter`].
-fn compose_with_redirect(started: &OAuthStartResponse, redirect_uri: &str) -> CommandResult<String> {
-    // Destructured rather than read field by field, so that a field added to
-    // `OAuthStartResponse` later stops this compiling until someone decides
-    // whether it belongs in the URL and what checks it. `started.client_id`
-    // and friends would have taken a new field in silence, and neither the
-    // parameter count asserted below nor the test's field list would have
-    // said so. `app_secret` is named here to be refused: it is the one value
-    // that must never travel through a browser.
-    let OAuthStartResponse { client_id, state, nonce, code_challenge, app_secret: _ } = started;
-    let parameters = [
-        ("client_id", client_id.as_str()),
-        ("state", state.as_str()),
-        ("nonce", nonce.as_str()),
-        ("code_challenge", code_challenge.as_str()),
-    ];
-    for (name, value) in parameters {
-        check_authorization_parameter(name, value)?;
+    /// Check one of the opaque values the server supplies for the authorization
+    /// URL.
+    ///
+    /// This is not what stops a parameter escaping its slot — `parse_with_params`
+    /// percent-encodes every value, so `&scope=...` arriving in a nonce reaches
+    /// Google as one oddly spelled nonce. It is a second layer, and it earns its
+    /// place twice: it bounds what can be handed to `ShellExecuteW` or
+    /// `/usr/bin/open`, and it would still refuse the reserved characters if the
+    /// composition below were ever rewritten with `format!`.
+    ///
+    /// The rule itself is [`check_opaque_oauth_value`] in core, where the server
+    /// can see it too. What is here is only the wording: a refusal is the entire
+    /// product of this function, so each reason gets its own sentence, and the
+    /// one that means "a value outside the published contract" says what the
+    /// contract is rather than only that it was broken.
+    ///
+    /// # Errors
+    /// `oauth` if the value is not one [`OAuthStartResponse`] may carry.
+    fn check_authorization_parameter(name: &str, value: &str) -> CommandResult<()> {
+        let why = match check_opaque_oauth_value(value) {
+            Ok(()) => return Ok(()),
+            Err(NotAnOpaqueValue::Empty) => "empty".to_string(),
+            Err(NotAnOpaqueValue::TooLong) => {
+                format!("longer than the {MAX_OPAQUE_VALUE_LEN} characters this protocol allows")
+            }
+            Err(NotAnOpaqueValue::BadCharacters) => "spelled with characters this protocol does not allow there — \
+                 letters, digits, and the four marks - . _ ~ are the whole set"
+                .to_string(),
+        };
+        Err(CommandError::new(
+            "oauth",
+            format!(
+                "this server sent a sign-in {name} that is {why}. Nothing was opened. \
+                 Do not trust this server with your Google password."
+            ),
+        ))
     }
-    // Composed from the array that was just checked, so a value cannot be
-    // validated and then a different one used — these four names now mean the
-    // checked values rather than the raw fields. The binding is positional:
-    // reordering the array above swaps two of these silently, and what catches
-    // that is `the_composed_url_is_googles_own_sign_in_page`, which gives each
-    // parameter a distinct value.
-    let [client_id, state, nonce, code_challenge] = parameters.map(|(_, value)| value);
-    let url = url::Url::parse_with_params(
-        GOOGLE_AUTHORIZATION_ENDPOINT,
-        [
-            ("client_id", client_id),
-            ("redirect_uri", redirect_uri),
-            ("response_type", "code"),
-            ("scope", GOOGLE_SCOPE),
-            ("state", state),
-            ("nonce", nonce),
-            ("code_challenge", code_challenge),
-            ("code_challenge_method", "S256"),
-            // Always show the chooser: without it a user with several Google
-            // accounts silently signs in as whichever one the browser has.
-            ("prompt", "select_account"),
-        ],
-    )
-    // The base is a literal, so this is unreachable unless someone edits it
-    // into something that is not a URL.
-    .map_err(|e| CommandError::new("oauth", format!("could not build the sign-in address: {e}")))?;
-    Ok(url.to_string())
+
+    /// Build the URL the system browser will be sent to.
+    ///
+    /// The redirect can only be this app's own listener address: a
+    /// [`RedirectListener`] is obtainable from `bind` alone, which formats it from
+    /// a literal path and the port the OS just gave it. That is the one value
+    /// [`with_redirect`] does not screen, and taking the listener rather
+    /// than a string is what makes its provenance a fact about the type instead of
+    /// a fact about the single call site.
+    ///
+    /// # Errors
+    /// `oauth` if any server-supplied value fails
+    /// [`check_authorization_parameter`].
+    pub(super) fn compose(started: &OAuthStartResponse, listener: &RedirectListener) -> CommandResult<String> {
+        with_redirect(started, listener.redirect_uri())
+    }
+
+    /// The composition itself, split from [`compose`] so the
+    /// redirect can be an arbitrary string here and nowhere else.
+    ///
+    /// That split is what lets `a_value_cannot_escape_the_parameter_it_was_put_in`
+    /// push reserved characters through the unscreened slot: a newtype a test can
+    /// mint would not be an invariant, and one it cannot mint would delete that
+    /// test. Callers outside this module get the safe signature above.
+    ///
+    /// Everything that decides *where* the browser goes and *what is asked for*
+    /// is a constant: the endpoint, and with it the scheme and the host; the
+    /// scope; the prompt. The server contributes only values that are opaque to
+    /// both sides.
+    ///
+    /// Keep this a `parse_with_params` over a literal base. That is the whole
+    /// invariant: the base fixes the scheme, host and path beyond the reach of
+    /// anything the server sends, and every value it does send is percent-encoded
+    /// into the one slot it was given. A `format!` would hand all of that back.
+    ///
+    /// # Errors
+    /// `oauth` if any server-supplied value fails
+    /// [`check_authorization_parameter`].
+    fn with_redirect(started: &OAuthStartResponse, redirect_uri: &str) -> CommandResult<String> {
+        // Destructured rather than read field by field, so that a field added to
+        // `OAuthStartResponse` later stops this compiling until someone decides
+        // whether it belongs in the URL and what checks it. `started.client_id`
+        // and friends would have taken a new field in silence, and neither the
+        // parameter count asserted below nor the test's field list would have
+        // said so. `app_secret` is named here to be refused: it is the one value
+        // that must never travel through a browser.
+        let OAuthStartResponse { client_id, state, nonce, code_challenge, app_secret: _ } = started;
+        let parameters = [
+            ("client_id", client_id.as_str()),
+            ("state", state.as_str()),
+            ("nonce", nonce.as_str()),
+            ("code_challenge", code_challenge.as_str()),
+        ];
+        for (name, value) in parameters {
+            check_authorization_parameter(name, value)?;
+        }
+        // Composed from the array that was just checked, so a value cannot be
+        // validated and then a different one used — these four names now mean the
+        // checked values rather than the raw fields. The binding is positional:
+        // reordering the array above swaps two of these silently, and what catches
+        // that is `the_composed_url_is_googles_own_sign_in_page`, which gives each
+        // parameter a distinct value.
+        let [client_id, state, nonce, code_challenge] = parameters.map(|(_, value)| value);
+        let url = url::Url::parse_with_params(
+            GOOGLE_AUTHORIZATION_ENDPOINT,
+            [
+                ("client_id", client_id),
+                ("redirect_uri", redirect_uri),
+                ("response_type", "code"),
+                ("scope", GOOGLE_SCOPE),
+                ("state", state),
+                ("nonce", nonce),
+                ("code_challenge", code_challenge),
+                ("code_challenge_method", "S256"),
+                // Always show the chooser: without it a user with several Google
+                // accounts silently signs in as whichever one the browser has.
+                ("prompt", "select_account"),
+            ],
+        )
+        // The base is a literal, so this is unreachable unless someone edits it
+        // into something that is not a URL.
+        .map_err(|e| CommandError::new("oauth", format!("could not build the sign-in address: {e}")))?;
+        Ok(url.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The loopback address the app's own redirect listener hands out.
+        const REDIRECT: &str = "http://127.0.0.1:49152/callback";
+
+        /// A response of the shape `/oauth/start` returns, with values that pass
+        /// the parameter check so a test can doctor one of them and see only that
+        /// change refused.
+        fn start_response() -> OAuthStartResponse {
+            OAuthStartResponse {
+                client_id: "1234567890-abcdef.apps.googleusercontent.com".into(),
+                state: "state-token".into(),
+                nonce: "nonce-token".into(),
+                code_challenge: "challenge-token".into(),
+                app_secret: Zeroizing::new("app-secret".into()),
+            }
+        }
+
+        /// Where the browser goes, and what it asks for, are this app's to decide.
+        /// The server used to send the whole URL; what it sends now cannot reach
+        /// the scheme, the host, the path, the scope or the prompt.
+        #[test]
+        fn the_composed_url_is_googles_own_sign_in_page() {
+            let url = with_redirect(&start_response(), REDIRECT).unwrap();
+            let parsed = url::Url::parse(&url).unwrap();
+            assert_eq!(parsed.scheme(), "https");
+            assert_eq!(parsed.host_str(), Some("accounts.google.com"));
+            assert_eq!(parsed.port(), None);
+            assert_eq!(parsed.path(), "/o/oauth2/v2/auth");
+
+            let parameters: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+            assert_eq!(parameters["client_id"], "1234567890-abcdef.apps.googleusercontent.com");
+            assert_eq!(parameters["redirect_uri"], REDIRECT);
+            assert_eq!(parameters["response_type"], "code");
+            assert_eq!(parameters["scope"], "openid email");
+            assert_eq!(parameters["state"], "state-token");
+            assert_eq!(parameters["nonce"], "nonce-token");
+            assert_eq!(parameters["code_challenge"], "challenge-token");
+            assert_eq!(parameters["code_challenge_method"], "S256");
+            // Without this a user with several Google accounts is signed in as
+            // whichever one the browser already holds, with nothing to notice.
+            assert_eq!(parameters["prompt"], "select_account");
+            assert_eq!(parameters.len(), 9, "an unexpected parameter is as much a change as a missing one");
+            // The parameter count above catches `app_secret` arriving as a tenth
+            // pair; this catches it arriving as the value of one of the nine.
+            // It is the piece that binds the flow to this app, it is handed over
+            // the app's own HTTPS connection, and a browser would put it in the
+            // address bar, the history and the referer.
+            assert!(!url.contains("app-secret"), "the app secret must never travel through the browser");
+        }
+
+        /// The property the server-supplied values rest on: the composition
+        /// encodes into one slot rather than concatenating, so no value can add a
+        /// parameter or truncate the URL with a fragment.
+        ///
+        /// The redirect is the app's own address and so is not an attack — it is
+        /// simply the one parameter the character check does not screen, which
+        /// makes it the only way to put a reserved character through the
+        /// composition and watch what comes out.
+        #[test]
+        fn a_value_cannot_escape_the_parameter_it_was_put_in() {
+            let hostile =
+                "http://127.0.0.1:49152/callback?x=1&scope=https://www.googleapis.com/auth/drive&prompt=none#f";
+            let url = with_redirect(&start_response(), hostile).unwrap();
+            let parsed = url::Url::parse(&url).unwrap();
+
+            assert_eq!(parsed.host_str(), Some("accounts.google.com"));
+            assert_eq!(parsed.fragment(), None, "a # in a value must not end the URL early");
+            let parameters: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+            assert_eq!(parameters.len(), 9);
+            assert_eq!(parameters["redirect_uri"], hostile, "the whole string belongs in its own slot");
+            assert_eq!(parameters["scope"], "openid email");
+            assert_eq!(parameters["prompt"], "select_account");
+        }
+
+        /// The second layer. These values are opaque tokens and a client id;
+        /// anything that is not one of those is refused before the platform URL
+        /// handler is handed anything at all.
+        #[test]
+        fn values_that_are_not_opaque_tokens_are_refused() {
+            for bad in [
+                "",
+                "&scope=https://www.googleapis.com/auth/drive",
+                "token#fragment",
+                "token?query",
+                "token with spaces",
+                "token\nnewline",
+                "tokén",
+                "token%2Fencoded",
+                &"x".repeat(MAX_OPAQUE_VALUE_LEN + 1),
+            ] {
+                for field in ["client_id", "state", "nonce", "code_challenge"] {
+                    let mut started = start_response();
+                    match field {
+                        "client_id" => started.client_id = bad.into(),
+                        "state" => started.state = bad.into(),
+                        "nonce" => started.nonce = bad.into(),
+                        "code_challenge" => started.code_challenge = bad.into(),
+                        // A catch-all arm would quietly send a newly listed field
+                        // to whichever one it named, and the test would pass
+                        // without ever having touched it.
+                        other => unreachable!("{other} is not a field this test knows how to doctor"),
+                    }
+                    let error = with_redirect(&started, REDIRECT)
+                        .expect_err("a value outside the permitted set must be refused");
+                    assert_eq!(error.code, "oauth", "{field} of {bad:?}");
+                    // Nothing is opened, so the sentence is the entire product of
+                    // the refusal; it has to say which value was wrong.
+                    assert!(error.message.contains(field), "{field} of {bad:?}: {}", error.message);
+                }
+            }
+        }
+
+        /// A real response passes. A check that refuses everything is not a check.
+        #[test]
+        fn an_ordinary_response_composes() {
+            assert!(with_redirect(&start_response(), REDIRECT).is_ok());
+            for token in
+                ["A-Za-z0-9", "with.dots", "with_underscores", "with~tildes", &"x".repeat(MAX_OPAQUE_VALUE_LEN)]
+            {
+                let mut started = start_response();
+                started.nonce = token.into();
+                assert!(with_redirect(&started, REDIRECT).is_ok(), "{token} must be accepted");
+            }
+        }
+
+        /// Every other test here reaches `with_redirect`, so without this the one
+        /// line the module boundary exists to protect — `compose` passing the
+        /// listener's own address and not some other string — is covered by
+        /// nothing.
+        #[tokio::test]
+        async fn the_entry_point_uses_the_listeners_own_address() {
+            let listener = RedirectListener::bind().await.expect("a loopback listener must bind");
+            let url = compose(&start_response(), &listener).unwrap();
+            let parsed = url::Url::parse(&url).unwrap();
+            let parameters: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+            assert_eq!(parameters["redirect_uri"], listener.redirect_uri());
+        }
+    }
 }
 
 /// Run the browser half of a sign-in and hand back the code it produced.
@@ -895,7 +1048,7 @@ async fn authorize_with_google(
     // Google password into Google's own window, where they can see the URL.
     // Which window that is, is this app's to decide and not the server's; see
     // `compose_authorization_url`.
-    let authorization_url = compose_authorization_url(&started, &listener)?;
+    let authorization_url = authorization_url::compose(&started, &listener)?;
     app.opener()
         .open_url(authorization_url, None::<&str>)
         .map_err(|e| CommandError::new("oauth", format!("could not open your browser: {e}")))?;
@@ -2173,9 +2326,6 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    /// The loopback address the app's own redirect listener hands out.
-    const REDIRECT: &str = "http://127.0.0.1:49152/callback";
-
     /// "Clear now" and the timer must not both act on one copy: whichever
     /// runs first takes the digest and the other finds nothing to clear.
     #[test]
@@ -2188,124 +2338,6 @@ mod tests {
     #[test]
     fn nothing_copied_means_nothing_to_clear() {
         assert_eq!(take_copied_digest(&Mutex::new(None)), None);
-    }
-
-    /// A response of the shape `/oauth/start` returns, with values that pass
-    /// the parameter check so a test can doctor one of them and see only that
-    /// change refused.
-    fn start_response() -> OAuthStartResponse {
-        OAuthStartResponse {
-            client_id: "1234567890-abcdef.apps.googleusercontent.com".into(),
-            state: "state-token".into(),
-            nonce: "nonce-token".into(),
-            code_challenge: "challenge-token".into(),
-            app_secret: Zeroizing::new("app-secret".into()),
-        }
-    }
-
-    /// Where the browser goes, and what it asks for, are this app's to decide.
-    /// The server used to send the whole URL; what it sends now cannot reach
-    /// the scheme, the host, the path, the scope or the prompt.
-    #[test]
-    fn the_composed_url_is_googles_own_sign_in_page() {
-        let url = compose_with_redirect(&start_response(), REDIRECT).unwrap();
-        let parsed = url::Url::parse(&url).unwrap();
-        assert_eq!(parsed.scheme(), "https");
-        assert_eq!(parsed.host_str(), Some("accounts.google.com"));
-        assert_eq!(parsed.port(), None);
-        assert_eq!(parsed.path(), "/o/oauth2/v2/auth");
-
-        let parameters: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(parameters["client_id"], "1234567890-abcdef.apps.googleusercontent.com");
-        assert_eq!(parameters["redirect_uri"], REDIRECT);
-        assert_eq!(parameters["response_type"], "code");
-        assert_eq!(parameters["scope"], "openid email");
-        assert_eq!(parameters["state"], "state-token");
-        assert_eq!(parameters["nonce"], "nonce-token");
-        assert_eq!(parameters["code_challenge"], "challenge-token");
-        assert_eq!(parameters["code_challenge_method"], "S256");
-        // Without this a user with several Google accounts is signed in as
-        // whichever one the browser already holds, with nothing to notice.
-        assert_eq!(parameters["prompt"], "select_account");
-        assert_eq!(parameters.len(), 9, "an unexpected parameter is as much a change as a missing one");
-        // The parameter count above catches `app_secret` arriving as a tenth
-        // pair; this catches it arriving as the value of one of the nine.
-        // It is the piece that binds the flow to this app, it is handed over
-        // the app's own HTTPS connection, and a browser would put it in the
-        // address bar, the history and the referer.
-        assert!(!url.contains("app-secret"), "the app secret must never travel through the browser");
-    }
-
-    /// The property the server-supplied values rest on: the composition
-    /// encodes into one slot rather than concatenating, so no value can add a
-    /// parameter or truncate the URL with a fragment.
-    ///
-    /// The redirect is the app's own address and so is not an attack — it is
-    /// simply the one parameter the character check does not screen, which
-    /// makes it the only way to put a reserved character through the
-    /// composition and watch what comes out.
-    #[test]
-    fn a_value_cannot_escape_the_parameter_it_was_put_in() {
-        let hostile = "http://127.0.0.1:49152/callback?x=1&scope=https://www.googleapis.com/auth/drive&prompt=none#f";
-        let url = compose_with_redirect(&start_response(), hostile).unwrap();
-        let parsed = url::Url::parse(&url).unwrap();
-
-        assert_eq!(parsed.host_str(), Some("accounts.google.com"));
-        assert_eq!(parsed.fragment(), None, "a # in a value must not end the URL early");
-        let parameters: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(parameters.len(), 9);
-        assert_eq!(parameters["redirect_uri"], hostile, "the whole string belongs in its own slot");
-        assert_eq!(parameters["scope"], "openid email");
-        assert_eq!(parameters["prompt"], "select_account");
-    }
-
-    /// The second layer. These values are opaque tokens and a client id;
-    /// anything that is not one of those is refused before the platform URL
-    /// handler is handed anything at all.
-    #[test]
-    fn values_that_are_not_opaque_tokens_are_refused() {
-        for bad in [
-            "",
-            "&scope=https://www.googleapis.com/auth/drive",
-            "token#fragment",
-            "token?query",
-            "token with spaces",
-            "token\nnewline",
-            "tokén",
-            "token%2Fencoded",
-            &"x".repeat(MAX_OPAQUE_VALUE_LEN + 1),
-        ] {
-            for field in ["client_id", "state", "nonce", "code_challenge"] {
-                let mut started = start_response();
-                match field {
-                    "client_id" => started.client_id = bad.into(),
-                    "state" => started.state = bad.into(),
-                    "nonce" => started.nonce = bad.into(),
-                    "code_challenge" => started.code_challenge = bad.into(),
-                    // A catch-all arm would quietly send a newly listed field
-                    // to whichever one it named, and the test would pass
-                    // without ever having touched it.
-                    other => unreachable!("{other} is not a field this test knows how to doctor"),
-                }
-                let error = compose_with_redirect(&started, REDIRECT)
-                    .expect_err("a value outside the permitted set must be refused");
-                assert_eq!(error.code, "oauth", "{field} of {bad:?}");
-                // Nothing is opened, so the sentence is the entire product of
-                // the refusal; it has to say which value was wrong.
-                assert!(error.message.contains(field), "{field} of {bad:?}: {}", error.message);
-            }
-        }
-    }
-
-    /// A real response passes. A check that refuses everything is not a check.
-    #[test]
-    fn an_ordinary_response_composes() {
-        assert!(compose_with_redirect(&start_response(), REDIRECT).is_ok());
-        for token in ["A-Za-z0-9", "with.dots", "with_underscores", "with~tildes", &"x".repeat(MAX_OPAQUE_VALUE_LEN)] {
-            let mut started = start_response();
-            started.nonce = token.into();
-            assert!(compose_with_redirect(&started, REDIRECT).is_ok(), "{token} must be accepted");
-        }
     }
 
     #[test]

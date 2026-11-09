@@ -1047,7 +1047,7 @@ async fn authorize_with_google(
     // The system browser, not the app webview: the user should be typing a
     // Google password into Google's own window, where they can see the URL.
     // Which window that is, is this app's to decide and not the server's; see
-    // `compose_authorization_url`.
+    // `authorization_url::compose`.
     let authorization_url = authorization_url::compose(&started, &listener)?;
     app.opener()
         .open_url(authorization_url, None::<&str>)

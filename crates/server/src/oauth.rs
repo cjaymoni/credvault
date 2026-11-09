@@ -520,12 +520,12 @@ mod tests {
     }
 
     /// The parameters that used to be asserted here are now composed by the
-    /// client, and `compose_authorization_url` in the desktop crate owns that
+    /// client, and `authorization_url::compose` in the desktop crate owns that
     /// contract along with its tests. What is left on this side is the single
     /// value a provider contributes to that URL. That it is the only one is
     /// enforced by the trait having one method, not by a test.
     #[test]
-    fn the_provider_publishes_only_its_client_id() {
+    fn the_provider_publishes_its_client_id() {
         let provider =
             GoogleProvider::new(GoogleConfig::new("client-123".into(), Zeroizing::new("secret".into()))).unwrap();
         assert_eq!(provider.client_id(), "client-123");

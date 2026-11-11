@@ -1,0 +1,7 @@
+# Pinned so a new lint in a Rust release cannot fail the release gate, which
+# runs clippy with `-D warnings`, on code that did not change. Raise it
+# deliberately, with the clippy run green, rather than by being the first
+# person to build on a Monday.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

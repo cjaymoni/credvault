@@ -1,4 +1,7 @@
 target/
+# where the release workflow's collect step gathers the bundles; running it
+# by hand to reproduce a problem should not leave anything to commit
+dist/
 *.db
 *.db-*
 .DS_Store

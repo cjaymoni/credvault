@@ -21,7 +21,7 @@ openssl rand -base64 32          # paste into CREDVAULT_REGISTRATION_TOKEN
 chmod 600 .env                   # the token is a credential
 $EDITOR .env                     # set domain and ACME email too
 docker compose up -d --build
-curl https://vault.example.com/health   # expects: {"status":"ok","protocol":1,...}
+curl https://vault.example.com/health   # expects: {"status":"ok","protocol":3,...}
 ```
 
 The first build compiles the whole dependency tree and takes a while on a
@@ -110,7 +110,7 @@ instead of failing one request at a time.
 
 ```sh
 curl -s https://vault.example.com/health
-# {"status":"ok","protocol":1,"min_client_protocol":1}
+# {"status":"ok","protocol":3,"min_client_protocol":1}
 ```
 
 If an upgrade raises `min_client_protocol`, clients below it stop working the

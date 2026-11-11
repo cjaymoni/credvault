@@ -1,0 +1,347 @@
+# Builds the desktop app for macOS, Windows and Linux and attaches the
+# installers to a GitHub release.
+#
+# Pushing a tag `vX.Y.Z` runs the whole thing and leaves a **draft** release
+# holding the installers. Drafts are deliberate: the bundles are unsigned, so
+# whoever publishes should read the notes once more and decide that is still
+# the right trade before anyone can download them.
+#
+# Running it by hand (Actions -> Release -> Run workflow) builds the same
+# bundles and keeps them as workflow artifacts without touching a release, so
+# the build can be fixed without spending tags on it.
+#
+# The gate that decides whether a release happens lives in ci.yml, which runs
+# the same checks on every pull request. This workflow runs them again on the
+# tagged commit rather than trusting that the tag points at something CI saw.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read-only by default. Only the two short jobs that touch a release raise it
+# for themselves; in particular the build jobs, which compile the dependency
+# tree and so run every build script and proc macro in it, cannot write one.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a release is reproducible from its tag, and so a CLI release
+  # cannot change what the bundles are the day after a green run. The same
+  # reasoning pins the toolchain (rust-toolchain.toml), node, the runner
+  # images, and the actions below, which are pinned to commits because a tag
+  # can be moved.
+  TAURI_CLI_VERSION: 2.12.4
+  CARGO_AUDIT_VERSION: 0.23.0
+  NODE_VERSION: "26"
+
+jobs:
+  # Nothing is built, and no release exists, until the suite passes on the
+  # tagged commit.
+  check:
+    name: Tests, format, clippy, audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The desktop crate links against the system webview, so even `cargo
+      # test` needs these on Linux.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libgtk-3-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          # The registry and the git database only. Nothing executable is
+          # restored from a cache into a job that builds a release.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-check-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-check-${{ runner.os }}-
+
+      # A tag that disagrees with the version in the manifests would ship
+      # installers named after one version from a tag named after another.
+      # Checked here rather than at bundling time, where three platforms would
+      # each discover it separately after a long build.
+      #
+      # Only exact versions pass, so `v0.1.0-rc1` fails against a manifest
+      # reading `0.1.0`. That is deliberate: a pre-release tag would need the
+      # manifests to carry the suffix too, or the installers inside it are
+      # named as the real thing.
+      - name: Tag matches the version in the manifests
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          bundle="$(jq -r .version apps/desktop/tauri.conf.json)"
+          echo "tag=$tag workspace=$crate tauri.conf.json=$bundle"
+          if [ "$tag" != "$crate" ] || [ "$tag" != "$bundle" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml ($crate) and tauri.conf.json ($bundle)"
+            exit 1
+          fi
+
+      # --locked throughout: a build that silently resolved a different
+      # dependency set is not the build the lockfile describes, and a release
+      # is the last place to find that out.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      # The editor logic and the colour tokens; see apps/desktop/ui-tests/.
+      - run: node --test apps/desktop/ui-tests/
+
+      # .cargo/audit.toml carries one exemption with an argument that depends
+      # on the MySQL driver staying unselected, and a note to re-check it on
+      # any sqlx upgrade. This is what re-checks it.
+      - name: Advisory scan
+        run: |
+          set -euo pipefail
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+          cargo audit
+
+  # One job creates the draft, so three bundle jobs cannot race to create it.
+  draft:
+    name: Create the draft release
+    needs: check
+    # On the event as well as the ref: the Run-workflow dropdown can be
+    # pointed at a tag, and gating on the ref alone would let a hand-run
+    # create or overwrite a release that the person believed it could not.
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Create or reuse the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Re-running a tag is fine while the release is still a draft.
+            # Once it is published people may be downloading it, and the
+            # upload step would replace assets underneath them.
+            if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "::error::release $GITHUB_REF_NAME is already published; delete it or cut a new tag"
+              exit 1
+            fi
+            # Note that the notes are written once, at creation: a re-run of
+            # the same tag keeps the ones it already has, so an edit to
+            # .github/release-notes.md needs editing on the release too.
+            echo "draft $GITHUB_REF_NAME already exists; reusing it"
+            exit 0
+          fi
+          # The notes link testers at the deploy guide, and they are attached
+          # to an immutable tag that tells them the server must come from this
+          # same release -- so the link has to point at this tag rather than
+          # at a branch that will have moved by the time they follow it.
+          sed "s|__TAG__|$GITHUB_REF_NAME|g" .github/release-notes.md > /tmp/release-notes.md
+          if grep -q __TAG__ /tmp/release-notes.md; then
+            echo "::error::a __TAG__ placeholder survived substitution"
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release-notes.md
+
+  bundle:
+    name: ${{ matrix.name }}
+    needs: [check, draft]
+    # `draft` is skipped on a manual run, which would skip this too without
+    # the first clause; the second stops three long builds from starting when
+    # the cheap release step has already failed on a tag run.
+    if: ${{ !cancelled() && needs.check.result == 'success' && needs.draft.result != 'failure' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not throw away bundles that did build;
+      # the artifacts survive for whoever fixes it.
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (universal)
+            os: macos-14
+            # Built for both architectures as one bundle so there is a single
+            # download rather than a choice testers have to get right.
+            target: universal-apple-darwin
+            bundles: dmg,app
+            artifacts: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          - name: Linux (x86_64)
+            # 22.04 rather than 24.04 for the AppImage: it links against the
+            # older glibc, so the result runs on more distributions. Still a
+            # supported image (actions/runner-images was publishing ubuntu22
+            # as of 2026-11); when it retires, moving up narrows who can run
+            # the Linux build.
+            os: ubuntu-22.04
+            target: ""
+            # deb and AppImage only: between them they cover the distributions
+            # testers are likely to be on, and rpm packaging pulls in tooling
+            # that has nothing to do with what is being tested.
+            bundles: deb,appimage
+            artifacts: |
+              target/release/bundle/deb/*.deb
+              target/release/bundle/appimage/*.AppImage
+          - name: Windows (x86_64)
+            # Pinned like the others. On `windows-latest` the day GitHub moves
+            # the alias, the MSI and the NSIS installer are built against a
+            # different SDK and VC runtime than the last green run, with
+            # nothing in the repository having changed.
+            os: windows-2022
+            target: ""
+            bundles: msi,nsis
+            artifacts: |
+              target/release/bundle/msi/*.msi
+              target/release/bundle/nsis/*-setup.exe
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libgtk-3-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - name: Add the macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          # Sources only. ~/.cargo/bin is deliberately not cached: the Tauri
+          # CLI is what builds and names the installers, and a cached
+          # executable is of no verifiable provenance -- a freshness check
+          # would accept anything that printed the right version string. So
+          # the CLI is compiled on every run instead, which costs a couple of
+          # minutes and is the cheaper side of the trade.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-bundle-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-bundle-${{ matrix.os }}-
+
+      - name: Install the Tauri CLI
+        shell: bash
+        run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - name: Build the bundles
+        shell: bash
+        working-directory: apps/desktop
+        env:
+          # Through the environment rather than interpolated into the script,
+          # so the safety of a matrix value is not something to re-derive
+          # every time the matrix grows.
+          TARGET: ${{ matrix.target }}
+          BUNDLES: ${{ matrix.bundles }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TARGET" ]; then
+            cargo tauri build --target "$TARGET" --bundles "$BUNDLES" -- --locked
+          else
+            cargo tauri build --bundles "$BUNDLES" -- --locked
+          fi
+
+      # Collected into one flat directory first. upload-artifact roots an
+      # artifact at the least common ancestor of its search paths, so the
+      # platforms that produce two kinds of bundle would otherwise keep their
+      # `deb/` and `msi/` parent directories while macOS, with a single path,
+      # would not -- and the job that attaches them would be matching three
+      # different layouts. Flat is also what someone downloading a dry-run
+      # artifact to inspect it wants.
+      - name: Collect the bundles
+        shell: bash
+        env:
+          ARTIFACTS: ${{ matrix.artifacts }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p dist
+          while IFS= read -r pattern; do
+            [ -z "${pattern//[[:space:]]/}" ] && continue
+            matches=( $pattern )
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::error::no bundle matched $pattern"
+              exit 1
+            fi
+            cp "${matches[@]}" dist/
+          done <<< "$ARTIFACTS"
+          ls -l dist
+
+      # The bundles leave this job as artifacts and nothing else; attaching
+      # them to the release is a separate job with a token that can.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: credvault-${{ matrix.os }}
+          path: dist
+          if-no-files-found: error
+
+  attach:
+    name: Attach the bundles to the release
+    needs: [draft, bundle]
+    # Every platform must have built. A release holding two of the three
+    # installers is worse than a draft holding none: the missing platform
+    # looks unsupported rather than unfinished.
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.bundle.result == 'success' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: bundles
+          pattern: credvault-*
+          merge-multiple: true
+
+      - name: Attach them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job has no checkout -- there is nothing in the repository it
+          # needs -- so gh cannot infer the repository from a git remote.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # Asserted by shape rather than by count, so a renamed bundle is
+          # reported as the platform it belongs to.
+          required=( "*.dmg" "*.deb" "*.AppImage" "*.msi" "*-setup.exe" )
+          files=()
+          for pattern in "${required[@]}"; do
+            matches=( bundles/$pattern )
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::error::no bundle matched $pattern"
+              exit 1
+            fi
+            files+=( "${matches[@]}" )
+          done
+          printf 'uploading %s\n' "${files[@]}"
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber

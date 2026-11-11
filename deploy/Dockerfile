@@ -1,6 +1,9 @@
 # Build context is the repository root:
 #   docker build -f deploy/Dockerfile .
-FROM rust:1.83-bookworm AS build
+# Matches rust-toolchain.toml. If it does not, this image still builds -- the
+# official rust image carries rustup, which honours the toolchain file -- but
+# it downloads a second toolchain on every deploy build to do it.
+FROM rust:1.99-bookworm AS build
 WORKDIR /app
 COPY . .
 # Only the server is built. The desktop app is a workspace member, so its

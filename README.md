@@ -11,6 +11,22 @@ ability to share a single secret with another person.
 > builds. Run a client and a server built from the same commit, against a
 > database that commit created. The server holds only ciphertext, so it cannot
 > rewrite a vault into a new format on anyone's behalf.
+>
+> So: use throwaway credentials, or expect to type everything in again. Each
+> build reads its own formats and refuses the rest rather than guessing, and
+> there is no password recovery, so an upgrade can leave a vault no build can
+> open and nobody can rescue.
+
+## Install
+
+Installers for macOS, Windows and Linux are attached to each
+[release](https://github.com/cjaymoni/credvault/releases); the release notes
+say how to get past the warning each platform shows for an unsigned build.
+Building from source instead is under [Build](#build) below.
+
+You also need somewhere to connect to. Running a server is
+[deploy/README.md](deploy/README.md); for a look around on your own machine,
+`cargo run -p credvault-server` and the default address in the app are enough.
 
 ## How the security works
 

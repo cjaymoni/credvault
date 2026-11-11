@@ -21,6 +21,38 @@ ignore = [
     # Re-check on any sqlx upgrade: the argument depends on the MySQL driver
     # staying unselected.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0459 - CVE-2026-119375, a memory disclosure in the C SQLite
+    # bundled by `libsqlite3-sys`. Opening a database alongside a `-wal` file
+    # whose page size disagrees with it can make ordinary queries return
+    # uninitialised page-cache memory. Fixed in libsqlite3-sys 0.39.0
+    # (SQLite 3.54.0).
+    #
+    # There is no version to move to. sqlx-sqlite pins
+    # `libsqlite3-sys >=0.30.1, <0.38.0`, in 0.9.0 as in the 0.8 series this
+    # build uses, so the whole sqlx line is below the fix. Linking the system
+    # library instead would not help either: the deploy image is
+    # debian:bookworm-slim, whose SQLite is older still.
+    #
+    # Not reachable here. The attack is local and needs the victim to open a
+    # database file and a matching `-wal` that someone less trusted wrote.
+    # This server opens exactly one database, the one it created itself, in a
+    # data directory it makes with mode 0700 and a file it writes with mode
+    # 0600 (crates/server/src/main.rs; both are #[cfg(unix)], which covers
+    # every platform this is deployed on -- the image is debian:bookworm-slim).
+    # No request can introduce a database file, name one, or influence which
+    # one is opened: the path is `--data-dir`, or `$HOME/.credvault-server`
+    # when the flag is absent, and either way it comes from whoever starts the
+    # process rather than from anything sent to it. The only person who can
+    # put a foreign database there is whoever runs the server, restoring their
+    # own backup, which is the documented procedure in deploy/README.md. sqlx
+    # is in the server alone; neither the desktop app nor core links SQLite.
+    #
+    # Drop this the moment sqlx widens its libsqlite3-sys range. Unlike the
+    # entry above, nothing about this one is structural -- it is a wait for an
+    # upstream bound to move, and the advisory scan in CI is what will keep
+    # asking.
+    "RUSTSEC-2026-0459",
 ]
 
 # Unmaintained and unsound crates are reported rather than ignored. They are

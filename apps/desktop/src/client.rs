@@ -351,6 +351,13 @@ impl ApiClient {
         let response = self.send_retrying_connects(|| self.http.get(&url)).await?;
         let status = response.status();
         if !status.is_success() {
+            // Before the generic message, because this is the first request a
+            // newly typed address ever gets: `connect` runs it before anything
+            // else, so a redirect that is only reported as a status code
+            // stops someone here with the one thing they need withheld.
+            if let Some(redirect) = redirected_to(status, response.headers()) {
+                return Err(ClientError::Server(redirect));
+            }
             return Err(ClientError::Server(format!("the server's health check returned {status}")));
         }
         response.json().await.map_err(|_| {
@@ -512,6 +519,10 @@ impl ApiClient {
     }
 }
 
+/// How much of a server-supplied `Location` is worth showing. Long enough for
+/// any real address, short enough that a banner stays readable.
+const MAX_SHOWN_LOCATION_CHARS: usize = 200;
+
 /// Why a redirect this client will not follow is the end of the request, said
 /// in a way the person who configured the address can act on.
 ///
@@ -528,7 +539,15 @@ fn redirected_to(status: StatusCode, headers: &reqwest::header::HeaderMap) -> Op
     let destination = headers
         .get(reqwest::header::LOCATION)
         .and_then(|location| location.to_str().ok())
-        .map(|location| format!(" to {location}"))
+        .map(|location| {
+            // The far end chooses this and there is no length it has to
+            // respect. Enough to recognise an address by, not enough to fill
+            // the screen with.
+            match location.char_indices().nth(MAX_SHOWN_LOCATION_CHARS) {
+                Some((cut, _)) => format!(" to {}...", &location[..cut]),
+                None => format!(" to {location}"),
+            }
+        })
         .unwrap_or_default();
     Some(format!(
         "the server redirected this request{destination}, which this app does not follow; \
@@ -581,6 +600,31 @@ fn urlencode(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn the_first_request_a_new_server_gets_names_a_redirect_too() {
+        // `connect` runs `health` before anything else, so this is where a
+        // wrongly configured address is actually met -- and it has a status
+        // ladder of its own, which is how it missed the fix the first time.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = read_until_marker(&mut stream, "\r\n\r\n").await;
+                    let response = "HTTP/1.1 301 Moved Permanently\r\nLocation: https://www.example.test/health\r\ncontent-length: 0\r\n\r\n";
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let api = ApiClient::new(&format!("http://127.0.0.1:{port}")).unwrap();
+        let Err(ClientError::Server(message)) = api.health().await else {
+            panic!("a redirected health check is a failure");
+        };
+        assert!(message.contains("https://www.example.test/health"), "the address must be named: {message}");
+    }
+
     #[test]
     fn a_redirect_is_reported_with_the_address_it_pointed_at() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -592,6 +636,12 @@ mod tests {
         // has to be reported rather than read as the server's answer.
         let bare = redirected_to(StatusCode::FOUND, &reqwest::header::HeaderMap::new());
         assert!(bare.is_some(), "a Location-less redirect must still be an error");
+
+        // A server choosing an enormous Location must not fill the banner.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::LOCATION, "h".repeat(5_000).parse().unwrap());
+        let long = redirected_to(StatusCode::FOUND, &headers).expect("still a redirect");
+        assert!(long.len() < MAX_SHOWN_LOCATION_CHARS + 200, "the address must be cut short: {} chars", long.len());
 
         for not_a_redirect in [StatusCode::OK, StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
             assert_eq!(redirected_to(not_a_redirect, &reqwest::header::HeaderMap::new()), None, "{not_a_redirect}");
@@ -825,7 +875,7 @@ mod tests {
     /// then stops the sequence. Small enough to run in a blink.
     const TRUNCATED_RETRIES: ConnectRetries = ConnectRetries {
         backoffs: &[std::time::Duration::from_millis(50); 10],
-        budget: std::time::Duration::from_millis(175),
+        budget: std::time::Duration::from_millis(180),
     };
 
     #[tokio::test]
@@ -843,8 +893,10 @@ mod tests {
         let whole_table: std::time::Duration = TRUNCATED_RETRIES.backoffs.iter().sum();
         assert!(spent < whole_table / 2, "the budget must stop the sequence early: {spent:?} of {whole_table:?}");
         // 150ms, not 100: three waits fit the budget, and a bound of 100
-        // would also pass an off-by-one that took only two.
-        assert!(spent >= std::time::Duration::from_millis(150), "the waits that fit must be waited: {spent:?}");
+        // would also pass an off-by-one that took only two. The budget has a
+        // tick of room over those three (180 against 150) so that this asserts
+        // the count rather than the exact arithmetic of the comparison.
+        assert!(spent >= std::time::Duration::from_millis(150), "the three waits that fit must be waited: {spent:?}");
     }
 
     #[tokio::test]

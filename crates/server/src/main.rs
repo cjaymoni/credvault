@@ -358,6 +358,21 @@ fn restrict_file_permissions(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// One deterministic pseudo-random number, so a failure is reproducible
+    /// from the seed rather than only on the run that found it.
+    fn next_number(state: &mut u64) -> usize {
+        *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as usize
+    }
+
+    /// A short string of characters an operator could plausibly produce,
+    /// including the empty one, chosen by the generator rather than by anyone
+    /// deciding which cases are worth covering.
+    fn generated_value(state: &mut u64, alphabet: &[char]) -> String {
+        let length = next_number(state) % 7;
+        (0..length).map(|_| alphabet[next_number(state) % alphabet.len()]).collect()
+    }
+
     /// Mutates process environment, so it is one test rather than several:
     /// the others in this file read no environment at all.
     #[test]
@@ -442,6 +457,44 @@ mod tests {
         std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "abc123");
         normalize_env();
         assert!(Args::try_parse_from(["credvault-server"]).is_err(), "a token and closed together must be refused");
+
+        // Everything above this point is a list of values somebody chose, and
+        // four times running the defect was in a value nobody chose: `off`
+        // booted a public vault open to anyone while eight truthy spellings
+        // had tests, because the half that was tested was not the half that
+        // could do harm. Hand-picked cases only catch what the author already
+        // suspected.
+        //
+        // So stop choosing. The rule this setting exists to enforce is one
+        // sentence -- a server is open to anyone only when the operator wrote nothing,
+        // or wrote a spelling that means "not in use" -- and it can be checked against inputs neither the author
+        // nor the reviewer picked. Refusing to start is always an acceptable
+        // answer: it names the variable and is noticed at once. The only
+        // unacceptable outcome is a quiet Open nobody asked for.
+        let alphabet: Vec<char> =
+            "truefalseyesnoonff01 \t\n\r\u{a0}-_.,!TRUEYESNOOFF\u{ff34}\u{130}\u{c9}".chars().collect();
+        let mut seed = 0x5EED_0000_0001_u64;
+        for _ in 0..5_000 {
+            let closed = generated_value(&mut seed, &alphabet);
+            let token = generated_value(&mut seed, &alphabet);
+            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", &closed);
+            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", &token);
+            normalize_env();
+            let Ok(args) = Args::try_parse_from(["credvault-server"]) else { continue };
+            let policy = registration_policy(args.closed_registration, args.registration_token);
+            if matches!(policy, RegistrationPolicy::Open) {
+                // Spelled out here rather than read from BOOLISH on purpose.
+                // An oracle that derives the answer from the code it is
+                // judging widens when that code widens, which is exactly how
+                // `off` would slip back in unnoticed.
+                let written = closed.trim().to_ascii_lowercase();
+                let asked_for_open = matches!(written.as_str(), "" | "false" | "0");
+                assert!(
+                    asked_for_open && token.trim().is_empty(),
+                    "registration opened on input nobody asked to open: CLOSED={closed:?} TOKEN={token:?}"
+                );
+            }
+        }
 
         std::env::remove_var("CREDVAULT_CLOSED_REGISTRATION");
         std::env::remove_var("CREDVAULT_REGISTRATION_TOKEN");

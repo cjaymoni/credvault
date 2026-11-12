@@ -19,7 +19,11 @@ services:
       # Rate limits are keyed on the rightmost X-Forwarded-For address, which
       # is the one Caddy appends. Only correct behind the proxy below.
       CREDVAULT_TRUST_FORWARDED_FOR: "true"
-      CREDVAULT_REGISTRATION_TOKEN: ${CREDVAULT_REGISTRATION_TOKEN:?set this in .env}
+      # Blank leaves registration open to anyone who can reach the server, so
+      # set it for any host that is not loopback. Left interpolable rather
+      # than mandatory so a host can be opened briefly without editing this
+      # file; the server logs a warning for the whole time it is open.
+      CREDVAULT_REGISTRATION_TOKEN: ${CREDVAULT_REGISTRATION_TOKEN:-}
       # Optional; both blank keeps the server password-only. Clap requires
       # them together, so a lone value stops the server rather than quietly
       # running without the button.

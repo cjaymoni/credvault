@@ -48,6 +48,11 @@ should have accounts on this server.
   accounts are unaffected.
 - Stop new accounts entirely by replacing the token variable with
   `CREDVAULT_CLOSED_REGISTRATION=true`.
+- Leaving the token blank opens registration to anyone who can reach the
+  server, which is what you want on loopback and a deliberate decision
+  anywhere else. The app then shows no token field at all. The server says so
+  in its log on every start, so `docker compose logs credvault | grep
+  "registration is open"` tells you whether a host is open right now.
 
 ## Sign in with Google (optional)
 

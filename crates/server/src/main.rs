@@ -153,6 +153,32 @@ fn clear_blank_flag_env() {
     }
 }
 
+/// Which registrations the server accepts, from the two flags that decide it.
+///
+/// A blank token counts as no token, the same way a blank Google credential
+/// counts as none: `docker compose` turns an unset variable into an empty one
+/// and clap reports that as a value. Taken literally it would build a gate
+/// whose key is the empty string -- and no client can present that, because
+/// an empty field is sent as `null` and the policy refuses a missing token
+/// outright. The operator would have shut registration rather than opened it,
+/// and the server would look healthy while doing it.
+///
+/// Closed wins over a token: clap already refuses both at once, and the
+/// stricter of the two is the safe way to read a combination that got past it.
+fn registration_policy(closed: bool, token: Option<String>) -> RegistrationPolicy {
+    if closed {
+        return RegistrationPolicy::Closed;
+    }
+    // Trimmed for the same reason the Google credential is: a value out of a
+    // .env file routinely arrives with a trailing newline, and a token cannot
+    // legitimately begin or end with whitespace -- the client trims the field
+    // before sending it, so such a token could never be presented intact.
+    match token.map(|text| text.trim().to_string()).filter(|text| !text.is_empty()) {
+        Some(token) => RegistrationPolicy::Token(token),
+        None => RegistrationPolicy::Open,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     clear_blank_flag_env();
@@ -179,13 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let registration = if args.closed_registration {
-        RegistrationPolicy::Closed
-    } else if let Some(token) = args.registration_token {
-        RegistrationPolicy::Token(token)
-    } else {
-        RegistrationPolicy::Open
-    };
+    let registration = registration_policy(args.closed_registration, args.registration_token);
     if matches!(registration, RegistrationPolicy::Open) && !args.bind.ip().is_loopback() {
         tracing::warn!("registration is open on a non-loopback address; consider --registration-token");
     }
@@ -274,6 +294,33 @@ mod tests {
             clear_blank_flag_env();
             assert!(std::env::var(key).is_err());
         }
+    }
+
+    #[test]
+    fn a_blank_registration_token_opens_registration_rather_than_sealing_it() {
+        // The shapes compose and a .env file produce for "I did not set this".
+        for blank in [Some(String::new()), Some("   ".to_string()), Some("\n".to_string()), None] {
+            assert!(
+                matches!(registration_policy(false, blank.clone()), RegistrationPolicy::Open),
+                "{blank:?} must leave registration open, not gate it behind a token nobody can send",
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_token_gates_registration_and_keeps_its_own_value() {
+        let gated = registration_policy(false, Some("s3cret".into()));
+        assert!(matches!(&gated, RegistrationPolicy::Token(token) if token == "s3cret"));
+        // A .env file's trailing newline is not part of the token: the client
+        // trims the field, so a token carrying one could never be matched.
+        let trimmed = registration_policy(false, Some("  s3cret\n".into()));
+        assert!(matches!(&trimmed, RegistrationPolicy::Token(token) if token == "s3cret"));
+    }
+
+    #[test]
+    fn closed_registration_wins_over_a_token() {
+        assert!(matches!(registration_policy(true, None), RegistrationPolicy::Closed));
+        assert!(matches!(registration_policy(true, Some("s3cret".into())), RegistrationPolicy::Closed));
     }
 
     #[test]

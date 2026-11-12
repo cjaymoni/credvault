@@ -1028,13 +1028,18 @@ mod authorization_url {
     }
 }
 
-/// Run the browser half of a sign-in and hand back the code it produced.
+/// Run the browser half of a sign-in and hand back the code it produced,
+/// along with the client to spend it on.
 /// Shared by signing in and by linking, which differ only in purpose.
+///
+/// The returned client is not the one passed in. Everything after this point
+/// happens on the far side of a trip through the system browser, and the
+/// pooled connection does not survive that trip; see [`ApiClient::reconnect`].
 async fn authorize_with_google(
     app: &AppHandle,
     api: &ApiClient,
     purpose: OAuthPurpose,
-) -> CommandResult<OAuthCallbackRequest> {
+) -> CommandResult<(ApiClient, OAuthCallbackRequest)> {
     let listener = RedirectListener::bind()
         .await
         .map_err(|e| CommandError::new("oauth", format!("could not listen for the sign-in response: {e}")))?;
@@ -1057,7 +1062,8 @@ async fn authorize_with_google(
     // `app_secret` came back over this client's own HTTPS connection and was
     // never in the URL the browser followed, so returning it with the code is
     // what proves this app started the flow.
-    Ok(OAuthCallbackRequest { state: started.state, app_secret: started.app_secret, code })
+    let callback = OAuthCallbackRequest { state: started.state, app_secret: started.app_secret, code };
+    Ok((api.reconnect()?, callback))
 }
 
 /// What the server at `server_url` supports. Called before the sign-in screen
@@ -1084,7 +1090,7 @@ async fn google_sign_in(
 
     // Any earlier attempt is void the moment a new one starts.
     clear_pending_google(&state);
-    let callback = authorize_with_google(&app, &api, OAuthPurpose::SignIn).await?;
+    let (api, callback) = authorize_with_google(&app, &api, OAuthPurpose::SignIn).await?;
 
     let (pending, stage) = match api.oauth_callback(&callback).await? {
         OAuthCallbackResponse::SignedIn(session) => {
@@ -1227,7 +1233,7 @@ async fn google_link(
     // reading a consent screen in a browser. Dropped rather than held for it.
     drop(master);
 
-    let callback = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
+    let (api, callback) = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
     let profile =
         api.oauth_link(&OAuthLinkRequest::new(callback, Some(auth_hash))).await.map_err(passphrase_rejected)?;
     remember_google_email(&state, user_id, profile.google_email)

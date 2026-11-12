@@ -164,10 +164,50 @@ const BLANK_MEANS_UNSET: [&str; 5] = [
     "CREDVAULT_GOOGLE_CLIENT_SECRET",
 ];
 
-fn clear_blank_env() {
+/// The two settings clap parses as `bool`, which it accepts only as exactly
+/// `true` or `false`.
+const BOOL_FLAGS: [&str; 2] = ["CREDVAULT_CLOSED_REGISTRATION", "CREDVAULT_TRUST_FORWARDED_FOR"];
+
+/// Spellings an operator plausibly writes, and what each one means.
+///
+/// Anything outside this list still reaches clap, which stops the server and
+/// names the variable and the values it takes. That is a stop with a reason;
+/// what this table prevents is a stop over a capital letter.
+const BOOLISH: [(&str, &str); 8] = [
+    ("true", "true"),
+    ("yes", "true"),
+    ("on", "true"),
+    ("1", "true"),
+    ("false", "false"),
+    ("no", "false"),
+    ("off", "false"),
+    ("0", "false"),
+];
+
+/// Make the environment say what the operator meant, before clap reads it.
+///
+/// Two passes, both for the same reason: a value that is nearly right must not
+/// take the whole server down. Blank means unset (see [`BLANK_MEANS_UNSET`]),
+/// and a recognised spelling of a boolean becomes the one spelling clap takes.
+///
+/// Measured on the built binary before this existed: `CREDVAULT_CLOSED_REGISTRATION`
+/// set to `TRUE`, `True`, `1`, `yes`, or `true` with a trailing space each
+/// exited 2 with "invalid value". The README tells an operator to set that
+/// variable to stop new sign-ups, so a capital letter, or a line copied with a
+/// space, or a `.env` edited on Windows, turned "stop new accounts" into a
+/// container that crash-loops under `restart: unless-stopped` -- the sync
+/// service down for every existing user, with compose reporting success.
+fn normalize_env() {
     for key in BLANK_MEANS_UNSET {
         if std::env::var(key).is_ok_and(|value| value.trim().is_empty()) {
             std::env::remove_var(key);
+        }
+    }
+    for key in BOOL_FLAGS {
+        let Ok(value) = std::env::var(key) else { continue };
+        let written = value.trim().to_ascii_lowercase();
+        if let Some((_, canonical)) = BOOLISH.iter().find(|(spelling, _)| *spelling == written) {
+            std::env::set_var(key, canonical);
         }
     }
 }
@@ -198,9 +238,18 @@ fn registration_policy(closed: bool, token: Option<String>) -> RegistrationPolic
     }
 }
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before the runtime exists. `set_var`/`remove_var` are only sound while
+    // the process is single-threaded, and `#[tokio::main]` builds a
+    // multi-thread runtime -- workers and the IO driver are alive before the
+    // body runs. Nothing read the environment from those threads in practice,
+    // but it costs nothing to do this where it is actually defined.
+    normalize_env();
+    run()
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    clear_blank_env();
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -303,19 +352,19 @@ mod tests {
     fn a_blank_flag_variable_counts_as_unset_rather_than_stopping_the_server() {
         for key in BLANK_MEANS_UNSET {
             std::env::set_var(key, "");
-            clear_blank_env();
+            normalize_env();
             assert!(std::env::var(key).is_err(), "{key} blank should be removed");
 
             std::env::set_var(key, "   ");
-            clear_blank_env();
+            normalize_env();
             assert!(std::env::var(key).is_err(), "{key} whitespace should be removed");
 
             // A real value is left alone, and so is a variable nobody set.
             std::env::set_var(key, "true");
-            clear_blank_env();
+            normalize_env();
             assert_eq!(std::env::var(key).unwrap(), "true");
             std::env::remove_var(key);
-            clear_blank_env();
+            normalize_env();
             assert!(std::env::var(key).is_err());
         }
 
@@ -329,7 +378,7 @@ mod tests {
         {
             std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", closed);
             std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", token);
-            clear_blank_env();
+            normalize_env();
             let args = Args::try_parse_from(["credvault-server"]).unwrap_or_else(|e| {
                 panic!("compose produces CLOSED={closed:?} TOKEN={token:?}; clap must take it: {e}")
             });
@@ -337,10 +386,29 @@ mod tests {
             assert_eq!(policy.describe(), expected, "CLOSED={closed:?} TOKEN={token:?}");
         }
 
+        // Spellings of the documented value that an operator plausibly types.
+        // Each of these used to exit 2, which under `restart: unless-stopped`
+        // is a crash loop reached by capitalising a word.
+        for written in ["true", "TRUE", "True", "1", "yes", "on", "true ", "true\n"] {
+            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", written);
+            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "");
+            normalize_env();
+            let args = Args::try_parse_from(["credvault-server"])
+                .unwrap_or_else(|e| panic!("CLOSED={written:?} must not stop the server: {e}"));
+            let policy = registration_policy(args.closed_registration, args.registration_token);
+            assert_eq!(policy.describe(), "closed", "CLOSED={written:?}");
+        }
+
+        // Something that is not a spelling of anything still stops the server,
+        // because guessing at it is how a vault ends up open by accident.
+        std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", "maybe");
+        normalize_env();
+        assert!(Args::try_parse_from(["credvault-server"]).is_err(), "an unrecognised value must stop the server");
+
         // Asking for both at once is still refused rather than guessed at.
         std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", "true");
         std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "abc123");
-        clear_blank_env();
+        normalize_env();
         assert!(Args::try_parse_from(["credvault-server"]).is_err(), "a token and closed together must be refused");
 
         std::env::remove_var("CREDVAULT_CLOSED_REGISTRATION");
@@ -350,6 +418,11 @@ mod tests {
     /// Which service each documented setting has to reach. Everything the
     /// server reads belongs to `credvault`; the certificate pair is the
     /// proxy's.
+    ///
+    /// The default is the server, so a new proxy-only setting fails this test
+    /// by name rather than passing unnoticed. Add it to the match arm when it
+    /// does -- not to an exclusion list, which is what hid two settings here
+    /// before.
     fn owning_service(name: &str) -> &'static str {
         match name {
             "CREDVAULT_DOMAIN" | "CREDVAULT_ACME_EMAIL" => "caddy",
@@ -364,12 +437,27 @@ mod tests {
     /// in the *other* service, named only in a comment, or named on a line
     /// that is commented out.
     fn environment_of(compose: &str, service: &str) -> String {
-        let after = compose.split_once(&format!("\n  {service}:")).expect("service in compose").1;
-        let block = after.split_once("\n    environment:").expect("environment block").1;
-        block
-            .lines()
+        // Walked line by line rather than split on text. A service's body is
+        // indented past its name, so any substring boundary like "\n  " also
+        // matches the service's own lines; the boundary that means "the next
+        // service" is a line indented exactly to the service level.
+        let is_service = |line: &str| line.starts_with("  ") && !line.starts_with("   ");
+        let mut lines = compose.lines().skip_while(|line| line.trim_end() != format!("  {service}:"));
+        assert!(lines.next().is_some(), "no service `{service}:` in docker-compose.yml");
+
+        // Bounded to this service first, so one with no `environment:` of its
+        // own cannot borrow the next one's and pass -- deleting the block
+        // outright is the most extreme form of what this guards against.
+        let body: Vec<&str> = lines.take_while(|line| !is_service(line)).collect();
+        let mut after_key = body.iter().skip_while(|line| line.trim_end() != "    environment:").skip(1).peekable();
+        assert!(after_key.peek().is_some(), "service `{service}:` has no `environment:` block");
+
+        // Coupled to this file's two-space-per-level indentation: a reindent
+        // makes the block invisible and every setting reports as missing,
+        // which is the direction a brittle test should fail in.
+        after_key
             .take_while(|line| line.trim().is_empty() || line.starts_with("      "))
-            .map(|line| line.split_once('#').map_or(line, |(code, _)| code))
+            .map(|line| line.split_once('#').map_or(*line, |(code, _)| code))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -402,11 +490,17 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert!(documented.len() >= 4, "the docs should name several settings, found {documented:?}");
+        assert!(documented.contains("CREDVAULT_CLOSED_REGISTRATION"), "the close path must stay documented");
+        assert!(documented.contains("CREDVAULT_REGISTRATION_TOKEN"), "the token must stay documented");
 
         let missing: Vec<&String> = documented
             .iter()
-            .filter(|name| !environment_of(&compose, owning_service(name)).contains(&format!("{name}:")))
+            .filter(|name| {
+                // By key position, so `SOMETHING_ELSE: ${CREDVAULT_X:-}` does
+                // not count as delivering CREDVAULT_X under its own name.
+                let block = environment_of(&compose, owning_service(name));
+                !block.lines().any(|line| line.trim_start().starts_with(&format!("{name}:")))
+            })
             .collect();
         assert!(missing.is_empty(), "documented in deploy/ but never reaching their container: {missing:?}");
     }

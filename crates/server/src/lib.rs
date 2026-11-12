@@ -127,7 +127,11 @@ pub enum RegistrationPolicy {
 impl RegistrationPolicy {
     /// A short phrase for the log, so an operator can read which of the three
     /// states a server is in rather than inferring it from the absence of a
-    /// warning. Never the token itself.
+    /// warning.
+    ///
+    /// Never the token itself, and the `&'static str` is what guarantees it:
+    /// the payload is discarded at the match and no value could be formatted
+    /// in. Returning a `String` here would make that a matter of care again.
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Open => "open to anyone",

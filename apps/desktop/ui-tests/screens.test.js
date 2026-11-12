@@ -301,9 +301,31 @@ test("the server address stays reachable on a phone", () => {
   const js = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
 
   assert.match(css, /\.auth\.server-open #server-field\s*\{[^}]*display:\s*block/, "a state must re-show the field");
-  assert.match(html, /<button[^>]*id="btn-server-change"/, "the summary must be pressable, not a caption");
-  assert.match(js, /\$\("btn-server-change"\)\.onclick/, "pressing it must be wired to something");
-  assert.match(js, /classList\.add\("server-open"\)/, "and that something must open the field");
+  // The whole tag, so the one attribute that makes it work is pinned. The
+  // button sits inside <form id="auth-form">, where a missing type="button"
+  // is type="submit": every tap on the server line would submit the sign-in
+  // form instead of unfolding the field, which on a phone reads as "Enter
+  // your email." under the line the user was trying to edit.
+  const tag = html.match(/<button[^>]*id="btn-server-change"[^>]*>/);
+  assert.ok(tag, "the summary must be pressable, not a caption");
+  assert.match(tag[0], /type="button"/, "it must not submit the form it sits in");
+
+  // Captured rather than grepped, so the binding has to reach the function
+  // that opens the field. Four independent regexes over three files would
+  // pass with the handler bound to something else entirely, as long as the
+  // string appeared somewhere in app.js -- including in dead code.
+  const bound = js.match(/\$\("btn-server-change"\)\.onclick\s*=\s*(\w+)/);
+  assert.ok(bound, "pressing it must be wired to something");
+  const handler = js.match(new RegExp(`function ${bound[1]}\\(\\)\\s*\\{[^}]*\\}`));
+  assert.ok(handler, `${bound[1]}() must be a function in app.js`);
+  assert.match(handler[0], /classList\.add\("server-open"\)/, "and it must open the field");
+
+  // Clearing it on the way out is the part with no other guard: a later
+  // refactor that splits resetToSignedOut loses the folded line silently, and
+  // the next person to sign in sees the previous one's server already unfolded.
+  const reset = js.match(/function resetToSignedOut\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(reset, "resetToSignedOut must exist");
+  assert.match(reset[0], /classList\.remove\("server-open"\)/, "signing out must refold the server line");
 });
 
 test("a closed dialog stays closed: no dialog sets display outside [open]", () => {

@@ -511,12 +511,33 @@ mod tests {
         //
         // Checking only the first would let the fixes for it keep producing
         // the second, which is exactly what happened twice.
-        let seed_from_env = std::env::var("CREDVAULT_FUZZ_SEED").ok().and_then(|s| s.parse().ok());
-        let seed_used = seed_from_env.unwrap_or(0x5EED_0000_0001_u64);
+        // Parsed strictly. Falling back to the default on a malformed seed
+        // reports a pass for a run nobody asked for, and the literal below is
+        // written in hex, so `CREDVAULT_FUZZ_SEED=0x5EED0000001` is the first
+        // thing someone reproducing a failure would reach for.
+        let seed_used = match std::env::var("CREDVAULT_FUZZ_SEED") {
+            Ok(written) => {
+                let digits = written.trim().replace('_', "");
+                let parsed = match digits.strip_prefix("0x") {
+                    Some(hex) => u64::from_str_radix(hex, 16),
+                    None => digits.parse(),
+                };
+                parsed.unwrap_or_else(|_| panic!("CREDVAULT_FUZZ_SEED={written:?} is not a u64"))
+            }
+            Err(_) => 0x5EED_0000_0001_u64,
+        };
         let mut seed = seed_used;
         for _ in 0..5_000 {
             let closed = generated_value(&mut seed);
-            let token = generated_value(&mut seed);
+            // Empty about half the time on purpose. Drawn from the same word
+            // bag as `closed`, a token is non-empty ~96% of runs, and a
+            // non-empty token makes the pair either a `conflicts_with`
+            // refusal or a Token policy -- neither of which can tell a correct
+            // implementation from a broken one. Both assertions below can only
+            // discriminate on a blank token, so "5000 pairs" was overselling
+            // the reach by two orders of magnitude.
+            let token =
+                if next_number(&mut seed).is_multiple_of(2) { String::new() } else { generated_value(&mut seed) };
             std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", &closed);
             std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", &token);
             normalize_env();
@@ -638,22 +659,37 @@ mod tests {
                 // By key position, so `SOMETHING_ELSE: ${CREDVAULT_X:-}` does
                 // not count as delivering CREDVAULT_X under its own name --
                 // and by the interpolated name too, so the operator's `.env`
-                // is what actually reaches the container. Both halves of this
-                // line carry the same identifier, which means a typo shows up
-                // on one side only: `CREDVAULT_CLOSED_REGISTRATION:
+                // is what actually reaches the container. Both halves of the
+                // line carry the same identifier, which means a typo shows on
+                // one side only: `CREDVAULT_CLOSED_REGISTRATION:
                 // ${CREDVAULT_CLOSED_REGISTRATON:-}` passed a key-only check
                 // while reproducing the original blocker -- the operator sets
-                // it and registration stays open. A value hardcoded in compose
-                // does the same, which is why TRUST_FORWARDED_FOR is named
-                // here rather than quietly accepted.
-                const HARDCODED_IN_COMPOSE: [&str; 1] = ["CREDVAULT_TRUST_FORWARDED_FOR"];
-                if HARDCODED_IN_COMPOSE.contains(&name.as_str()) {
-                    return false;
-                }
+                // it and registration stays open.
+                //
+                // The interpolated name has to *end* where the name ends. A
+                // bare `contains("${NAME")` also accepts `${NAME_OLD:-}`,
+                // which delivers nothing under this name: demonstrated on
+                // CREDVAULT_CLOSED_REGISTRATION, where the test passed while
+                // registration stayed open to anyone. No documented name is a
+                // prefix of another today, which is the only thing that made
+                // that latent rather than live; a rename leaving the old key
+                // behind, or a `${NAME_FILE}` secrets convention, reaches it.
+                //
+                // A name compose hardcodes is not accepted either. Nothing
+                // documented is hardcoded today, so this costs nothing now --
+                // and the day one is, an operator has been told to set a value
+                // in `.env` that cannot reach the container, which is the
+                // original blocker wearing a different hat and should fail
+                // loudly rather than be waived by name.
                 let block = environment_of(&compose, owning_service(name));
+                let opening = format!("${{{name}");
                 !block.lines().any(|line| {
                     let line = line.trim_start();
-                    line.starts_with(&format!("{name}:")) && line.contains(&format!("${{{name}"))
+                    line.starts_with(&format!("{name}:"))
+                        && line.match_indices(&opening).any(|(at, matched)| {
+                            let after = &line[at + matched.len()..];
+                            !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                        })
                 })
             })
             .collect();

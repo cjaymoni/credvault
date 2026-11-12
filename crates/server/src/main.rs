@@ -365,12 +365,45 @@ mod tests {
         (*state >> 33) as usize
     }
 
-    /// A short string of characters an operator could plausibly produce,
-    /// including the empty one, chosen by the generator rather than by anyone
-    /// deciding which cases are worth covering.
-    fn generated_value(state: &mut u64, alphabet: &[char]) -> String {
-        let length = next_number(state) % 7;
-        (0..length).map(|_| alphabet[next_number(state) % alphabet.len()]).collect()
+    /// Words an operator could plausibly write in a boolean setting, and the
+    /// junk around them.
+    ///
+    /// Words rather than random characters, because the first version of this
+    /// drew 0-6 characters from a 45-character bag and the arithmetic is
+    /// brutal: reaching a three-letter target costs about one draw in 23,000,
+    /// so 5000 pairs produced `off` -- the exact spelling of the last shipped
+    /// fail-open -- zero times. A generator that cannot reach the defect it
+    /// was written for is worse than no generator, because it reads like
+    /// coverage. The near-miss set is where all four shipped defects lived,
+    /// so it is sampled deliberately rather than hoped for.
+    const WORDS: [&str; 20] = [
+        "", "true", "false", "yes", "no", "on", "off", "0", "1", "y", "n", "t", "f", "enabled", "disabled", "closed",
+        "open", "none", "null", "maybe",
+    ];
+
+    /// One of those words, wearing the damage a `.env` file does to it: the
+    /// capitalisation someone types, the trailing newline an editor leaves,
+    /// the CR from a file written on Windows, the quotes someone adds because
+    /// other lines have them.
+    fn generated_value(state: &mut u64) -> String {
+        let word = WORDS[next_number(state) % WORDS.len()];
+        let cased = match next_number(state) % 4 {
+            0 => word.to_string(),
+            1 => word.to_ascii_uppercase(),
+            2 => {
+                let mut chars = word.chars();
+                chars.next().map(|c| c.to_ascii_uppercase().to_string() + chars.as_str()).unwrap_or_default()
+            }
+            _ => word.to_string(),
+        };
+        match next_number(state) % 6 {
+            0 => format!("{cased} "),
+            1 => format!("{cased}\n"),
+            2 => format!("{cased}\r\n"),
+            3 => format!(" {cased}"),
+            4 => format!("\"{cased}\""),
+            _ => cased,
+        }
     }
 
     /// Mutates process environment, so it is one test rather than several:
@@ -465,33 +498,54 @@ mod tests {
         // could do harm. Hand-picked cases only catch what the author already
         // suspected.
         //
-        // So stop choosing. The rule this setting exists to enforce is one
-        // sentence -- a server is open to anyone only when the operator wrote nothing,
-        // or wrote a spelling that means "not in use" -- and it can be checked against inputs neither the author
-        // nor the reviewer picked. Refusing to start is always an acceptable
-        // answer: it names the variable and is noticed at once. The only
-        // unacceptable outcome is a quiet Open nobody asked for.
-        let alphabet: Vec<char> =
-            "truefalseyesnoonff01 \t\n\r\u{a0}-_.,!TRUEYESNOOFF\u{ff34}\u{130}\u{c9}".chars().collect();
-        let mut seed = 0x5EED_0000_0001_u64;
+        // So state the rule instead of the cases, and check it against pairs
+        // nobody chose. Two things must hold, because this setting has failed
+        // in two directions:
+        //
+        //   open   -- the server is open to anyone only where the operator
+        //             wrote nothing, or a spelling that means "not in use".
+        //   boots  -- a spelling the deploy guide tells an operator to write
+        //             never stops the server. A refusal is a fine answer to
+        //             nonsense, but under `restart: unless-stopped` it is a
+        //             crash loop, so it must not be the answer to `TRUE`.
+        //
+        // Checking only the first would let the fixes for it keep producing
+        // the second, which is exactly what happened twice.
+        let seed_from_env = std::env::var("CREDVAULT_FUZZ_SEED").ok().and_then(|s| s.parse().ok());
+        let seed_used = seed_from_env.unwrap_or(0x5EED_0000_0001_u64);
+        let mut seed = seed_used;
         for _ in 0..5_000 {
-            let closed = generated_value(&mut seed, &alphabet);
-            let token = generated_value(&mut seed, &alphabet);
+            let closed = generated_value(&mut seed);
+            let token = generated_value(&mut seed);
             std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", &closed);
             std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", &token);
             normalize_env();
-            let Ok(args) = Args::try_parse_from(["credvault-server"]) else { continue };
+
+            // Spelled out here rather than read from BOOLISH on purpose. An
+            // oracle that derives the answer from the code it is judging
+            // widens when that code widens, which is exactly the route `off`
+            // would take back in under a green suite.
+            let written = closed.trim().to_ascii_lowercase();
+            let documented_truthy = matches!(written.as_str(), "true" | "yes" | "on" | "1");
+            let documented_falsey = matches!(written.as_str(), "" | "false" | "0");
+            let token_written = token.trim().to_string();
+
+            let Ok(args) = Args::try_parse_from(["credvault-server"]) else {
+                // Asking for a token and closed at once is refused on purpose.
+                assert!(
+                    !((documented_truthy || documented_falsey) && token_written.is_empty()),
+                    "a documented spelling stopped the server, which under \
+                     `restart: unless-stopped` is a crash loop: CLOSED={closed:?} \
+                     TOKEN={token:?} (seed {seed_used})"
+                );
+                continue;
+            };
             let policy = registration_policy(args.closed_registration, args.registration_token);
             if matches!(policy, RegistrationPolicy::Open) {
-                // Spelled out here rather than read from BOOLISH on purpose.
-                // An oracle that derives the answer from the code it is
-                // judging widens when that code widens, which is exactly how
-                // `off` would slip back in unnoticed.
-                let written = closed.trim().to_ascii_lowercase();
-                let asked_for_open = matches!(written.as_str(), "" | "false" | "0");
                 assert!(
-                    asked_for_open && token.trim().is_empty(),
-                    "registration opened on input nobody asked to open: CLOSED={closed:?} TOKEN={token:?}"
+                    documented_falsey && token_written.is_empty(),
+                    "registration opened on input nobody asked to open: \
+                     CLOSED={closed:?} TOKEN={token:?} (seed {seed_used})"
                 );
             }
         }
@@ -582,9 +636,25 @@ mod tests {
             .iter()
             .filter(|name| {
                 // By key position, so `SOMETHING_ELSE: ${CREDVAULT_X:-}` does
-                // not count as delivering CREDVAULT_X under its own name.
+                // not count as delivering CREDVAULT_X under its own name --
+                // and by the interpolated name too, so the operator's `.env`
+                // is what actually reaches the container. Both halves of this
+                // line carry the same identifier, which means a typo shows up
+                // on one side only: `CREDVAULT_CLOSED_REGISTRATION:
+                // ${CREDVAULT_CLOSED_REGISTRATON:-}` passed a key-only check
+                // while reproducing the original blocker -- the operator sets
+                // it and registration stays open. A value hardcoded in compose
+                // does the same, which is why TRUST_FORWARDED_FOR is named
+                // here rather than quietly accepted.
+                const HARDCODED_IN_COMPOSE: [&str; 1] = ["CREDVAULT_TRUST_FORWARDED_FOR"];
+                if HARDCODED_IN_COMPOSE.contains(&name.as_str()) {
+                    return false;
+                }
                 let block = environment_of(&compose, owning_service(name));
-                !block.lines().any(|line| line.trim_start().starts_with(&format!("{name}:")))
+                !block.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with(&format!("{name}:")) && line.contains(&format!("${{{name}"))
+                })
             })
             .collect();
         assert!(missing.is_empty(), "documented in deploy/ but never reaching their container: {missing:?}");

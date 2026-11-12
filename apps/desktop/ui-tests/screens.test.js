@@ -4,9 +4,42 @@
 // Run with: node --test apps/desktop/ui-tests/
 const test = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const path = require("node:path");
 const { esc, serverSummaryText, listGroupHtml } = require("../ui/screens.js");
 
 const DEFAULT_SERVER = "http://127.0.0.1:8787";
+
+// ----- the default server ----------------------------------------------------
+//
+// `app.js` is the shipped frontend and has no module system, so the constant
+// cannot be imported; it is read as text. The test deliberately asserts the
+// shape rather than the hostname, so changing which server testers are sent
+// to does not touch it -- but shipping one the client would reject does.
+
+test("the default server is a URL the Rust side will accept", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+  const found = source.match(/^const DEFAULT_SERVER = "([^"]+)";$/m);
+  assert.ok(found, "DEFAULT_SERVER is not declared where this test can find it");
+
+  const url = new URL(found[1]);
+  // http is refused for anything but loopback, and only once the password has
+  // already been typed, so a bad default fails as late as it possibly could.
+  assert.equal(url.protocol, "https:");
+  // ServerAddress::parse rejects these outright.
+  assert.equal(url.search, "");
+  assert.equal(url.hash, "");
+  assert.equal(url.username, "");
+  assert.equal(url.password, "");
+  // A path is not rejected -- `parse` keeps one, so two instances can share a
+  // host. It is barred here because this literal is what the collapsed server
+  // line renders, while the auth hash binds the canonical form, and a default
+  // where those disagree is an inconsistency nobody would think to look for.
+  // The origin check also catches an uppercase or non-ASCII host, which
+  // canonicalise to something the literal no longer matches.
+  assert.equal(url.pathname, "/");
+  assert.equal(found[1], url.origin, "must be bare origin, no trailing slash");
+});
 
 // ----- the collapsed server line --------------------------------------------
 //
@@ -168,8 +201,6 @@ test("a budget that is not a number is refused rather than ignored", () => {
 // still be right.
 
 const { PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts } = require("../ui/screens.js");
-const fs = require("node:fs");
-const path = require("node:path");
 
 const USER_AGENTS = {
   macos: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)",

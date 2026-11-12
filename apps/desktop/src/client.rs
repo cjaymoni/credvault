@@ -269,6 +269,9 @@ impl ApiClient {
             }
             return response.json().await.map_err(|e| ClientError::Server(format!("bad response: {e}")));
         }
+        if let Some(redirect) = redirected_to(status, response.headers()) {
+            return Err(ClientError::Server(redirect));
+        }
         if status == StatusCode::UNAUTHORIZED && self.token.is_some() {
             return Err(ClientError::Unauthorized);
         }
@@ -509,6 +512,30 @@ impl ApiClient {
     }
 }
 
+/// Why a redirect this client will not follow is the end of the request, said
+/// in a way the person who configured the address can act on.
+///
+/// Redirects are not followed on purpose: see `ApiClient::new`, where the
+/// whole safety of resending a failed request rests on there only ever being
+/// one hop. The address bar is the fix, so the answer has to carry the address
+/// -- without it this is "server returned 301" and nothing else, which is what
+/// a self-hoster behind a trailing-slash or canonical-host redirect would have
+/// to debug from.
+fn redirected_to(status: StatusCode, headers: &reqwest::header::HeaderMap) -> Option<String> {
+    if !status.is_redirection() {
+        return None;
+    }
+    let destination = headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|location| location.to_str().ok())
+        .map(|location| format!(" to {location}"))
+        .unwrap_or_default();
+    Some(format!(
+        "the server redirected this request{destination}, which this app does not follow; \
+         point it at that address instead"
+    ))
+}
+
 /// Render a transport failure as a sentence that names what actually went
 /// wrong.
 ///
@@ -553,6 +580,23 @@ fn urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_redirect_is_reported_with_the_address_it_pointed_at() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::LOCATION, "https://elsewhere.example/api".parse().unwrap());
+        let said = redirected_to(StatusCode::PERMANENT_REDIRECT, &headers).expect("a 3xx ends the request");
+        assert!(said.contains("https://elsewhere.example/api"), "{said}");
+
+        // A redirect with no usable Location is still a redirect, and still
+        // has to be reported rather than read as the server's answer.
+        let bare = redirected_to(StatusCode::FOUND, &reqwest::header::HeaderMap::new());
+        assert!(bare.is_some(), "a Location-less redirect must still be an error");
+
+        for not_a_redirect in [StatusCode::OK, StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+            assert_eq!(redirected_to(not_a_redirect, &reqwest::header::HeaderMap::new()), None, "{not_a_redirect}");
+        }
+    }
 
     #[test]
     fn urlencode_escapes_reserved_characters() {
@@ -664,8 +708,10 @@ mod tests {
 
     /// Accept, read the request, count it, and hang up without answering.
     /// That fails the request *after* its bytes reached the far end, which is
-    /// the shape that must never be retried. The count is of requests the
-    /// server actually received.
+    /// the shape that must never be retried. The count is of connections the
+    /// far end accepted, which for a client that opens one per attempt is the
+    /// number of attempts that reached it -- so it over-counts rather than
+    /// under-counts, which is the safe direction for an exactly-once claim.
     async fn server_that_takes_the_request_and_says_nothing() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>)
     {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -695,10 +741,12 @@ mod tests {
     async fn read_until_marker(stream: &mut tokio::net::TcpStream, marker: &str) -> bool {
         use tokio::io::AsyncReadExt;
         let mut seen = Vec::new();
-        let deadline = std::time::Duration::from_secs(1);
+        // Per read, not for the whole call: a peer that dribbles bytes keeps
+        // this alive, which is fine for a test server on loopback.
+        let read_timeout = std::time::Duration::from_secs(1);
         loop {
             let mut buffer = [0u8; 1024];
-            match tokio::time::timeout(deadline, stream.read(&mut buffer)).await {
+            match tokio::time::timeout(read_timeout, stream.read(&mut buffer)).await {
                 Ok(Ok(0)) | Err(_) => return false,
                 Ok(Ok(read)) => seen.extend_from_slice(&buffer[..read]),
                 Ok(Err(_)) => return false,
@@ -761,9 +809,14 @@ mod tests {
 
         let api = ApiClient::new(&format!("http://127.0.0.1:{port}")).unwrap().reconnect().unwrap().patiently();
         let outcome = api.oauth_callback(&a_callback()).await;
+        let Err(ClientError::Server(message)) = &outcome else {
+            panic!("an unfollowed 3xx is the server's answer, got {outcome:?}");
+        };
+        // The address is the whole point: it is what the person who typed the
+        // server URL has to change.
         assert!(
-            matches!(outcome, Err(ClientError::Server(_))),
-            "an unfollowed 3xx is the server's answer, got {outcome:?}"
+            message.contains(&format!("127.0.0.1:{dead_port}")),
+            "the answer must name where it pointed: {message}"
         );
         assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1, "the code must reach the server exactly once");
     }
@@ -789,7 +842,9 @@ mod tests {
 
         let whole_table: std::time::Duration = TRUNCATED_RETRIES.backoffs.iter().sum();
         assert!(spent < whole_table / 2, "the budget must stop the sequence early: {spent:?} of {whole_table:?}");
-        assert!(spent >= std::time::Duration::from_millis(100), "but not before the waits that fit: {spent:?}");
+        // 150ms, not 100: three waits fit the budget, and a bound of 100
+        // would also pass an off-by-one that took only two.
+        assert!(spent >= std::time::Duration::from_millis(150), "the waits that fit must be waited: {spent:?}");
     }
 
     #[tokio::test]
@@ -813,6 +868,12 @@ mod tests {
             BRIEF_CONNECT_RETRIES.budget >= ordinary,
             "the brief retry must fit its own budget: {:?} < {ordinary:?}",
             BRIEF_CONNECT_RETRIES.budget,
+        );
+        // Said directly rather than reached through the two above, so it
+        // survives either of them being retuned.
+        assert!(
+            PATIENT_CONNECT_RETRIES.budget > std::time::Duration::from_millis(7500) * 2,
+            "the budget is the binding bound and must outlast the measured block",
         );
 
         let api = ApiClient::new("https://example.test").unwrap();

@@ -244,7 +244,7 @@
 [data-platform="macos"] .auth { background: var(--bg); padding-top: 52px; }
 [data-platform="macos"] .auth-card { border: 0; box-shadow: none; background: transparent; text-align: center; max-width: 440px; }
 [data-platform="macos"] .auth-card .brand { flex-direction: column; gap: 10px; }
-[data-platform="macos"] .auth-card .brand-mark { width: 64px; height: 64px; border-radius: 15px; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18); }
+[data-platform="macos"] .auth-card .brand-mark { width: 64px; height: 64px; border-radius: 10px; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18); }
 [data-platform="macos"] .auth-card .brand-mark svg { width: 32px; height: 32px; }
 [data-platform="macos"] .auth-card .brand-name { display: none; }
 [data-platform="macos"] .auth-card form, [data-platform="macos"] .auth-card .auth-alt { text-align: start; }

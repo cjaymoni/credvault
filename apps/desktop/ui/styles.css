@@ -431,14 +431,19 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; a
 .server-summary { display: none; }
 
 .brand { display: flex; align-items: center; gap: 10px; }
+/* The plate is the artwork's own colours, not `--accent`, and deliberately
+   does not follow the theme. `--accent` inverts in dark mode -- a mint plate
+   under a near-black glyph -- which would put a negative of the app icon next
+   to the real one in the dock. A logo is the one thing on the screen that
+   should look the same everywhere. */
 .brand-mark {
   display: inline-grid;
   place-items: center;
   width: 36px;
   height: 36px;
   border-radius: 10px;
-  background: var(--accent);
-  color: var(--on-accent);
+  background: #106e6e;
+  color: #ffffff;
 }
 .brand-mark svg { width: 20px; height: 20px; }
 .brand-name { font-weight: 700; font-size: var(--text-heading); letter-spacing: -0.01em; }

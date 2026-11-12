@@ -124,6 +124,19 @@ pub enum RegistrationPolicy {
     Token(String),
 }
 
+impl RegistrationPolicy {
+    /// One word for the log, so an operator can read which of the three
+    /// states a server is in rather than inferring it from the absence of a
+    /// warning. Never the token itself.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Open => "open to anyone",
+            Self::Closed => "closed",
+            Self::Token(_) => "token required",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ServerConfig {
     pub registration: RegistrationPolicy,

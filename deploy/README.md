@@ -40,19 +40,31 @@ ufw enable
 
 ## Accounts
 
-Registration requires `CREDVAULT_REGISTRATION_TOKEN`; clients send it as
-`registration_token` when creating an account. Give it only to people who
-should have accounts on this server.
+Who may create an account is one of three states, and `.env` as shipped
+chooses the middle one:
 
-- Rotate it by editing `.env` and running `docker compose up -d`. Existing
-  accounts are unaffected.
-- Stop new accounts entirely by replacing the token variable with
-  `CREDVAULT_CLOSED_REGISTRATION=true`.
-- Leaving the token blank opens registration to anyone who can reach the
-  server, which is what you want on loopback and a deliberate decision
-  anywhere else. The app then shows no token field at all. The server says so
-  in its log on every start, so `docker compose logs credvault | grep
-  "registration is open"` tells you whether a host is open right now.
+- **A token.** Set `CREDVAULT_REGISTRATION_TOKEN`; clients send it as
+  `registration_token` when creating an account. Give it only to people who
+  should have accounts here. Rotate it by editing `.env` and running
+  `docker compose up -d`; existing accounts are unaffected.
+- **Blank: anyone who can reach the server.** This is what an unset variable
+  means, and what the shipped `.env.example` gives you. The app then shows no
+  token field at all. Fine on loopback; on a public host it is a decision to
+  make on purpose, because anyone on the internet can then create an account
+  and store data you are hosting.
+- **Closed.** Set `CREDVAULT_CLOSED_REGISTRATION=true` and leave the token
+  unset. Existing accounts keep working. Setting both at once stops the
+  server rather than letting it guess.
+
+The server prints which state it is in on every start, so
+
+```sh
+docker compose logs credvault | grep "registration policy"
+```
+
+tells you what a host was last started with. It is one line per start, not a
+running status: if you need to know what a long-running container is doing
+now, restart it or read the policy you configured.
 
 ## Sign in with Google (optional)
 

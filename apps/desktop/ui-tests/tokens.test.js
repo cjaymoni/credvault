@@ -220,10 +220,6 @@ const NOT_A_PALETTE = [
   "@media (max-width: 720px)||:root",
   "@media (max-width: 900px)||.app",
   '@media (min-width: 721px)||[data-platform="ios"] .app, [data-platform="android"] .app',
-  // --search-row-h: a height shared by the search field and the account
-  // circle beside it, not a colour. Scoped to the row so the two cannot
-  // drift apart; see the test in screens.test.js that holds them to it.
-  '||[data-platform="android"] .sidebar-search',
 ];
 
 /// Where the table says each palette's two copies are written.
@@ -231,9 +227,17 @@ function paletteKeys() {
   return DARK_PALETTES.flatMap(([, media, theme]) => [`${DARK_MEDIA}||${media}`, `||${theme}`]);
 }
 
+/// Tokens that are measurements rather than colours, and so are not part of
+/// any palette wherever they are declared.
+const NOT_A_COLOUR = ["--search-row-h"];
+
+/// Whether a rule carries anything a palette would have to account for.
+const carriesPaletteTokens = (rule) =>
+  rule.declarations.some(([name]) => !NOT_A_COLOUR.includes(name));
+
 test("every rule that carries tokens is a palette the table names, or a listed exception", () => {
   const accounted = new Set([...paletteKeys(), ...NOT_A_PALETTE]);
-  const unaccounted = ALL_RULES.filter(carriesTokens)
+  const unaccounted = ALL_RULES.filter(carriesPaletteTokens)
     .map(whereAndWhat)
     .filter((key) => !accounted.has(key));
   assert.deepStrictEqual([...new Set(unaccounted)], [], "add each to DARK_PALETTES or to NOT_A_PALETTE");

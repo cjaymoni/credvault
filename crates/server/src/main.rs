@@ -206,6 +206,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let registration = registration_policy(args.closed_registration, args.registration_token);
+    // Said on every start whichever state it is in, at info, next to the
+    // address. A line that only appears when something is wrong is a line an
+    // operator cannot use to confirm that nothing is: "is this host open?"
+    // has to be answerable by reading, not by failing to find a warning.
+    tracing::info!(registration = registration.describe(), address = %args.bind, "registration policy");
     if matches!(registration, RegistrationPolicy::Open) && !args.bind.ip().is_loopback() {
         tracing::warn!("registration is open on a non-loopback address; consider --registration-token");
     }
@@ -294,6 +299,43 @@ mod tests {
             clear_blank_flag_env();
             assert!(std::env::var(key).is_err());
         }
+    }
+
+    /// Every `CREDVAULT_*` setting the deploy guide tells an operator to use
+    /// must actually be passed into the container.
+    ///
+    /// Written because one was not. `deploy/README.md` documented
+    /// `CREDVAULT_CLOSED_REGISTRATION=true` as the way to stop new accounts,
+    /// and it was absent from the compose `environment:` block, so setting it
+    /// reached the interpolation context and never the server. Combined with
+    /// a blank token meaning "open", following the documented way to shut
+    /// registration left it open to anyone instead -- the failure pointing the
+    /// wrong way round from the one the operator was guarding against.
+    #[test]
+    fn every_setting_the_deploy_guide_names_is_passed_to_the_container() {
+        let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+        let readme = std::fs::read_to_string(deploy.join("README.md")).expect("deploy/README.md");
+        let compose = std::fs::read_to_string(deploy.join("docker-compose.yml")).expect("docker-compose.yml");
+
+        // The server's own variables; the proxy's are set elsewhere in the file.
+        let named: std::collections::BTreeSet<&str> = readme
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| word.starts_with("CREDVAULT_"))
+            .filter(|word| !["CREDVAULT_DOMAIN", "CREDVAULT_ACME_EMAIL"].contains(word))
+            .collect();
+        assert!(!named.is_empty(), "the guide should name some settings");
+
+        let missing: Vec<&str> = named.into_iter().filter(|name| !compose.contains(&format!("{name}:"))).collect();
+        assert!(missing.is_empty(), "named in deploy/README.md but never reaching the container: {missing:?}");
+    }
+
+    #[test]
+    fn the_logged_policy_names_the_state_and_never_the_token() {
+        assert_eq!(registration_policy(true, None).describe(), "closed");
+        assert_eq!(registration_policy(false, None).describe(), "open to anyone");
+        let gated = registration_policy(false, Some("s3cret".into()));
+        assert_eq!(gated.describe(), "token required");
+        assert!(!gated.describe().contains("s3cret"), "the log must not carry the token");
     }
 
     #[test]

@@ -142,10 +142,15 @@
 .legal-body strong { color: var(--text); }
 /* Placeholders print as code so an unfilled `[CONTACT EMAIL]` is obviously
    not prose someone forgot to proofread. */
-.legal-body code { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.92em; }
+.legal-body code { font-family: var(--mono); font-size: 0.92em; }
+/* --accent-soft and its text colour, because both are defined per palette and
+   per theme. The amber this used to hardcode came from a `var(--warning-bg,
+   ...)` fallback for a token that exists nowhere, so every platform got the
+   same colour in light and dark -- and writing it as a fallback is what kept
+   it out of the palette checks in tokens.test.js. */
 .legal-draft {
-  flex: none; margin: 0 0 4px; padding: 8px 10px; border-radius: var(--radius-sm, 6px);
-  background: var(--warning-bg, rgba(190, 120, 0, 0.12)); color: var(--text); font-size: var(--text-small);
+  flex: none; margin: 0 0 4px; padding: 8px 10px; border-radius: var(--radius-sm);
+  background: var(--accent-soft); color: var(--accent-soft-text); font-size: var(--text-small);
 }
 .auth-legal { margin: 14px 0 0; text-align: center; font-size: var(--text-small); color: var(--text-2); }
 /* The sign-in line reads as a sentence, so its links sit on the baseline

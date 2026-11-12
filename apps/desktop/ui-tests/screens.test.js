@@ -295,8 +295,11 @@ test("a closed dialog stays closed: no dialog sets display outside [open]", () =
   // Any rule that sets `display` on the element beats it, and the dialog then
   // renders in the page flow -- which is how the legal sheet came to sit at the
   // bottom of the sign-in screen, visible to anyone who scrolled that far.
-  const css = fs
-    .readFileSync(path.join(__dirname, "../ui/platform.css"), "utf8")
+  // Both stylesheets, because the page loads both and the next dialog rule
+  // is as likely to be written in one as the other.
+  const css = ["../ui/styles.css", "../ui/platform.css"]
+    .map((sheet) => fs.readFileSync(path.join(__dirname, sheet), "utf8"))
+    .join("\n")
     .replace(/\/\*[\s\S]*?\*\//g, "");
   /// The element a selector actually targets: its last compound, with any
   /// pseudo-element or pseudo-class dropped. `.legal-dialog .legal-body`

@@ -28,18 +28,31 @@ The installers are not code-signed, so each system will question them once.
   Choose **More info**, then **Run anyway**.
 - **Linux** — install the `.deb` with `sudo apt install ./credvault_*.deb`, or
   make the `.AppImage` executable (`chmod +x`) and run it.
+- **Android** — download the `.apk` and open it. Android will ask you to allow
+  installing from this source; the build is signed with a test key, not a
+  Play Store one, so it will not update itself and will warn you once. It is
+  built for arm64, which covers every current phone but not an x86 emulator.
+  The `.apk` is built by hand rather than by the release pipeline, so it
+  appears only when someone has built one; a release without it means the
+  Android app has not changed.
 
 ## Getting an account
 
-You need the address of a credvault server and, if the person running it has
-closed registration, the registration token they will give you. Enter the
-server address, your email, and a passphrase of at least 12 characters, then
-**Create account**.
+During pre-release the Server URL field arrives pre-filled with the
+maintainer's test server, so you can create an account without being handed
+an address. Leaving it as it is means your account is created there, on a
+machine someone else runs. You will also need the registration token for it,
+which whoever invited you will send you privately.
 
-No server is attached to this release; it is built from the same source, and
-running one is described in
-[deploy/README.md](https://github.com/cjaymoni/credvault/blob/__TAG__/deploy/README.md).
-Remember that it has to come from this same release.
+Enter your email and a passphrase of at least 12 characters, then click
+**Does the server require a registration token?**, paste it in, and
+**Create account**. That button is how the token field appears; it stays
+folded away because not every server asks for one.
+
+The address is only a default: whatever you type replaces it and is
+remembered. Running your own server is described in
+[deploy/README.md](https://github.com/cjaymoni/credvault/blob/__TAG__/deploy/README.md),
+and a server you run has to come from this same release.
 
 To share a secret with someone, both of you need accounts on the same server.
 You will also need their key fingerprint, read to you over a channel that is

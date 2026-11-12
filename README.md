@@ -26,7 +26,13 @@ Building from source instead is under [Build](#build) below.
 
 You also need somewhere to connect to. Running a server is
 [deploy/README.md](deploy/README.md); for a look around on your own machine,
-`cargo run -p credvault-server` and the default address in the app are enough.
+`cargo run -p credvault-server` and `http://127.0.0.1:8787` typed into the
+app's Server URL field are enough.
+
+During pre-release that field is pre-filled with the maintainer's test
+server, so testers do not have to be told an address. It is only a default:
+whatever you type replaces it and is remembered, and self-hosting is
+unaffected.
 
 ## How the security works
 
@@ -367,7 +373,8 @@ cargo tauri android dev <avd-name>
 ```
 
 Inside the emulator `127.0.0.1` is the emulator itself, so forward the port to
-the server on the host before logging in; the default server URL then works:
+the server on the host before logging in, and type `http://127.0.0.1:8787`
+into the Server URL field:
 
 ```sh
 adb reverse tcp:8787 tcp:8787
@@ -396,3 +403,7 @@ cargo run -p credvault-server                  # terminal 1
 cd apps/desktop && cargo tauri dev             # terminal 2
 cargo fmt --all && cargo clippy --workspace --all-targets
 ```
+
+As under [Install](#install), the Server URL field starts on the hosted test
+server rather than the one you just started, so type `http://127.0.0.1:8787`
+on first run. It is remembered after that.

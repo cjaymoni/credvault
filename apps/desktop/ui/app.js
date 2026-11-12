@@ -4,7 +4,12 @@
 const invoke = window.__TAURI__.core.invoke;
 const $ = (id) => document.getElementById(id);
 
-const DEFAULT_SERVER = "http://127.0.0.1:8787";
+// Pre-fills the Server URL field so testers are not handed an address to
+// type. Only a default: the field stays editable and a typed value is
+// remembered, so anyone self-hosting sets theirs once. Must stay https --
+// the Rust side refuses http for anything but loopback, and it refuses it
+// after the password has been entered. Checked by ui-tests/screens.test.js.
+const DEFAULT_SERVER = "https://credvault.alphadesigns.dev";
 const REVEAL_HIDE_AFTER_MS = 30_000;
 const TOAST_MS = 2200;
 const MASKED = "••••••••••••";

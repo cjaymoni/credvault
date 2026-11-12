@@ -1205,8 +1205,7 @@ input.mono.mismatch { border-color: var(--danger); }
   .link-btn { margin: 0 0 6px; padding: 10px 0; } /* a row, not an inline link: a full target */
   .btn.block { height: 52px; font-size: var(--text-emphasis); }
 
-  /* the server, as one line. Read-only here: the field it used to unfold is
-     not reachable on a phone. */
+  /* the server, as one line, until it is tapped */
   .server-summary {
     display: flex;
     align-items: center;
@@ -1231,7 +1230,10 @@ input.mono.mismatch { border-color: var(--danger); }
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .server-summary-action { flex: none; color: var(--accent); font-weight: 600; }
   #server-field { display: none; }
+  .auth.server-open .server-summary { display: none; }
+  .auth.server-open #server-field { display: block; }
 
   .auth-alt { margin-top: 12px; }
   .auth-divider { margin-bottom: 12px; }

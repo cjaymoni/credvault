@@ -452,6 +452,16 @@ function setAuthMode(mode) {
   if (state.google) { state.google = null; showGoogleForm(false); }
 }
 
+/// The phone layout shows the server as one line and keeps the field folded
+/// behind it, because the address is right far more often than it is wrong.
+/// Tapping the line unfolds the field: wrong is the case that matters, and a
+/// default that cannot be corrected is how someone's vault ends up on a
+/// stranger's server.
+function showServerField() {
+  $("auth").classList.add("server-open");
+  $("server").focus();
+}
+
 function syncServerSummary() {
   $("server-summary").textContent = Screens.serverSummaryText($("server").value, DEFAULT_SERVER);
 }
@@ -917,6 +927,8 @@ function resetToSignedOut() {
   setError("main-error", "");
   $("app").classList.add("hidden");
   $("auth").classList.remove("hidden");
+  // The next person to use this app gets the folded server line back.
+  $("auth").classList.remove("server-open");
 }
 
 async function logout() {
@@ -2023,6 +2035,7 @@ $("btn-sign-out-others").onclick = () => renderSignOutOthersForm();
 // settles rather than on every keystroke.
 $("server").onchange = () => refreshCapabilities();
 $("server").onblur = () => refreshCapabilities();
+$("btn-server-change").onclick = showServerField;
 $("server").oninput = syncServerSummary;
 $("btn-logout").onclick = () => logout().catch((error) => setError("main-error", error));
 $("btn-refresh").onclick = () => { closeAccountSheet({ restoreFocus: false }); refresh(); };

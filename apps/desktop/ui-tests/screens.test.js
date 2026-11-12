@@ -290,6 +290,22 @@ test("on Android the account circle is sized from the same token as the search f
   assert.match(body(`${ANDROID} #btn-account`), /padding:\s*0/, "the button must not pad the circle into an oval");
 });
 
+test("the server address stays reachable on a phone", () => {
+  // The narrow layout hides #server-field and shows a one-line summary in its
+  // place. That is fine only while something can unfold it again: with the
+  // summary a plain <p> and no rule re-showing the field, an Android user had
+  // no way to change the address at any width, and the shipped default points
+  // at someone else's server. Self-hosting is the product.
+  const css = fs.readFileSync(path.join(__dirname, "../ui/styles.css"), "utf8");
+  const html = fs.readFileSync(path.join(__dirname, "../ui/index.html"), "utf8");
+  const js = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+
+  assert.match(css, /\.auth\.server-open #server-field\s*\{[^}]*display:\s*block/, "a state must re-show the field");
+  assert.match(html, /<button[^>]*id="btn-server-change"/, "the summary must be pressable, not a caption");
+  assert.match(js, /\$\("btn-server-change"\)\.onclick/, "pressing it must be wired to something");
+  assert.match(js, /classList\.add\("server-open"\)/, "and that something must open the field");
+});
+
 test("a closed dialog stays closed: no dialog sets display outside [open]", () => {
   // A <dialog> is hidden by the browser's own `dialog:not([open]) {display:none}`.
   // Any rule that sets `display` on the element beats it, and the dialog then

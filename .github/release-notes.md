@@ -43,9 +43,10 @@ maintainer's test server, so you can create an account without being handed
 an address. Leaving it as it is means your account is created there, on a
 machine someone else runs. That server currently accepts anyone who can reach
 it: no registration token, no invitation. A server that does ask for one shows
-a **Does the server require a registration token?** button instead, and
-whoever invited you sends the token privately; the field stays folded away
-because not every server asks for one.
+the token field already open and marked required, and whoever invited you
+sends the token privately. If the app cannot reach the server to ask, it shows
+a **Does the server require a registration token?** button instead, because
+not every server wants one.
 
 Enter your email and a passphrase of at least 12 characters and press **Create
 account**. Or press **Continue with Google**, which opens your browser, hands

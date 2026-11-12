@@ -34,13 +34,15 @@
     <form id="auth-form" novalidate>
       <!-- On a phone the server is one line and is not editable there. It is
            still shown rather than hidden: it is where the credential is about
-           to be sent, and that is worth seeing before it is sent. Not a
-           button -- there is nothing to press -- so it is read out as the
-           text it is. -->
-      <p class="server-summary">
+           to be sent, and that is worth seeing before it is sent. It is a
+           button because the address has to stay changeable on a phone --
+           self-hosting is the point of the product, and a default pointing at
+           someone else's server is not a default anyone can be held to. -->
+      <button type="button" class="server-summary" id="btn-server-change">
         <span class="server-summary-label">Server</span>
         <span class="server-summary-value" id="server-summary"></span>
-      </p>
+        <span class="server-summary-action">Change</span>
+      </button>
       <div class="field" id="server-field">
         <label for="server">Server URL</label>
         <input id="server" type="url" autocomplete="off" spellcheck="false" inputmode="url">

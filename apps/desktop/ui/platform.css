@@ -117,6 +117,41 @@
 .form-dialog { padding: 0; width: min(560px, calc(100% - 32px)); }
 .form-dialog .card { margin: 0; border: 0; box-shadow: none; border-radius: 0; }
 
+/* The legal documents. The dialog itself stops scrolling and the text scrolls
+   inside it, so the title, the document switch and Close stay reachable
+   through a long document -- on a phone especially, where the dialog is a
+   sheet and scrolling the whole thing would carry Close off the screen.
+   .legal-body is focusable so the text can be scrolled from the keyboard
+   without tabbing past it. */
+/* The column layout belongs to the open state. Setting `display` on the
+   element itself beats the browser's own `dialog:not([open]) {display:none}`,
+   and the closed dialog then renders in the page -- which put this sheet at
+   the foot of the sign-in screen for anyone who scrolled down. */
+.legal-dialog { overflow: hidden; width: min(620px, calc(100% - 32px)); }
+.legal-dialog[open] { display: flex; flex-direction: column; }
+.legal-switch { margin: 12px 0; flex: none; }
+.legal-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  font-size: var(--text-small); line-height: 1.55; color: var(--text);
+}
+.legal-body h3 { font-size: var(--text-body); margin: 20px 0 6px; }
+.legal-body h3:first-child { margin-top: 0; }
+.legal-body p { margin: 0 0 10px; color: var(--text-2); }
+.legal-body ul { margin: 0 0 10px; padding-left: 20px; color: var(--text-2); }
+.legal-body li { margin-bottom: 6px; }
+.legal-body strong { color: var(--text); }
+/* Placeholders print as code so an unfilled `[CONTACT EMAIL]` is obviously
+   not prose someone forgot to proofread. */
+.legal-body code { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.92em; }
+.legal-draft {
+  flex: none; margin: 0 0 4px; padding: 8px 10px; border-radius: var(--radius-sm, 6px);
+  background: var(--warning-bg, rgba(190, 120, 0, 0.12)); color: var(--text); font-size: var(--text-small);
+}
+.auth-legal { margin: 14px 0 0; text-align: center; font-size: var(--text-small); color: var(--text-2); }
+/* The sign-in line reads as a sentence, so its links sit on the baseline
+   rather than carrying .link-btn's block spacing. */
+.link-btn.inline { margin: 0; padding: 0; font-size: inherit; vertical-align: baseline; }
+
 /* A toast carrying an action can be reached and pressed. */
 .toast.has-action { pointer-events: auto; }
 .toast-action {
@@ -126,7 +161,7 @@
 
 /* Text in the accent colour reads in --tint, which stays legible in dark
    themes where the accent fill is too dark to read as text. */
-.link-btn, .server-summary-action, .value a { color: var(--tint, var(--accent)); }
+.link-btn, .value a { color: var(--tint, var(--accent)); }
 
 /* macOS and Windows keep Edit and Delete in the secret's own header. */
 [data-platform="macos"] #btn-bar-edit, [data-platform="windows"] #btn-bar-edit { display: none; }
@@ -653,12 +688,20 @@
 
 /* List: a search bar holding the account avatar, the invitations card,
    full-width list items, and the extended FAB. */
-[data-platform="android"] .sidebar-search { padding: calc(8px + env(safe-area-inset-top)) 16px 8px; }
-[data-platform="android"] .sidebar-search .search { display: flex; align-items: center; height: 56px; padding: 0 4px 0 16px; border: 1px solid var(--border-input); border-radius: 28px; background: var(--surface-3); }
+/* The account button is a sibling of the search pill, not a passenger inside
+   it: the pill takes the room that is left and the button keeps its own. Both
+   are sized from --search-row-h so the circle and the field stay the same
+   height -- they sit side by side, and any difference reads as a mistake. */
+[data-platform="android"] .sidebar-search { --search-row-h: 56px; display: flex; align-items: center; gap: 8px; padding: calc(8px + env(safe-area-inset-top)) 16px 8px; }
+[data-platform="android"] .sidebar-search .search { display: flex; align-items: center; height: var(--search-row-h); padding: 0 16px; border: 1px solid var(--border-input); border-radius: 28px; background: var(--surface-3); }
 [data-platform="android"] .sidebar-search .search .ic { position: static; transform: none; width: 24px; height: 24px; color: var(--text-2); }
 [data-platform="android"] .sidebar-search .search input { flex: 1; min-height: 48px; margin-left: 16px; padding: 0; border: 0; background: transparent; font-size: 1rem; }
-[data-platform="android"] #btn-account { width: 48px; height: 48px; border-radius: 50%; }
-[data-platform="android"] #btn-account .acct-avatar { display: inline-grid; width: 30px; height: 30px; font-size: 0.875rem; font-weight: 500; }
+/* padding: 0 because the button's own UA padding (6px a side) was squeezing
+   the circle inside it to 44px wide against 56px tall -- a visible oval. */
+[data-platform="android"] #btn-account { flex: none; width: var(--search-row-h); height: var(--search-row-h); padding: 0; border-radius: 50%; }
+/* The tinted circle is the whole button, not a token inside it, so what the
+   eye measures against the field is the thing that matches it. */
+[data-platform="android"] #btn-account .acct-avatar { display: inline-grid; flex: none; width: var(--search-row-h); height: var(--search-row-h); font-size: var(--text-title); font-weight: 500; }
 [data-platform="android"] .sidebar-count { display: none; }
 [data-platform="android"] .invites-banner { margin: 0 16px 8px; width: calc(100% - 32px); padding: 16px; gap: 16px; border-radius: 12px; background: var(--accent-soft); color: var(--accent-soft-text); font-size: 0.875rem; }
 [data-platform="android"] .ib-icon { display: inline-flex; }

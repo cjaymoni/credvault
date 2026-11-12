@@ -281,6 +281,7 @@ Requires Rust (https://rustup.rs). On Linux, Tauri also needs
 ```sh
 cargo test --workspace            # core + server + desktop tests
 node --test apps/desktop/ui-tests/   # the editor logic in apps/desktop/ui/fields.js
+node scripts/build-legal.js         # regenerate ui/legal.js after editing docs/*.md
 cargo build --release -p credvault-server
 cargo install tauri-cli --version "^2" --locked
 cd apps/desktop && cargo tauri build     # produces an installer in target/release/bundle

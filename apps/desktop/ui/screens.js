@@ -82,6 +82,36 @@
     return `${heading}<div class="list-group" ${wrapper}>${itemsHtml}</div>`;
   }
 
+  /// What a server with no token asks for, and what every form that is not
+  /// creating an account shows.
+  const NO_TOKEN_PROMPT = Object.freeze({ field: false, disclosure: false, required: false });
+
+  /// What the create-account form should do about the registration token.
+  ///
+  /// There are three answers, not two. `serverRequires` is what the server
+  /// said about itself -- `true`, `false`, or neither when it could not be
+  /// asked, which is the case before the first capabilities fetch lands and
+  /// whenever the address in the box does not answer. The third case is why
+  /// the disclosure button ("Does the server require a registration token?")
+  /// exists at all: it is the question to ask when nobody knows the answer.
+  /// Once the server has answered there is nothing to ask, so the button goes
+  /// and the field either stands open and required or is not there.
+  ///
+  /// `unfolded` is the user having opened the field themselves. It keeps the
+  /// field open across a re-render, including the one that follows a failed
+  /// submit on a server whose capabilities said no token was needed -- stale
+  /// or wrong, but recoverable as long as the field does not snap shut.
+  ///
+  /// `required` is what makes the difference the user sees: it lets the form
+  /// refuse an empty token in its own words instead of sending a blank one
+  /// and reading back the server's 403.
+  function tokenPrompt(isCreating, serverRequires, unfolded = false) {
+    if (!isCreating) return NO_TOKEN_PROMPT;
+    if (serverRequires === true) return Object.freeze({ field: true, disclosure: false, required: true });
+    const field = Boolean(unfolded);
+    return Object.freeze({ field, disclosure: serverRequires !== false && !field, required: false });
+  }
+
   /// The platforms the interface has a native look for. Anything else gets
   /// the Linux look, the most generic of the five.
   const PLATFORMS = ["macos", "windows", "linux", "ios", "android"];
@@ -175,7 +205,7 @@
     windows: { search: "toolbar-center", newSecret: "pane-actions", refresh: "pane-actions", account: "toolbar-end", invites: "sidebar-top" },
     linux: { search: "sidebar-search", newSecret: "pane-head-start", refresh: "account-menu", account: "pane-head-end", invites: "content-top" },
     ios: { search: "sidebar-search", newSecret: "bottombar-end", refresh: "account-menu", account: "pane-head-end", invites: "sidebar-top" },
-    android: { search: "sidebar-search", newSecret: "fab", refresh: "account-menu", account: "search-end", invites: "sidebar-top" },
+    android: { search: "sidebar-search", newSecret: "fab", refresh: "account-menu", account: "sidebar-search", invites: "sidebar-top" },
   };
   const PLACED_CONTROLS = ["search", "newSecret", "refresh", "account", "invites"];
 
@@ -188,5 +218,5 @@
     return PLACED_CONTROLS.map((control) => [control, table[control]]);
   }
 
-  return { esc, serverSummaryText, listGroupHtml, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
+  return { esc, serverSummaryText, listGroupHtml, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
 });

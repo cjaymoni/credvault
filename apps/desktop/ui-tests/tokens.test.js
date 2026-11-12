@@ -205,11 +205,11 @@ const carriesTokens = (rule) => rule.declarations.length > 0;
 const whereAndWhat = (rule) => `${rule.at.join(" >> ")}||${rule.selector}`;
 
 /// The token-carrying rules that are deliberately not dark palettes: the
-/// light defaults each platform starts from, and the blocks that override a
-/// few tokens for a width. Anything carrying tokens that is in neither this
-/// list nor DARK_PALETTES fails the test below, so a new one is a decision
-/// somebody makes on purpose rather than a palette that quietly goes
-/// unchecked.
+/// light defaults each platform starts from, the blocks that override a few
+/// tokens for a width, and the one rule that declares a measurement rather
+/// than a colour. Anything carrying tokens that is in neither this list nor
+/// DARK_PALETTES fails the test below, so a new one is a decision somebody
+/// makes on purpose rather than a palette that quietly goes unchecked.
 const NOT_A_PALETTE = [
   "||:root",
   '||:root[data-platform="macos"]',
@@ -220,6 +220,10 @@ const NOT_A_PALETTE = [
   "@media (max-width: 720px)||:root",
   "@media (max-width: 900px)||.app",
   '@media (min-width: 721px)||[data-platform="ios"] .app, [data-platform="android"] .app',
+  // --search-row-h: a height shared by the search field and the account
+  // circle beside it, not a colour. Scoped to the row so the two cannot
+  // drift apart; see the test in screens.test.js that holds them to it.
+  '||[data-platform="android"] .sidebar-search',
 ];
 
 /// Where the table says each palette's two copies are written.

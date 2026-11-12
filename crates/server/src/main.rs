@@ -137,15 +137,34 @@ fn google_provider(
     }
 }
 
-/// Flags whose environment variable is set but empty.
+/// Settings whose environment variable is set but empty, which `docker
+/// compose` produces for every variable it interpolates and the operator has
+/// not filled in.
 ///
-/// `docker compose` turns an unset variable into an empty one, and clap reads
-/// an empty value for a `bool` flag as a value that is missing rather than as
-/// a flag that is off — so the server refuses to start. A blank value means
-/// "not set", the same way it does for the Google credentials.
-const BLANK_MEANS_UNSET: [&str; 2] = ["CREDVAULT_CLOSED_REGISTRATION", "CREDVAULT_TRUST_FORWARDED_FOR"];
+/// Clap reads an env-sourced empty string as a value that is *present*, and
+/// that breaks two different ways. Off a `bool` flag it is a missing value and
+/// the server refuses to start. Off `--registration-token` it is a present
+/// value, so `conflicts_with = "closed_registration"` fires -- and the
+/// documented way to close registration is to set the flag and leave the token
+/// blank, which compose turns into exactly that pair. Measured against the
+/// built binary: the server exited 2 with "the argument
+/// '--registration-token' cannot be used with '--closed-registration'", and
+/// under `restart: unless-stopped` that is a crash loop taking the whole
+/// service down -- while the operator's compose reported success.
+///
+/// So blank means "not set" here, before clap ever looks, for every variable
+/// the compose file interpolates. The trimming inside `registration_policy`
+/// and `google_provider` stays as well: this handles the parse, those handle
+/// a value that arrives with a stray newline.
+const BLANK_MEANS_UNSET: [&str; 5] = [
+    "CREDVAULT_CLOSED_REGISTRATION",
+    "CREDVAULT_TRUST_FORWARDED_FOR",
+    "CREDVAULT_REGISTRATION_TOKEN",
+    "CREDVAULT_GOOGLE_CLIENT_ID",
+    "CREDVAULT_GOOGLE_CLIENT_SECRET",
+];
 
-fn clear_blank_flag_env() {
+fn clear_blank_env() {
     for key in BLANK_MEANS_UNSET {
         if std::env::var(key).is_ok_and(|value| value.trim().is_empty()) {
             std::env::remove_var(key);
@@ -181,7 +200,7 @@ fn registration_policy(closed: bool, token: Option<String>) -> RegistrationPolic
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    clear_blank_flag_env();
+    clear_blank_env();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -284,49 +303,112 @@ mod tests {
     fn a_blank_flag_variable_counts_as_unset_rather_than_stopping_the_server() {
         for key in BLANK_MEANS_UNSET {
             std::env::set_var(key, "");
-            clear_blank_flag_env();
+            clear_blank_env();
             assert!(std::env::var(key).is_err(), "{key} blank should be removed");
 
             std::env::set_var(key, "   ");
-            clear_blank_flag_env();
+            clear_blank_env();
             assert!(std::env::var(key).is_err(), "{key} whitespace should be removed");
 
             // A real value is left alone, and so is a variable nobody set.
             std::env::set_var(key, "true");
-            clear_blank_flag_env();
+            clear_blank_env();
             assert_eq!(std::env::var(key).unwrap(), "true");
             std::env::remove_var(key);
-            clear_blank_flag_env();
+            clear_blank_env();
             assert!(std::env::var(key).is_err());
+        }
+
+        // The three states the deploy guide documents, spelled the way
+        // `docker compose` actually spells them: every interpolated variable
+        // present, the unfilled ones empty rather than absent. The previous
+        // version of this file passed every test while the third of these
+        // exited 2 at startup, because nothing exercised the parse.
+        for (closed, token, expected) in
+            [("", "abc123", "token required"), ("", "", "open to anyone"), ("true", "", "closed")]
+        {
+            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", closed);
+            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", token);
+            clear_blank_env();
+            let args = Args::try_parse_from(["credvault-server"]).unwrap_or_else(|e| {
+                panic!("compose produces CLOSED={closed:?} TOKEN={token:?}; clap must take it: {e}")
+            });
+            let policy = registration_policy(args.closed_registration, args.registration_token);
+            assert_eq!(policy.describe(), expected, "CLOSED={closed:?} TOKEN={token:?}");
+        }
+
+        // Asking for both at once is still refused rather than guessed at.
+        std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", "true");
+        std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "abc123");
+        clear_blank_env();
+        assert!(Args::try_parse_from(["credvault-server"]).is_err(), "a token and closed together must be refused");
+
+        std::env::remove_var("CREDVAULT_CLOSED_REGISTRATION");
+        std::env::remove_var("CREDVAULT_REGISTRATION_TOKEN");
+    }
+
+    /// Which service each documented setting has to reach. Everything the
+    /// server reads belongs to `credvault`; the certificate pair is the
+    /// proxy's.
+    fn owning_service(name: &str) -> &'static str {
+        match name {
+            "CREDVAULT_DOMAIN" | "CREDVAULT_ACME_EMAIL" => "caddy",
+            _ => "credvault",
         }
     }
 
-    /// Every `CREDVAULT_*` setting the deploy guide tells an operator to use
-    /// must actually be passed into the container.
+    /// The `environment:` block of one service, with comments stripped.
     ///
-    /// Written because one was not. `deploy/README.md` documented
+    /// Scoped and stripped because a plain text search over the whole file
+    /// accepts three things that leave the bug reachable: the variable named
+    /// in the *other* service, named only in a comment, or named on a line
+    /// that is commented out.
+    fn environment_of(compose: &str, service: &str) -> String {
+        let after = compose.split_once(&format!("\n  {service}:")).expect("service in compose").1;
+        let block = after.split_once("\n    environment:").expect("environment block").1;
+        block
+            .lines()
+            .take_while(|line| line.trim().is_empty() || line.starts_with("      "))
+            .map(|line| line.split_once('#').map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every `CREDVAULT_*` setting the deploy docs tell an operator to use
+    /// must actually reach the container that reads it.
+    ///
+    /// Written because one did not. `deploy/README.md` documented
     /// `CREDVAULT_CLOSED_REGISTRATION=true` as the way to stop new accounts,
     /// and it was absent from the compose `environment:` block, so setting it
-    /// reached the interpolation context and never the server. Combined with
-    /// a blank token meaning "open", following the documented way to shut
-    /// registration left it open to anyone instead -- the failure pointing the
-    /// wrong way round from the one the operator was guarding against.
+    /// reached compose's interpolation context and never the server. Combined
+    /// with a blank token meaning "open", following the documented way to
+    /// shut registration left it open to anyone instead -- the failure
+    /// pointing the opposite way from the one the operator was guarding
+    /// against.
+    ///
+    /// `.env.example` is read as well as the README, because it is the file
+    /// the operator actually edits and two settings are documented only there.
     #[test]
-    fn every_setting_the_deploy_guide_names_is_passed_to_the_container() {
+    fn every_setting_the_deploy_docs_name_reaches_the_container_that_reads_it() {
         let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
-        let readme = std::fs::read_to_string(deploy.join("README.md")).expect("deploy/README.md");
         let compose = std::fs::read_to_string(deploy.join("docker-compose.yml")).expect("docker-compose.yml");
-
-        // The server's own variables; the proxy's are set elsewhere in the file.
-        let named: std::collections::BTreeSet<&str> = readme
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter(|word| word.starts_with("CREDVAULT_"))
-            .filter(|word| !["CREDVAULT_DOMAIN", "CREDVAULT_ACME_EMAIL"].contains(word))
+        let documented: std::collections::BTreeSet<String> = ["README.md", ".env.example"]
+            .iter()
+            .flat_map(|file| {
+                let text = std::fs::read_to_string(deploy.join(file)).unwrap_or_else(|_| panic!("deploy/{file}"));
+                text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|word| word.starts_with("CREDVAULT_"))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
             .collect();
-        assert!(!named.is_empty(), "the guide should name some settings");
+        assert!(documented.len() >= 4, "the docs should name several settings, found {documented:?}");
 
-        let missing: Vec<&str> = named.into_iter().filter(|name| !compose.contains(&format!("{name}:"))).collect();
-        assert!(missing.is_empty(), "named in deploy/README.md but never reaching the container: {missing:?}");
+        let missing: Vec<&String> = documented
+            .iter()
+            .filter(|name| !environment_of(&compose, owning_service(name)).contains(&format!("{name}:")))
+            .collect();
+        assert!(missing.is_empty(), "documented in deploy/ but never reaching their container: {missing:?}");
     }
 
     #[test]
@@ -335,7 +417,6 @@ mod tests {
         assert_eq!(registration_policy(false, None).describe(), "open to anyone");
         let gated = registration_policy(false, Some("s3cret".into()));
         assert_eq!(gated.describe(), "token required");
-        assert!(!gated.describe().contains("s3cret"), "the log must not carry the token");
     }
 
     #[test]

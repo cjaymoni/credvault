@@ -64,7 +64,9 @@ docker compose logs credvault | grep "registration policy"
 
 tells you what a host was last started with. It is one line per start, not a
 running status: if you need to know what a long-running container is doing
-now, restart it or read the policy you configured.
+now, restart it or read the policy you configured. No line at all means the
+container did not start -- `docker compose ps` will show it restarting, and
+the reason is above the last line of its log.
 
 ## Sign in with Google (optional)
 

@@ -53,10 +53,12 @@ chooses the middle one:
   make on purpose, because anyone on the internet can then create an account
   and store data you are hosting.
 - **Closed.** Set `CREDVAULT_CLOSED_REGISTRATION=true` and leave the token
-  unset. Existing accounts keep working. `yes`, `on` and `1` are read the same
-  way, as are capitals and stray whitespace; anything else stops the server and
-  names what it takes, rather than guessing at what you meant. Setting both a
-  token and closed at once stops it too.
+  unset. Existing accounts keep working. `yes`, `on` and `1` mean the same, as
+  do capitals and stray whitespace. `false`, `0` and blank all mean this
+  setting is not in use. Anything else -- including `off` and `no`, which read
+  both ways on a variable with this name -- stops the server and names what it
+  takes, rather than guessing at what you meant. Setting both a token and
+  closed at once stops it too.
 
 The server prints which state it is in on every start, so
 

@@ -173,16 +173,19 @@ const BOOL_FLAGS: [&str; 2] = ["CREDVAULT_CLOSED_REGISTRATION", "CREDVAULT_TRUST
 /// Anything outside this list still reaches clap, which stops the server and
 /// names the variable and the values it takes. That is a stop with a reason;
 /// what this table prevents is a stop over a capital letter.
-const BOOLISH: [(&str, &str); 8] = [
-    ("true", "true"),
-    ("yes", "true"),
-    ("on", "true"),
-    ("1", "true"),
-    ("false", "false"),
-    ("no", "false"),
-    ("off", "false"),
-    ("0", "false"),
-];
+///
+/// `off` and `no` are deliberately absent, and the asymmetry is the point.
+/// The variable is called `CLOSED_REGISTRATION`, so those two read both ways:
+/// "closed-registration is off" means open, and "registration: off" means
+/// closed. The truthy spellings have the same ambiguity -- `on` could be read
+/// as "registration on" -- but they resolve to *closed*, which is the
+/// restrictive direction and is noticed within minutes because sign-ups stop.
+/// A falsey misreading resolves to open to anyone, on a public vault, silently.
+/// Measured before they were removed: `CREDVAULT_CLOSED_REGISTRATION=off`
+/// booted and logged `registration="open to anyone"`. So they stop the server
+/// instead, and the operator is asked what they meant.
+const BOOLISH: [(&str, &str); 6] =
+    [("true", "true"), ("yes", "true"), ("on", "true"), ("1", "true"), ("false", "false"), ("0", "false")];
 
 /// Make the environment say what the operator meant, before clap reads it.
 ///
@@ -206,8 +209,17 @@ fn normalize_env() {
     for key in BOOL_FLAGS {
         let Ok(value) = std::env::var(key) else { continue };
         let written = value.trim().to_ascii_lowercase();
-        if let Some((_, canonical)) = BOOLISH.iter().find(|(spelling, _)| *spelling == written) {
-            std::env::set_var(key, canonical);
+        match BOOLISH.iter().find(|(spelling, _)| *spelling == written) {
+            // Falsey means "this setting is not in use", which is what a blank
+            // one already means, so they become the same thing. Leaving
+            // `false` in the environment instead makes clap count the flag as
+            // present, and `conflicts_with` then refuses it beside a
+            // registration token: exit 2, and a crash loop under
+            // `restart: unless-stopped`. The flag defaults to false anyway, so
+            // removing it parses identically where it already worked.
+            Some((_, "false")) => std::env::remove_var(key),
+            Some((_, canonical)) => std::env::set_var(key, canonical),
+            None => {}
         }
     }
 }
@@ -399,11 +411,31 @@ mod tests {
             assert_eq!(policy.describe(), "closed", "CLOSED={written:?}");
         }
 
-        // Something that is not a spelling of anything still stops the server,
-        // because guessing at it is how a vault ends up open by accident.
-        std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", "maybe");
-        normalize_env();
-        assert!(Args::try_parse_from(["credvault-server"]).is_err(), "an unrecognised value must stop the server");
+        // The falsey half, which had no test while it was the half that could
+        // open a vault. A token alongside it must still mean "token
+        // required" rather than the exit 2 that a present-but-false flag used
+        // to produce.
+        for written in ["false", "FALSE", "0", "false "] {
+            for (token, expected) in [("", "open to anyone"), ("abc123", "token required")] {
+                std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", written);
+                std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", token);
+                normalize_env();
+                let args = Args::try_parse_from(["credvault-server"])
+                    .unwrap_or_else(|e| panic!("CLOSED={written:?} TOKEN={token:?} must not stop the server: {e}"));
+                let policy = registration_policy(args.closed_registration, args.registration_token);
+                assert_eq!(policy.describe(), expected, "CLOSED={written:?} TOKEN={token:?}");
+            }
+        }
+
+        // Spellings that read both ways on a variable called CLOSED_REGISTRATION
+        // must stop the server rather than pick one. Getting this wrong opens a
+        // vault silently; see BOOLISH.
+        for ambiguous in ["off", "no", "maybe"] {
+            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", ambiguous);
+            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "");
+            normalize_env();
+            assert!(Args::try_parse_from(["credvault-server"]).is_err(), "{ambiguous:?} must stop the server");
+        }
 
         // Asking for both at once is still refused rather than guessed at.
         std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", "true");

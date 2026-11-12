@@ -41,13 +41,21 @@ The installers are not code-signed, so each system will question them once.
 During pre-release the Server URL field arrives pre-filled with the
 maintainer's test server, so you can create an account without being handed
 an address. Leaving it as it is means your account is created there, on a
-machine someone else runs. You will also need the registration token for it,
-which whoever invited you will send you privately.
+machine someone else runs. That server currently accepts anyone who can reach
+it: no registration token, no invitation. A server that does ask for one shows
+a **Does the server require a registration token?** button instead, and
+whoever invited you sends the token privately; the field stays folded away
+because not every server asks for one.
 
-Enter your email and a passphrase of at least 12 characters, then click
-**Does the server require a registration token?**, paste it in, and
-**Create account**. That button is how the token field appears; it stays
-folded away because not every server asks for one.
+Enter your email and a passphrase of at least 12 characters and press **Create
+account**. Or press **Continue with Google**, which opens your browser, hands
+the result back to the app, and then asks for a passphrase of your own to
+encrypt the vault with. Google is how the server knows who you are; it is
+never how your secrets are decrypted, and it never sees that passphrase.
+
+The sign-in screen links to a Terms of Service and a Privacy Policy. Both are
+drafts: the app says so above them, and the operator's details in them are
+still blank.
 
 The address is only a default: whatever you type replaces it and is
 remembered. Running your own server is described in

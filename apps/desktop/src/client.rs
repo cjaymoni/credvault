@@ -58,14 +58,42 @@ pub const PASSWORD_CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// the freeze timing is Samsung's and undocumented, so a caller that cannot
 /// afford a dead connection asks for a live one with [`ApiClient::reconnect`]
 /// instead of trusting this number.
-/// How long to wait before each retry of a request that never left the device
-/// in the ordinary case: one quick go, then report it.
+const IDLE_CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a client does when the connector itself fails, as a pair: the waits
+/// between attempts, and a ceiling on the whole sequence.
+///
+/// The ceiling is the part that is easy to leave out. The waits alone do not
+/// bound anything, because each attempt also costs up to this client's request
+/// timeout before it fails -- and a connect can be slow, not quick: a resolver
+/// with unreachable nameservers blocks for seconds per lookup, and a TCP
+/// connect that ends in `ETIMEDOUT` takes a minute or more. Eleven attempts of
+/// that is minutes of a frozen-looking screen. With a budget, no further
+/// attempt starts once the sequence has run long enough, so a slow failure
+/// stops the retrying instead of multiplying it.
+#[derive(Debug, PartialEq, Eq)]
+struct ConnectRetries {
+    /// How long to wait before each attempt after the first. One entry, one
+    /// further attempt.
+    backoffs: &'static [std::time::Duration],
+    /// How long the whole sequence may run before the last error is reported
+    /// rather than another attempt made.
+    budget: std::time::Duration,
+}
+
+/// What every request does by default: one quick go, then report it.
 ///
 /// Short on purpose. A user whose network is genuinely down should be told so
 /// while the tap still feels connected to the answer, not after a wait. The
-/// one place that needs to be patient instead asks for it; see
-/// [`PATIENT_CONNECT_RETRIES`].
-const BRIEF_CONNECT_RETRIES: &[std::time::Duration] = &[std::time::Duration::from_millis(250)];
+/// one request that needs patience asks for it; see [`PATIENT_CONNECT_RETRIES`].
+///
+/// The budget is what keeps [`ApiClient::change_password`] honest. That one
+/// request is given 180 seconds of its own, and a TCP connect can burn most of
+/// them before failing; without a ceiling, retrying it would double the wait on
+/// the one request whose doc comment says that leaving the user unable to tell
+/// what happened is the thing it must not do.
+const BRIEF_CONNECT_RETRIES: ConnectRetries =
+    ConnectRetries { backoffs: &[std::time::Duration::from_millis(250)], budget: std::time::Duration::from_secs(2) };
 
 /// The waits used for the one request that must not be allowed to fail: the
 /// one that spends a Google authorization code.
@@ -83,20 +111,21 @@ const BRIEF_CONNECT_RETRIES: &[std::time::Duration] = &[std::time::Duration::fro
 ///
 /// The user waits rather than being thrown back to the sign-in screen, and the
 /// wait only happens when the alternative was failing outright.
-const PATIENT_CONNECT_RETRIES: &[std::time::Duration] = &[
-    std::time::Duration::from_millis(250),
-    std::time::Duration::from_millis(500),
-    std::time::Duration::from_secs(1),
-    std::time::Duration::from_secs(1),
-    std::time::Duration::from_secs(1),
-    std::time::Duration::from_secs(2),
-    std::time::Duration::from_secs(2),
-    std::time::Duration::from_secs(2),
-    std::time::Duration::from_secs(3),
-    std::time::Duration::from_secs(3),
-];
-
-const IDLE_CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
+const PATIENT_CONNECT_RETRIES: ConnectRetries = ConnectRetries {
+    backoffs: &[
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(3),
+    ],
+    budget: std::time::Duration::from_secs(20),
+};
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -106,7 +135,7 @@ pub struct ApiClient {
     /// How hard this client tries when the connector itself fails. Normally
     /// [`BRIEF_CONNECT_RETRIES`]; see [`ApiClient::reconnect`] for the one
     /// client that is patient instead.
-    connect_retries: &'static [std::time::Duration],
+    connect_retries: &'static ConnectRetries,
 }
 
 #[derive(serde::Deserialize)]
@@ -120,9 +149,20 @@ impl ApiClient {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .pool_idle_timeout(IDLE_CONNECTION_LIFETIME)
+            // Not optional, and not merely tidy for a typed JSON API: it is
+            // what makes the retry in `send_retrying_connects` safe. reqwest
+            // follows up to ten redirects by default, and a connect failure on
+            // a later hop is still reported as `is_connect()` -- so a request
+            // whose body a first hop had already swallowed would be resent
+            // from the top. Measured before this line existed: a 308 pointing
+            // at a dead port delivered one `/oauth/callback` body, code and
+            // all, eleven times while the user was told the server could not
+            // be reached. With no redirects, a connect failure can only ever
+            // be the first and only hop.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ClientError::Network(describe_transport_error(&e)))?;
-        Ok(Self { http, base_url: server_url.to_string(), token: None, connect_retries: BRIEF_CONNECT_RETRIES })
+        Ok(Self { http, base_url: server_url.to_string(), token: None, connect_retries: &BRIEF_CONNECT_RETRIES })
     }
 
     /// A second client for the same server and session, with a connection pool
@@ -136,10 +176,27 @@ impl ApiClient {
     /// a retry succeeds. The one that cannot is the end of a Google sign-in: it
     /// carries an authorization code that is good once, and the user cannot be
     /// sent back to Google for another without starting over.
+    /// The same client, prepared to wait out a connector that is refusing it.
+    ///
+    /// Scoped deliberately narrowly -- see [`PATIENT_CONNECT_RETRIES`] for what
+    /// it costs and why one request is worth it. A client that is parked
+    /// somewhere, or that is about to hold a session, gives it back with
+    /// [`ApiClient::promptly`].
+    pub fn patiently(mut self) -> Self {
+        self.connect_retries = &PATIENT_CONNECT_RETRIES;
+        self
+    }
+
+    /// The same client, back to reporting an unreachable server promptly.
+    pub fn promptly(mut self) -> Self {
+        self.connect_retries = &BRIEF_CONNECT_RETRIES;
+        self
+    }
+
     pub fn reconnect(&self) -> Result<Self, ClientError> {
         let mut fresh = Self::new(&self.base_url)?;
         fresh.token = self.token.clone();
-        fresh.connect_retries = PATIENT_CONNECT_RETRIES;
+        fresh.connect_retries = self.connect_retries;
         Ok(fresh)
     }
 
@@ -150,7 +207,7 @@ impl ApiClient {
     /// dead network promptly rather than waiting one out.
     pub fn with_token(mut self, token: &str) -> Self {
         self.token = Some(token.to_string());
-        self.connect_retries = BRIEF_CONNECT_RETRIES;
+        self.connect_retries = &BRIEF_CONNECT_RETRIES;
         self
     }
 
@@ -248,14 +305,23 @@ impl ApiClient {
         &self,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, ClientError> {
-        for backoff in self.connect_retries {
-            match build().send().await {
+        let ConnectRetries { backoffs, budget } = *self.connect_retries;
+        let started = std::time::Instant::now();
+        let mut remaining = backoffs.iter();
+        loop {
+            let failure = match build().send().await {
                 Ok(response) => return Ok(response),
-                Err(error) if error.is_connect() => tokio::time::sleep(*backoff).await,
+                Err(error) if error.is_connect() => error,
                 Err(error) => return Err(ClientError::Network(describe_transport_error(&error))),
-            }
+            };
+            // The budget is checked against the wait that would follow, not
+            // against the time already spent, so a sequence cannot start a
+            // sleep it has no room for.
+            let Some(backoff) = remaining.next().filter(|backoff| started.elapsed() + **backoff <= budget) else {
+                return Err(ClientError::Network(describe_transport_error(&failure)));
+            };
+            tokio::time::sleep(*backoff).await;
         }
-        build().send().await.map_err(|e| ClientError::Network(describe_transport_error(&e)))
     }
 
     const NO_BODY: Option<&()> = None;
@@ -526,37 +592,12 @@ mod tests {
             http: reqwest::Client::builder().timeout(std::time::Duration::from_millis(200)).build().unwrap(),
             base_url: format!("http://127.0.0.1:{port}"),
             token: None,
-            connect_retries: BRIEF_CONNECT_RETRIES,
+            connect_retries: &BRIEF_CONNECT_RETRIES,
         };
         let Err(ClientError::Network(message)) = api.health().await else {
             panic!("a server that never answers must be reported as a network failure");
         };
         assert!(message.contains("timed out"), "a deadline must be named, got: {message}");
-    }
-
-    /// Serve one canned HTTP response per connection, counting them.
-    async fn counting_server(body: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = served.clone();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let counter = counter.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buffer = [0u8; 2048];
-                    let _ = stream.read(&mut buffer).await;
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
-            }
-        });
-        (format!("http://127.0.0.1:{port}"), served)
     }
 
     #[tokio::test]
@@ -567,20 +608,30 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(matches!(api.health().await, Err(ClientError::Network(_))));
         let spent = started.elapsed();
-        let budget: std::time::Duration = BRIEF_CONNECT_RETRIES.iter().sum();
+        let budget: std::time::Duration = BRIEF_CONNECT_RETRIES.backoffs.iter().sum();
         assert!(spent >= budget, "every backoff must be waited out: {spent:?} < {budget:?}");
     }
 
     #[tokio::test]
     async fn a_connect_that_succeeds_on_a_later_try_is_not_reported_as_a_failure() {
         // A port that is dead now and alive shortly after is the shape of the
-        // bug: Android refuses the lookup until the app reaches the foreground.
+        // bug: Android refuses the app's lookups until it reaches the
+        // foreground, then stops refusing them.
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+
+        let api = ApiClient::new(&format!("http://127.0.0.1:{port}")).unwrap().patiently();
+        let asking = tokio::spawn(async move { api.health().await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Rebound here rather than inside a spawned task so that losing the
+        // race for the port fails this test by name instead of hanging it out
+        // to the full budget with no indication why.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("another process took the port in the gap; rerun");
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -596,49 +647,132 @@ mod tests {
             }
         });
 
-        // Through a reconnected client, because waiting out a connector that
-        // clears is exactly what that client is for.
-        let api = ApiClient::new(&format!("http://127.0.0.1:{port}")).unwrap().reconnect().unwrap();
-        let health = api.health().await.expect("a connector failure that clears must not reach the user");
+        let health = asking.await.unwrap().expect("a connector failure that clears must not reach the user");
         assert_eq!(health.protocol, 3);
     }
 
+    /// Accept, read the request, count it, and hang up without answering.
+    /// That fails the request *after* its bytes reached the far end, which is
+    /// the shape that must never be retried. The count is of requests the
+    /// server actually received.
+    async fn server_that_takes_the_request_and_says_nothing() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer).await;
+                    // Counted once the request is in hand: the point of every
+                    // test using this is how many times the far end received
+                    // something, not how many times this process sent one.
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(stream);
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), served)
+    }
+
+    fn a_callback() -> OAuthCallbackRequest {
+        OAuthCallbackRequest { state: "s".into(), app_secret: String::from("a").into(), code: String::from("c").into() }
+    }
+
     #[tokio::test]
-    async fn a_request_the_server_answered_is_never_sent_twice() {
-        // The reason the retry is allowed to exist at all: once the far end
-        // has the request, nothing may replay it. /oauth/callback and
-        // /register are not safe to send twice.
-        let (base_url, served) = counting_server(r#"{"error":"nope"}"#).await;
-        let api = ApiClient::new(&base_url).unwrap();
-        let _ = api
-            .oauth_callback(&OAuthCallbackRequest {
-                state: "s".into(),
-                app_secret: String::from("a").into(),
-                code: String::from("c").into(),
-            })
-            .await;
+    async fn a_request_the_server_already_has_is_never_sent_again() {
+        // The reason the retry is allowed to exist at all. Once the far end
+        // has the request, nothing may replay it: /oauth/callback spends a
+        // code that is good once, and /register creates an account.
+        let (base_url, served) = server_that_takes_the_request_and_says_nothing().await;
+        let api = ApiClient::new(&base_url).unwrap().patiently();
+        let outcome = api.oauth_callback(&a_callback()).await;
+        assert!(matches!(outcome, Err(ClientError::Network(_))), "a server that hangs up is a failure");
         assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1, "the server must see it exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_cannot_turn_one_request_into_many() {
+        // This is the shape that broke the safety argument: a first hop takes
+        // the body and answers 308, the second hop fails in the connector, and
+        // `is_connect()` is true for an error that happened *after* the code
+        // was delivered. Measured at eleven deliveries before the client
+        // stopped following redirects.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dead = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buffer = [0u8; 4096];
+                    let read = stream.read(&mut buffer).await.unwrap_or(0);
+                    if String::from_utf8_lossy(&buffer[..read]).contains("app_secret") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let location = format!("http://127.0.0.1:{dead_port}/api/oauth/callback");
+                    let response =
+                        format!("HTTP/1.1 308 Permanent Redirect\r\nLocation: {location}\r\ncontent-length: 0\r\n\r\n");
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let api = ApiClient::new(&format!("http://127.0.0.1:{port}")).unwrap().reconnect().unwrap().patiently();
+        let outcome = api.oauth_callback(&a_callback()).await;
+        assert!(
+            matches!(outcome, Err(ClientError::Server(_))),
+            "an unfollowed 3xx is the server's answer, got {outcome:?}"
+        );
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1, "the code must reach the server exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_sequence_of_slow_failures_stops_at_its_budget() {
+        // Waits alone bound nothing: each attempt also costs a timeout. A
+        // connect that takes longer than the budget must end the sequence
+        // rather than multiply it.
+        let api = ApiClient::new(&a_dead_address().await).unwrap().patiently();
+        let started = std::time::Instant::now();
+        assert!(matches!(api.health().await, Err(ClientError::Network(_))));
+        let spent = started.elapsed();
+        assert!(spent <= PATIENT_CONNECT_RETRIES.budget, "the sequence must not outrun its budget: {spent:?}");
     }
 
     #[tokio::test]
     async fn the_request_that_spends_a_google_code_waits_out_a_block_that_an_ordinary_one_would_not() {
         // The measured block was 7.5s; an ordinary request must not sit there
         // that long, and the one carrying the code must outlast it.
-        let ordinary: std::time::Duration = BRIEF_CONNECT_RETRIES.iter().sum();
-        let patient: std::time::Duration = PATIENT_CONNECT_RETRIES.iter().sum();
+        let ordinary: std::time::Duration = BRIEF_CONNECT_RETRIES.backoffs.iter().sum();
+        let patient: std::time::Duration = PATIENT_CONNECT_RETRIES.backoffs.iter().sum();
         assert!(ordinary < std::time::Duration::from_secs(1), "an offline tap must answer promptly: {ordinary:?}");
         assert!(patient > std::time::Duration::from_millis(7500) * 2, "too little margin over the measurement");
 
         let api = ApiClient::new("https://example.test").unwrap();
-        assert_eq!(api.connect_retries, BRIEF_CONNECT_RETRIES);
-        assert_eq!(api.reconnect().unwrap().connect_retries, PATIENT_CONNECT_RETRIES);
+        assert_eq!(api.connect_retries, &BRIEF_CONNECT_RETRIES);
+        // Patience is asked for by name; reconnecting alone does not grant it.
+        assert_eq!(api.reconnect().unwrap().connect_retries, &BRIEF_CONNECT_RETRIES);
+        assert_eq!(api.clone().patiently().connect_retries, &PATIENT_CONNECT_RETRIES);
     }
 
     #[test]
     fn patience_ends_when_the_sign_in_does() {
         // Otherwise every later tap on a dead network inherits the long wait.
-        let signed_in = ApiClient::new("https://example.test").unwrap().reconnect().unwrap().with_token("t");
-        assert_eq!(signed_in.connect_retries, BRIEF_CONNECT_RETRIES);
+        let signed_in = ApiClient::new("https://example.test").unwrap().patiently().with_token("t");
+        assert_eq!(signed_in.connect_retries, &BRIEF_CONNECT_RETRIES);
+        assert_eq!(
+            ApiClient::new("https://example.test").unwrap().patiently().promptly().connect_retries,
+            &BRIEF_CONNECT_RETRIES
+        );
     }
 
     #[test]
@@ -659,29 +793,17 @@ mod tests {
     async fn a_reconnected_client_does_not_inherit_the_pool() {
         // Two clients sharing a pool would share its corpses; the whole point
         // of reconnecting is that this one starts empty. Observable as a
-        // second connection on the wire, so count accepts.
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = accepted.clone();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                held.push(stream);
-            }
-        });
+        // second connection on the wire, so count accepts. The server hangs up
+        // without answering, which fails both calls at once rather than
+        // leaving either to sit out a timeout.
+        let (base_url, reached) = server_that_takes_the_request_and_says_nothing().await;
 
-        let api = ApiClient {
-            http: reqwest::Client::builder().timeout(std::time::Duration::from_millis(200)).build().unwrap(),
-            base_url: format!("http://127.0.0.1:{port}"),
-            token: None,
-            connect_retries: BRIEF_CONNECT_RETRIES,
-        };
+        let api = ApiClient::new(&base_url).unwrap();
         let _ = api.health().await;
         let fresh = api.reconnect().unwrap();
+        assert_eq!(fresh.base_url(), api.base_url(), "the same server");
         let _ = fresh.health().await;
-        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2, "each client must dial for itself");
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 2, "each client dials for itself");
     }
 
     #[test]

@@ -1063,7 +1063,11 @@ async fn authorize_with_google(
     // never in the URL the browser followed, so returning it with the code is
     // what proves this app started the flow.
     let callback = OAuthCallbackRequest { state: started.state, app_secret: started.app_secret, code };
-    Ok((api.reconnect()?, callback))
+    // Patient only for the request that spends the code; see
+    // `ApiClient::patiently`. Reconnected because a connection that survived
+    // the trip through the browser may be a corpse, and the retry that makes
+    // the patience worth having only applies to a connect failure.
+    Ok((api.reconnect()?.patiently(), callback))
 }
 
 /// What the server at `server_url` supports. Called before the sign-in screen
@@ -1099,7 +1103,10 @@ async fn google_sign_in(
             (PendingGoogle::Unlock { api, session }, GoogleSignInStage::Unlock { email })
         }
         OAuthCallbackResponse::RegistrationRequired { ticket, email } => (
-            PendingGoogle::CreateAccount { api, ticket, email: email.clone() },
+            // `promptly` because this one is parked, not spent: it waits here
+            // through a passphrase prompt of no fixed length, and a client
+            // that comes back to a dead network should say so at once.
+            PendingGoogle::CreateAccount { api: api.promptly(), ticket, email: email.clone() },
             GoogleSignInStage::CreateAccount {
                 email,
                 registration_token_required: capabilities.registration_token_required,

@@ -76,8 +76,15 @@ struct ConnectRetries {
     /// How long to wait before each attempt after the first. One entry, one
     /// further attempt.
     backoffs: &'static [std::time::Duration],
-    /// How long the whole sequence may run before the last error is reported
-    /// rather than another attempt made.
+    /// How long the sequence may run *before a further attempt is started*.
+    ///
+    /// Not a ceiling on the whole sequence, and the difference is worth having
+    /// straight: the attempt this lets start is then bounded only by the
+    /// client's request timeout, so the worst case is this plus one timeout --
+    /// about 40 seconds for a patient client, and `budget + 180s` for
+    /// [`ApiClient::change_password`]. Bounding the end instead would mean
+    /// abandoning an attempt already in flight, which for a request that may
+    /// have reached the server is the ambiguity this client works to avoid.
     budget: std::time::Duration,
 }
 
@@ -95,8 +102,9 @@ struct ConnectRetries {
 const BRIEF_CONNECT_RETRIES: ConnectRetries =
     ConnectRetries { backoffs: &[std::time::Duration::from_millis(250)], budget: std::time::Duration::from_secs(2) };
 
-/// The waits used for the one request that must not be allowed to fail: the
-/// one that spends a Google authorization code.
+/// The waits used for the requests that must not be allowed to fail: the two
+/// that spend a Google authorization code, `/oauth/callback` and
+/// `/oauth/link`, both reached from `authorize_with_google`.
 ///
 /// Sized from the measurement, not from a guess. On a Galaxy S22 on mobile
 /// data, from the instant the redirect came back from Chrome, this app's DNS
@@ -133,8 +141,8 @@ pub struct ApiClient {
     base_url: String,
     token: Option<String>,
     /// How hard this client tries when the connector itself fails. Normally
-    /// [`BRIEF_CONNECT_RETRIES`]; see [`ApiClient::reconnect`] for the one
-    /// client that is patient instead.
+    /// [`BRIEF_CONNECT_RETRIES`]; [`ApiClient::patiently`] is how a client
+    /// comes to carry [`PATIENT_CONNECT_RETRIES`] instead.
     connect_retries: &'static ConnectRetries,
 }
 
@@ -165,17 +173,6 @@ impl ApiClient {
         Ok(Self { http, base_url: server_url.to_string(), token: None, connect_retries: &BRIEF_CONNECT_RETRIES })
     }
 
-    /// A second client for the same server and session, with a connection pool
-    /// of its own and nothing idle in it.
-    ///
-    /// For the request that follows a trip out of the app. While the system
-    /// browser holds the foreground, Android freezes this app and destroys its
-    /// live TCP sockets, so whatever the pool is holding is a corpse and the
-    /// next write to it fails -- see [`IDLE_CONNECTION_LIFETIME`]. Most callers
-    /// can wear that, because the dead connection is evicted on the way out and
-    /// a retry succeeds. The one that cannot is the end of a Google sign-in: it
-    /// carries an authorization code that is good once, and the user cannot be
-    /// sent back to Google for another without starting over.
     /// The same client, prepared to wait out a connector that is refusing it.
     ///
     /// Scoped deliberately narrowly -- see [`PATIENT_CONNECT_RETRIES`] for what
@@ -193,6 +190,20 @@ impl ApiClient {
         self
     }
 
+    /// A second client for the same server and session, with a connection pool
+    /// of its own and nothing idle in it.
+    ///
+    /// For the request that follows a trip out of the app. While the system
+    /// browser holds the foreground, Android freezes this app and destroys its
+    /// live TCP sockets, so whatever the pool is holding is a corpse and the
+    /// next write to it fails -- see [`IDLE_CONNECTION_LIFETIME`]. Most callers
+    /// can wear that, because the dead connection is evicted on the way out and
+    /// a retry succeeds. The one that cannot is the end of a Google sign-in: it
+    /// carries an authorization code that is good once, and the user cannot be
+    /// sent back to Google for another without starting over.
+    ///
+    /// Only the pool. Waiting is a separate decision, asked for by name with
+    /// [`ApiClient::patiently`].
     pub fn reconnect(&self) -> Result<Self, ClientError> {
         let mut fresh = Self::new(&self.base_url)?;
         fresh.token = self.token.clone();
@@ -679,6 +690,25 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), served)
     }
 
+    /// Read from `stream` until `marker` has arrived, or the peer stops
+    /// sending, or a second passes. Says whether it arrived.
+    async fn read_until_marker(stream: &mut tokio::net::TcpStream, marker: &str) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut seen = Vec::new();
+        let deadline = std::time::Duration::from_secs(1);
+        loop {
+            let mut buffer = [0u8; 1024];
+            match tokio::time::timeout(deadline, stream.read(&mut buffer)).await {
+                Ok(Ok(0)) | Err(_) => return false,
+                Ok(Ok(read)) => seen.extend_from_slice(&buffer[..read]),
+                Ok(Err(_)) => return false,
+            }
+            if String::from_utf8_lossy(&seen).contains(marker) {
+                return true;
+            }
+        }
+    }
+
     fn a_callback() -> OAuthCallbackRequest {
         OAuthCallbackRequest { state: "s".into(), app_secret: String::from("a").into(), code: String::from("c").into() }
     }
@@ -713,10 +743,12 @@ mod tests {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let counter = counter.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buffer = [0u8; 4096];
-                    let read = stream.read(&mut buffer).await.unwrap_or(0);
-                    if String::from_utf8_lossy(&buffer[..read]).contains("app_secret") {
+                    use tokio::io::AsyncWriteExt;
+                    // Read until the body is in hand, not once: a single read
+                    // can return headers alone, and this counter missing a
+                    // delivery would read as the replay regression it exists
+                    // to catch.
+                    if read_until_marker(&mut stream, "app_secret").await {
                         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     let location = format!("http://127.0.0.1:{dead_port}/api/oauth/callback");
@@ -736,16 +768,28 @@ mod tests {
         assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1, "the code must reach the server exactly once");
     }
 
+    /// Ten waits that cannot all fit: the budget allows the first three and
+    /// then stops the sequence. Small enough to run in a blink.
+    const TRUNCATED_RETRIES: ConnectRetries = ConnectRetries {
+        backoffs: &[std::time::Duration::from_millis(50); 10],
+        budget: std::time::Duration::from_millis(175),
+    };
+
     #[tokio::test]
-    async fn a_sequence_of_slow_failures_stops_at_its_budget() {
-        // Waits alone bound nothing: each attempt also costs a timeout. A
-        // connect that takes longer than the budget must end the sequence
-        // rather than multiply it.
-        let api = ApiClient::new(&a_dead_address().await).unwrap().patiently();
+    async fn the_budget_cuts_the_backoff_table_short() {
+        // The budget is the half of the policy that bounds anything, and the
+        // table it truncates is ten entries long. Timing is the observable:
+        // honouring the budget stops near 150ms, ignoring it runs the full
+        // 500ms of waits. A closed port fails each connect in microseconds, so
+        // what is measured here is the waiting and nothing else.
+        let api = ApiClient { connect_retries: &TRUNCATED_RETRIES, ..ApiClient::new(&a_dead_address().await).unwrap() };
         let started = std::time::Instant::now();
         assert!(matches!(api.health().await, Err(ClientError::Network(_))));
         let spent = started.elapsed();
-        assert!(spent <= PATIENT_CONNECT_RETRIES.budget, "the sequence must not outrun its budget: {spent:?}");
+
+        let whole_table: std::time::Duration = TRUNCATED_RETRIES.backoffs.iter().sum();
+        assert!(spent < whole_table / 2, "the budget must stop the sequence early: {spent:?} of {whole_table:?}");
+        assert!(spent >= std::time::Duration::from_millis(100), "but not before the waits that fit: {spent:?}");
     }
 
     #[tokio::test]
@@ -756,6 +800,20 @@ mod tests {
         let patient: std::time::Duration = PATIENT_CONNECT_RETRIES.backoffs.iter().sum();
         assert!(ordinary < std::time::Duration::from_secs(1), "an offline tap must answer promptly: {ordinary:?}");
         assert!(patient > std::time::Duration::from_millis(7500) * 2, "too little margin over the measurement");
+        // Patience is two numbers and the budget is the binding one. A budget
+        // tuned below its own table would truncate it silently -- every
+        // assertion above would still pass while real patience collapsed,
+        // possibly back under the 7.5s block this exists to outlast.
+        assert!(
+            PATIENT_CONNECT_RETRIES.budget >= patient,
+            "a budget under its table truncates it: {:?} < {patient:?}",
+            PATIENT_CONNECT_RETRIES.budget,
+        );
+        assert!(
+            BRIEF_CONNECT_RETRIES.budget >= ordinary,
+            "the brief retry must fit its own budget: {:?} < {ordinary:?}",
+            BRIEF_CONNECT_RETRIES.budget,
+        );
 
         let api = ApiClient::new("https://example.test").unwrap();
         assert_eq!(api.connect_retries, &BRIEF_CONNECT_RETRIES);

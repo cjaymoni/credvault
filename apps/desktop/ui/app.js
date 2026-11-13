@@ -15,6 +15,13 @@ const TOAST_MS = 2200;
 const MASKED = "••••••••••••";
 // Limits owned by the Rust crates; `ui_constants` overwrites these defaults at startup.
 const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLength: 20, maxCustomFields: 20, maxLabelLength: 100, maxFieldLength: 4096 };
+// What the token field says, and what the form says when it is left empty.
+// The server would also refuse a blank token, but its answer is written for
+// an API caller ("a registration token is required") and arrives only after a
+// round-trip that was never going to succeed.
+const TOKEN_REQUIRED_HINT = "This server only creates accounts for people who have its token. Whoever invited you can give you one.";
+const TOKEN_OPTIONAL_HINT = "Only needed if the server was set up to ask for one.";
+const TOKEN_MISSING_ERROR = "Paste the registration token for this server. Ask whoever invited you for it.";
 const THEME_KEY = "theme";
 const THEME_CHOICES = ["system", "light", "dark"];
 
@@ -25,6 +32,9 @@ const state = { secrets: [], selected: null, editing: false, editTitle: "", auth
   // What the server at the URL in the box offers, and the Google sign-in
   // waiting for a passphrase, if there is one.
   capabilities: null, google: null, user: null,
+  // The user opened the registration-token field themselves, on a server that
+  // did not say it needs one. Kept so a re-render does not fold it away again.
+  tokenFieldOpen: false,
   // Set when the server at that URL answered but speaks a protocol this build
   // cannot use; null the rest of the time.
   incompatible: null };
@@ -239,6 +249,29 @@ function closeDialog(dialog) {
   if (dialog?.open) dialog.close();
 }
 
+/// Show a legal document, and remember which one so the switch reflects it.
+///
+/// The text comes from ui/legal.js, which scripts/build-legal.js generates
+/// from docs/terms.md and docs/privacy.md. It is assigned as HTML because it
+/// *is* markup, built at generation time from our own files with every
+/// inline value escaped -- nothing a user or a server can influence reaches
+/// it. See scripts/build-legal.js.
+function showLegal(which) {
+  const document_ = Legal[which];
+  if (!document_) throw new Error(`no legal document named ${JSON.stringify(which)}`);
+  $("legal-title").textContent = document_.title;
+  $("legal-body").innerHTML = document_.html;
+  $("legal-body").scrollTop = 0;
+  // Only a draft says so, and it says so above the text rather than inside
+  // it, so nobody reads a placeholder as a term they agreed to.
+  $("legal-draft").classList.toggle("hidden", !document_.draft);
+  for (const [id, key] of [["tab-terms", "terms"], ["tab-privacy", "privacy"]]) {
+    $(id).setAttribute("aria-pressed", String(key === which));
+  }
+  openDialog($("legal-dialog"));
+  $("legal-body").focus();
+}
+
 /// The first of these that is actually on screen: the same action can sit in
 /// a different place per platform, and focus has to return to the one shown.
 function firstVisible(...ids) {
@@ -409,8 +442,8 @@ function setAuthMode(mode) {
   $("tab-login").setAttribute("aria-pressed", String(!isRegister));
   $("tab-register").setAttribute("aria-pressed", String(isRegister));
   $("auth-title").textContent = isRegister ? "Create your account" : "Welcome back";
-  $("btn-show-token").classList.toggle("hidden", !isRegister);
-  if (!isRegister) showTokenField(false);
+  if (!isRegister) state.tokenFieldOpen = false;
+  renderTokenPrompt();
   $("password-hint").classList.toggle("hidden", !isRegister);
   $("password").autocomplete = isRegister ? "new-password" : "current-password";
   $("btn-auth").textContent = isRegister ? "Create account" : "Log in";
@@ -420,23 +453,47 @@ function setAuthMode(mode) {
 }
 
 /// The phone layout shows the server as one line and keeps the field folded
-/// behind it. Unfolding is one-way: once someone is editing the address they
-/// stay in the field until they leave the screen.
+/// behind it, because the address is right far more often than it is wrong.
+/// Tapping the line unfolds the field: wrong is the case that matters, and a
+/// default that cannot be corrected is how someone's vault ends up on a
+/// stranger's server.
 function showServerField() {
   $("auth").classList.add("server-open");
   $("server").focus();
 }
+
 function syncServerSummary() {
   $("server-summary").textContent = Screens.serverSummaryText($("server").value, DEFAULT_SERVER);
 }
 
-/// The registration token is only needed on servers that require one, so the
-/// field stays folded away until asked for.
-function showTokenField(show) {
-  $("token-field").classList.toggle("hidden", !show);
-  $("btn-show-token").classList.toggle("hidden", show || state.authMode !== "register");
-  $("btn-show-token").setAttribute("aria-expanded", String(show));
-  if (show) $("registration-token").focus();
+/// Draw the registration-token field for whatever the server has said about
+/// itself. See Screens.tokenPrompt() for the three cases.
+///
+/// A server that requires a token gets the field open and marked required, so
+/// the demand is visible before the form is filled in rather than after it is
+/// submitted -- and so authenticate() can refuse an empty one here instead of
+/// relaying the server's 403.
+function renderTokenPrompt() {
+  const prompt = Screens.tokenPrompt(
+    state.authMode === "register",
+    state.capabilities?.registration_token_required,
+    state.tokenFieldOpen,
+  );
+  $("token-field").classList.toggle("hidden", !prompt.field);
+  $("btn-show-token").classList.toggle("hidden", !prompt.disclosure);
+  $("btn-show-token").setAttribute("aria-expanded", String(prompt.field));
+  const input = $("registration-token");
+  input.required = prompt.required;
+  input.setAttribute("aria-required", String(prompt.required));
+  $("token-hint").textContent = prompt.required ? TOKEN_REQUIRED_HINT : TOKEN_OPTIONAL_HINT;
+  return prompt;
+}
+
+/// Open the field because the user asked for it, and keep it open.
+function showTokenField() {
+  state.tokenFieldOpen = true;
+  renderTokenPrompt();
+  $("registration-token").focus();
 }
 
 async function authenticate(event) {
@@ -453,8 +510,14 @@ async function authenticate(event) {
     $("password").focus();
     return;
   }
+  const registrationToken = $("registration-token").value.trim();
+  if (isRegister && !registrationToken && renderTokenPrompt().required) {
+    setError("auth-error", TOKEN_MISSING_ERROR);
+    $("registration-token").focus();
+    return;
+  }
   const args = { serverUrl, email, password };
-  if (isRegister) args.registrationToken = $("registration-token").value.trim() || null;
+  if (isRegister) args.registrationToken = registrationToken || null;
   setBusy($("btn-auth"), true, isRegister ? "Creating account…" : "Unlocking…");
   try {
     const user = await invoke(isRegister ? "register" : "login", args);
@@ -462,10 +525,11 @@ async function authenticate(event) {
     remember("email", email);
     $("password").value = "";
     $("registration-token").value = "";
+    state.tokenFieldOpen = false;
     showApp(user);
   } catch (error) {
     setError("auth-error", error);
-    if (isRegister && /token/i.test(String(error?.message ?? error))) showTokenField(true);
+    if (isRegister && /token/i.test(String(error?.message ?? error))) showTokenField();
   } finally {
     setBusy($("btn-auth"), false);
   }
@@ -500,6 +564,8 @@ async function refreshCapabilities() {
   else if (wasIncompatible) setError("auth-error", "");
   const offered = Boolean(state.capabilities?.google_sign_in) && !state.google;
   $("google-block").classList.toggle("hidden", !offered);
+  // A different server can have a different answer about the token.
+  renderTokenPrompt();
   renderGoogleChip();
 }
 
@@ -532,6 +598,7 @@ function showGoogleForm(show) {
   if (!show) {
     $("google-password").value = "";
     $("google-registration-token").value = "";
+    renderGoogleTokenPrompt(false, false);
     setError("google-error", "");
   }
 }
@@ -554,7 +621,7 @@ async function startGoogleSignIn() {
       : "Google cannot unlock your vault; only this passphrase can.";
     $("google-password").autocomplete = creating ? "new-password" : "current-password";
     $("btn-google-submit").textContent = creating ? "Create vault" : "Unlock vault";
-    $("google-token-field").classList.toggle("hidden", !(creating && stage.registration_token_required));
+    renderGoogleTokenPrompt(creating, stage.registration_token_required);
     showGoogleForm(true);
     $("google-password").focus();
   } catch (error) {
@@ -562,6 +629,18 @@ async function startGoogleSignIn() {
   } finally {
     setBusy($("btn-google"), false);
   }
+}
+
+/// The Google path has no disclosure button: by the time it is on screen the
+/// server has already answered, in the sign-in stage itself. So the field is
+/// either open and required or not there at all.
+function renderGoogleTokenPrompt(isCreating, serverRequires) {
+  const prompt = Screens.tokenPrompt(isCreating, Boolean(serverRequires));
+  $("google-token-field").classList.toggle("hidden", !prompt.field);
+  const input = $("google-registration-token");
+  input.required = prompt.required;
+  input.setAttribute("aria-required", String(prompt.required));
+  $("google-token-hint").textContent = TOKEN_REQUIRED_HINT;
 }
 
 async function submitGooglePassphrase(event) {
@@ -576,8 +655,14 @@ async function submitGooglePassphrase(event) {
     return;
   }
 
+  const registrationToken = $("google-registration-token").value.trim();
+  if (creating && !registrationToken && state.google?.registration_token_required) {
+    setError("google-error", TOKEN_MISSING_ERROR);
+    $("google-registration-token").focus();
+    return;
+  }
   const args = creating
-    ? { password, registrationToken: $("google-registration-token").value.trim() || null }
+    ? { password, registrationToken: registrationToken || null }
     : { password };
   setBusy($("btn-google-submit"), true, creating ? "Creating vault…" : "Unlocking…");
   try {
@@ -589,7 +674,10 @@ async function submitGooglePassphrase(event) {
   } catch (error) {
     setError("google-error", error);
     if (creating && /token/i.test(String(error?.message ?? error))) {
-      $("google-token-field").classList.remove("hidden");
+      // The stage said no token was wanted and the server disagreed. Believe
+      // the server, so the next submit is checked here rather than there.
+      if (state.google) state.google.registration_token_required = true;
+      renderGoogleTokenPrompt(true, true);
     }
   } finally {
     setBusy($("btn-google-submit"), false);
@@ -827,8 +915,6 @@ function showApp(user) {
 /// they used to each keep their own copy, which had already drifted apart.
 function resetToSignedOut() {
   clearReveals();
-  // The next person to use this app gets the folded server line back.
-  $("auth").classList.remove("server-open");
   // Dropped with the rest of it: the chip reads the signed-in account, and a
   // stale one would describe the last person to use this app.
   state.user = null;
@@ -841,6 +927,8 @@ function resetToSignedOut() {
   setError("main-error", "");
   $("app").classList.add("hidden");
   $("auth").classList.remove("hidden");
+  // The next person to use this app gets the folded server line back.
+  $("auth").classList.remove("server-open");
 }
 
 async function logout() {
@@ -1929,7 +2017,13 @@ $("tab-login").onclick = () => setAuthMode("login");
 $("tab-register").onclick = () => setAuthMode("register");
 $("auth-form").onsubmit = authenticate;
 $("btn-auth-toggle-pw").onclick = () => togglePasswordInput($("password"), $("btn-auth-toggle-pw"));
-$("btn-show-token").onclick = () => showTokenField(true);
+$("btn-show-token").onclick = () => showTokenField();
+// Every control that names a document opens it: the two lines under the sign-in
+// forms, the two tabs inside the dialog, and the entry in the vault.
+for (const control of document.querySelectorAll("[data-legal]")) {
+  control.onclick = () => showLegal(control.dataset.legal);
+}
+$("btn-legal-close").onclick = () => closeDialog($("legal-dialog"));
 $("btn-google").onclick = startGoogleSignIn;
 $("google-form").onsubmit = submitGooglePassphrase;
 $("btn-google-cancel").onclick = cancelGoogleSignIn;
@@ -1941,8 +2035,8 @@ $("btn-sign-out-others").onclick = () => renderSignOutOthersForm();
 // settles rather than on every keystroke.
 $("server").onchange = () => refreshCapabilities();
 $("server").onblur = () => refreshCapabilities();
-$("server").oninput = syncServerSummary;
 $("btn-server-change").onclick = showServerField;
+$("server").oninput = syncServerSummary;
 $("btn-logout").onclick = () => logout().catch((error) => setError("main-error", error));
 $("btn-refresh").onclick = () => { closeAccountSheet({ restoreFocus: false }); refresh(); };
 $("btn-back").onclick = goBack;

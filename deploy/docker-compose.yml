@@ -19,7 +19,19 @@ services:
       # Rate limits are keyed on the rightmost X-Forwarded-For address, which
       # is the one Caddy appends. Only correct behind the proxy below.
       CREDVAULT_TRUST_FORWARDED_FOR: "true"
-      CREDVAULT_REGISTRATION_TOKEN: ${CREDVAULT_REGISTRATION_TOKEN:?set this in .env}
+      # Who may create an account. Three states, and exactly one of them is
+      # what this file ships: a token means holders of it, blank means anyone
+      # who can reach the server, and CREDVAULT_CLOSED_REGISTRATION=true means
+      # nobody. The server prints which one it is on every start.
+      #
+      # Both are passed through, because the way to close registration is to
+      # set the second one -- and if it is not listed here it never reaches
+      # the container. Setting it in .env then leaves the token blank instead,
+      # which is the *open* state: the documented way to shut the door would
+      # have opened it. Clap refuses both at once, so a stray pair stops the
+      # server rather than guessing.
+      CREDVAULT_REGISTRATION_TOKEN: ${CREDVAULT_REGISTRATION_TOKEN:-}
+      CREDVAULT_CLOSED_REGISTRATION: ${CREDVAULT_CLOSED_REGISTRATION:-}
       # Optional; both blank keeps the server password-only. Clap requires
       # them together, so a lone value stops the server rather than quietly
       # running without the button.

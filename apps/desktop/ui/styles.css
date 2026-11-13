@@ -1218,7 +1218,6 @@ input.mono.mismatch { border-color: var(--danger); }
     background: var(--surface-2);
     font-size: var(--text-small);
     text-align: left;
-    cursor: pointer;
   }
   .server-summary-label { flex: none; color: var(--text-3); }
   .server-summary-value {

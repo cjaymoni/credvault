@@ -247,6 +247,115 @@ test("every platform places every moving control, each in a slot the page has", 
   }
 });
 
+test("on Android the account button sits beside the search field, not inside it", () => {
+  // It used to ride inside the search pill, which read as a profile chip
+  // glued to the input. Both halves are pinned here: it shares the row with
+  // the search field, and the slot it used to sit in is gone, so it cannot
+  // quietly move back.
+  const html = fs.readFileSync(path.join(__dirname, "../ui/index.html"), "utf8");
+  const placement = new Map(placementFor("android"));
+  assert.equal(placement.get("account"), placement.get("search"), "account shares the search row");
+  assert.ok(!html.includes('data-slot="search-end"'), "the slot inside the search pill is gone");
+  for (const platform of PLATFORMS) {
+    const where = new Map(placementFor(platform));
+    assert.notEqual(where.get("account"), "search-end", `${platform} must not place account in the pill`);
+  }
+});
+
+test("on Android the account circle is sized from the same token as the search field", () => {
+  // They sit side by side on one row, so any difference in height reads as a
+  // mistake. Pinned as a shared token rather than two numbers that happen to
+  // agree, because two numbers drift and nothing on screen says which is wrong.
+  const css = fs.readFileSync(path.join(__dirname, "../ui/platform.css"), "utf8");
+  const body = (selector) => {
+    const start = css.indexOf(`${selector} {`);
+    assert.notEqual(start, -1, `no rule for ${selector}`);
+    return css.slice(start, css.indexOf("}", start));
+  };
+  const ANDROID = '[data-platform="android"]';
+
+  assert.match(body(`${ANDROID} .sidebar-search`), /--search-row-h:\s*\d+px/, "the row defines the shared height");
+  for (const [selector, properties] of [
+    [`${ANDROID} .sidebar-search .search`, ["height"]],
+    [`${ANDROID} #btn-account`, ["width", "height"]],
+    [`${ANDROID} #btn-account .acct-avatar`, ["width", "height"]],
+  ]) {
+    const declarations = body(selector);
+    for (const property of properties) {
+      assert.match(declarations, new RegExp(`${property}:\\s*var\\(--search-row-h\\)`), `${selector} -> ${property}`);
+    }
+  }
+  // A button carries UA padding of its own, which squeezed the circle inside
+  // it to 44px wide against 56px tall. Zeroing it is load-bearing, not tidying.
+  assert.match(body(`${ANDROID} #btn-account`), /padding:\s*0/, "the button must not pad the circle into an oval");
+});
+
+test("the server address stays reachable on a phone", () => {
+  // The narrow layout hides #server-field and shows a one-line summary in its
+  // place. That is fine only while something can unfold it again: with the
+  // summary a plain <p> and no rule re-showing the field, an Android user had
+  // no way to change the address at any width, and the shipped default points
+  // at someone else's server. Self-hosting is the product.
+  const css = fs.readFileSync(path.join(__dirname, "../ui/styles.css"), "utf8");
+  const html = fs.readFileSync(path.join(__dirname, "../ui/index.html"), "utf8");
+  const js = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+
+  assert.match(css, /\.auth\.server-open #server-field\s*\{[^}]*display:\s*block/, "a state must re-show the field");
+  // The whole tag, so the one attribute that makes it work is pinned. The
+  // button sits inside <form id="auth-form">, where a missing type="button"
+  // is type="submit": every tap on the server line would submit the sign-in
+  // form instead of unfolding the field, which on a phone reads as "Enter
+  // your email." under the line the user was trying to edit.
+  const tag = html.match(/<button[^>]*id="btn-server-change"[^>]*>/);
+  assert.ok(tag, "the summary must be pressable, not a caption");
+  assert.match(tag[0], /type="button"/, "it must not submit the form it sits in");
+
+  // Captured rather than grepped, so the binding has to reach the function
+  // that opens the field. Four independent regexes over three files would
+  // pass with the handler bound to something else entirely, as long as the
+  // string appeared somewhere in app.js -- including in dead code.
+  const bound = js.match(/\$\("btn-server-change"\)\.onclick\s*=\s*(\w+)/);
+  assert.ok(bound, "pressing it must be wired to something");
+  const handler = js.match(new RegExp(`function ${bound[1]}\\(\\)\\s*\\{[^}]*\\}`));
+  assert.ok(handler, `${bound[1]}() must be a function in app.js`);
+  assert.match(handler[0], /classList\.add\("server-open"\)/, "and it must open the field");
+
+  // Clearing it on the way out is the part with no other guard: a later
+  // refactor that splits resetToSignedOut loses the folded line silently, and
+  // the next person to sign in sees the previous one's server already unfolded.
+  const reset = js.match(/function resetToSignedOut\(\)\s*\{[\s\S]*?\n\}/);
+  assert.ok(reset, "resetToSignedOut must exist");
+  assert.match(reset[0], /classList\.remove\("server-open"\)/, "signing out must refold the server line");
+});
+
+test("a closed dialog stays closed: no dialog sets display outside [open]", () => {
+  // A <dialog> is hidden by the browser's own `dialog:not([open]) {display:none}`.
+  // Any rule that sets `display` on the element beats it, and the dialog then
+  // renders in the page flow -- which is how the legal sheet came to sit at the
+  // bottom of the sign-in screen, visible to anyone who scrolled that far.
+  // Both stylesheets, because the page loads both and the next dialog rule
+  // is as likely to be written in one as the other.
+  const css = ["../ui/styles.css", "../ui/platform.css"]
+    .map((sheet) => fs.readFileSync(path.join(__dirname, sheet), "utf8"))
+    .join("\n")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  /// The element a selector actually targets: its last compound, with any
+  /// pseudo-element or pseudo-class dropped. `.legal-dialog .legal-body`
+  /// targets the body, not the dialog, and must not be flagged.
+  const target = (selector) => selector.trim().split(/[\s>+~]+/).pop().replace(/::?[\w-]+(\([^)]*\))?/g, "");
+  const isDialog = (compound) => /(^|[.#])(?:[\w-]*-)?dialog(?:\[[^\]]*\])*$/.test(compound);
+
+  const offenders = [];
+  for (const [, prelude, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = prelude.trim().replace(/\s+/g, " ");
+    if (selector.startsWith("@") || !/(^|;)\s*display\s*:/.test(body)) continue;
+    for (const one of selector.split(",")) {
+      if (isDialog(target(one)) && !one.includes("[open]")) offenders.push(one.trim());
+    }
+  }
+  assert.deepStrictEqual(offenders, [], "set display on the [open] state, or the closed dialog shows in the page");
+});
+
 test("asking for a platform with no layout fails loudly", () => {
   assert.throws(() => placementFor("beos"), TypeError);
   assert.throws(() => placementFor("toString"), TypeError);
@@ -344,4 +453,68 @@ test("every platform the app knows gets an answer from the list, not from Object
   for (const unknown of ["beos", "", null, undefined, "toString", "__proto__"]) {
     assert.equal(namesShortcuts(unknown), false, String(unknown));
   }
+});
+
+// ----- what the create-account form asks about the registration token --------
+//
+// The point of the `required` answer is that the form can refuse a blank
+// token in its own words. Without it the app sends an empty token to a server
+// it already knows will reject it, and shows the user the 403 that comes
+// back -- an error written for an API caller, after a round-trip that was
+// never going to work.
+
+const { tokenPrompt } = require("../ui/screens.js");
+
+test("logging in never asks for a registration token", () => {
+  for (const answer of [true, false, undefined, null]) {
+    assert.deepEqual(tokenPrompt(false, answer), { field: false, disclosure: false, required: false });
+    // Not even if the user had opened the field while on the other tab.
+    assert.deepEqual(tokenPrompt(false, answer, true), { field: false, disclosure: false, required: false });
+  }
+});
+
+test("a server that requires a token says so before the form is submitted", () => {
+  assert.deepEqual(tokenPrompt(true, true), { field: true, disclosure: false, required: true });
+});
+
+test("a server that requires a token is not also asked whether it does", () => {
+  // The disclosure button's words are a question. Once the server has
+  // answered it, leaving the question on screen is noise.
+  assert.equal(tokenPrompt(true, true).disclosure, false);
+  assert.equal(tokenPrompt(true, false).disclosure, false);
+});
+
+test("a server that needs no token shows neither the field nor the question", () => {
+  assert.deepEqual(tokenPrompt(true, false), { field: false, disclosure: false, required: false });
+});
+
+test("a server that has not answered yet is the one case worth asking about", () => {
+  for (const unknown of [undefined, null]) {
+    assert.deepEqual(tokenPrompt(true, unknown), { field: false, disclosure: true, required: false }, String(unknown));
+  }
+});
+
+test("only a literal true means required, so a truthy answer is not mistaken for one", () => {
+  // `registration_token_required` arrives over IPC. Anything that is not the
+  // boolean the server sent is an unknown answer, not a yes.
+  for (const notTrue of ["true", 1, {}, "yes"]) {
+    assert.equal(tokenPrompt(true, notTrue).required, false, String(notTrue));
+  }
+});
+
+test("a field the user opened stays open across a re-render", () => {
+  assert.deepEqual(tokenPrompt(true, undefined, true), { field: true, disclosure: false, required: false });
+  // Including after a submit failed on a server whose capabilities said no
+  // token was needed: folding it away would hide the recovery.
+  assert.deepEqual(tokenPrompt(true, false, true), { field: true, disclosure: false, required: false });
+});
+
+test("the prompt cannot be mutated by whoever renders it", () => {
+  // Frozen rather than throwing: screens.js is a plain script, so a sloppy
+  // assignment is silently dropped. What matters is that it cannot turn a
+  // required token into an optional one for the next caller.
+  const prompt = tokenPrompt(true, true);
+  prompt.required = false;
+  assert.equal(prompt.required, true);
+  assert.equal(tokenPrompt(true, true).required, true);
 });

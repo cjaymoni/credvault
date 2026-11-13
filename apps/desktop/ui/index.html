@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="styles.css">
 <link rel="stylesheet" href="platform.css">
 <script src="screens.js"></script>
+<script src="legal.js"></script>
 <script src="boot.js"></script>
 </head>
 <body>
@@ -31,9 +32,12 @@
     </div>
 
     <form id="auth-form" novalidate>
-      <!-- On a phone the whole field is one line until it needs changing. The
-           address itself stays on screen either way: it is where the
-           credential is about to be sent. -->
+      <!-- On a phone the server is one line and is not editable there. It is
+           still shown rather than hidden: it is where the credential is about
+           to be sent, and that is worth seeing before it is sent. It is a
+           button because the address has to stay changeable on a phone --
+           self-hosting is the point of the product, and a default pointing at
+           someone else's server is not a default anyone can be held to. -->
       <button type="button" class="server-summary" id="btn-server-change">
         <span class="server-summary-label">Server</span>
         <span class="server-summary-value" id="server-summary"></span>
@@ -62,6 +66,7 @@
       <div class="field hidden" id="token-field">
         <label for="registration-token">Registration token</label>
         <input id="registration-token" autocomplete="off" spellcheck="false">
+        <p class="hint" id="token-hint"></p>
       </div>
       <div class="error" id="auth-error" role="alert"></div>
       <button type="submit" class="btn primary block" id="btn-auth">Log in</button>
@@ -93,13 +98,16 @@
       <div class="field hidden" id="google-token-field">
         <label for="google-registration-token">Registration token</label>
         <input id="google-registration-token" autocomplete="off" spellcheck="false">
-        <p class="hint">This server only creates accounts for people who have its token.</p>
+        <p class="hint" id="google-token-hint"></p>
       </div>
       <div class="error" id="google-error" role="alert"></div>
       <button type="submit" class="btn primary block" id="btn-google-submit">Unlock vault</button>
       <button type="button" class="link-btn block" id="btn-google-cancel">Cancel</button>
     </form>
   </div>
+  <p class="auth-legal">Creating an account means you accept the
+    <button type="button" class="link-btn inline" data-legal="terms">Terms of Service</button> and
+    <button type="button" class="link-btn inline" data-legal="privacy">Privacy Policy</button>.</p>
   <div class="auth-foot"><span>End-to-end encrypted · Self-hosted · Open source</span>
     <div class="theme-switch" id="theme-switch-auth" role="group" aria-label="Appearance">
       <button type="button" data-theme-choice="system" aria-pressed="true" title="Match the system" aria-label="Match the system">
@@ -135,7 +143,6 @@
       <div class="search" id="search-box">
         <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         <input id="filter" type="search" placeholder="Search" aria-label="Search secrets" autocomplete="off" spellcheck="false">
-        <div class="slot" data-slot="search-end"></div>
       </div>
     </div>
     <div class="slot" data-slot="sidebar-top">
@@ -242,6 +249,12 @@
       <span class="chip-label">Sign out other devices</span>
     </button>
 
+    <button type="button" class="chip" id="btn-legal" data-legal="terms"
+      title="The terms you accepted when you created this account, and what the server can and cannot see.">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg>
+      <span class="chip-label">Terms and privacy</span>
+    </button>
+
     <div class="theme-switch" id="theme-switch-app" role="group" aria-label="Appearance">
       <button type="button" data-theme-choice="system" aria-pressed="true" title="Match the system" aria-label="Match the system">
         <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
@@ -266,6 +279,22 @@
     </button>
   </div>
 </section>
+
+<!-- Terms of Service and Privacy Policy. One dialog for both: they are read
+     the same way, they are switched between from inside, and the text is
+     generated from docs/*.md by scripts/build-legal.js. -->
+<dialog class="dialog legal-dialog" id="legal-dialog" aria-labelledby="legal-title">
+  <h2 id="legal-title" class="dialog-title"></h2>
+  <p class="legal-draft hidden" id="legal-draft" role="status">Draft. This text is not final and the operator's details are still blank.</p>
+  <div class="segmented legal-switch" role="group" aria-label="Document">
+    <button type="button" id="tab-terms" data-legal="terms" aria-pressed="false">Terms</button>
+    <button type="button" id="tab-privacy" data-legal="privacy" aria-pressed="false">Privacy</button>
+  </div>
+  <div class="legal-body" id="legal-body" tabindex="0"></div>
+  <div class="dialog-actions">
+    <button type="button" class="btn primary" id="btn-legal-close">Close</button>
+  </div>
+</dialog>
 
 <!-- Invite someone to the open secret. A modal dialog on every platform: it
      holds the email, the fingerprint check and the confirmation in one place. -->

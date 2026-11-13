@@ -205,11 +205,11 @@ const carriesTokens = (rule) => rule.declarations.length > 0;
 const whereAndWhat = (rule) => `${rule.at.join(" >> ")}||${rule.selector}`;
 
 /// The token-carrying rules that are deliberately not dark palettes: the
-/// light defaults each platform starts from, and the blocks that override a
-/// few tokens for a width. Anything carrying tokens that is in neither this
-/// list nor DARK_PALETTES fails the test below, so a new one is a decision
-/// somebody makes on purpose rather than a palette that quietly goes
-/// unchecked.
+/// light defaults each platform starts from, the blocks that override a few
+/// tokens for a width, and the one rule that declares a measurement rather
+/// than a colour. Anything carrying tokens that is in neither this list nor
+/// DARK_PALETTES fails the test below, so a new one is a decision somebody
+/// makes on purpose rather than a palette that quietly goes unchecked.
 const NOT_A_PALETTE = [
   "||:root",
   '||:root[data-platform="macos"]',
@@ -227,9 +227,17 @@ function paletteKeys() {
   return DARK_PALETTES.flatMap(([, media, theme]) => [`${DARK_MEDIA}||${media}`, `||${theme}`]);
 }
 
+/// Tokens that are measurements rather than colours, and so are not part of
+/// any palette wherever they are declared.
+const NOT_A_COLOUR = ["--search-row-h"];
+
+/// Whether a rule carries anything a palette would have to account for.
+const carriesPaletteTokens = (rule) =>
+  rule.declarations.some(([name]) => !NOT_A_COLOUR.includes(name));
+
 test("every rule that carries tokens is a palette the table names, or a listed exception", () => {
   const accounted = new Set([...paletteKeys(), ...NOT_A_PALETTE]);
-  const unaccounted = ALL_RULES.filter(carriesTokens)
+  const unaccounted = ALL_RULES.filter(carriesPaletteTokens)
     .map(whereAndWhat)
     .filter((key) => !accounted.has(key));
   assert.deepStrictEqual([...new Set(unaccounted)], [], "add each to DARK_PALETTES or to NOT_A_PALETTE");

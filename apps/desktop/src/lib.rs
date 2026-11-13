@@ -1028,13 +1028,18 @@ mod authorization_url {
     }
 }
 
-/// Run the browser half of a sign-in and hand back the code it produced.
+/// Run the browser half of a sign-in and hand back the code it produced,
+/// along with the client to spend it on.
 /// Shared by signing in and by linking, which differ only in purpose.
+///
+/// The returned client is not the one passed in. Everything after this point
+/// happens on the far side of a trip through the system browser, and the
+/// pooled connection does not survive that trip; see [`ApiClient::reconnect`].
 async fn authorize_with_google(
     app: &AppHandle,
     api: &ApiClient,
     purpose: OAuthPurpose,
-) -> CommandResult<OAuthCallbackRequest> {
+) -> CommandResult<(ApiClient, OAuthCallbackRequest)> {
     let listener = RedirectListener::bind()
         .await
         .map_err(|e| CommandError::new("oauth", format!("could not listen for the sign-in response: {e}")))?;
@@ -1057,7 +1062,12 @@ async fn authorize_with_google(
     // `app_secret` came back over this client's own HTTPS connection and was
     // never in the URL the browser followed, so returning it with the code is
     // what proves this app started the flow.
-    Ok(OAuthCallbackRequest { state: started.state, app_secret: started.app_secret, code })
+    let callback = OAuthCallbackRequest { state: started.state, app_secret: started.app_secret, code };
+    // Patient only for the request that spends the code; see
+    // `ApiClient::patiently`. Reconnected because a connection that survived
+    // the trip through the browser may be a corpse, and the retry that makes
+    // the patience worth having only applies to a connect failure.
+    Ok((api.reconnect()?.patiently(), callback))
 }
 
 /// What the server at `server_url` supports. Called before the sign-in screen
@@ -1084,7 +1094,7 @@ async fn google_sign_in(
 
     // Any earlier attempt is void the moment a new one starts.
     clear_pending_google(&state);
-    let callback = authorize_with_google(&app, &api, OAuthPurpose::SignIn).await?;
+    let (api, callback) = authorize_with_google(&app, &api, OAuthPurpose::SignIn).await?;
 
     let (pending, stage) = match api.oauth_callback(&callback).await? {
         OAuthCallbackResponse::SignedIn(session) => {
@@ -1093,7 +1103,10 @@ async fn google_sign_in(
             (PendingGoogle::Unlock { api, session }, GoogleSignInStage::Unlock { email })
         }
         OAuthCallbackResponse::RegistrationRequired { ticket, email } => (
-            PendingGoogle::CreateAccount { api, ticket, email: email.clone() },
+            // `promptly` because this one is parked, not spent: it waits here
+            // through a passphrase prompt of no fixed length, and a client
+            // that comes back to a dead network should say so at once.
+            PendingGoogle::CreateAccount { api: api.promptly(), ticket, email: email.clone() },
             GoogleSignInStage::CreateAccount {
                 email,
                 registration_token_required: capabilities.registration_token_required,
@@ -1227,7 +1240,7 @@ async fn google_link(
     // reading a consent screen in a browser. Dropped rather than held for it.
     drop(master);
 
-    let callback = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
+    let (api, callback) = authorize_with_google(&app, &api, OAuthPurpose::Link).await?;
     let profile =
         api.oauth_link(&OAuthLinkRequest::new(callback, Some(auth_hash))).await.map_err(passphrase_rejected)?;
     remember_google_email(&state, user_id, profile.google_email)

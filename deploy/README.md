@@ -40,14 +40,37 @@ ufw enable
 
 ## Accounts
 
-Registration requires `CREDVAULT_REGISTRATION_TOKEN`; clients send it as
-`registration_token` when creating an account. Give it only to people who
-should have accounts on this server.
+Who may create an account is one of three states, and `.env` as shipped
+chooses the middle one:
 
-- Rotate it by editing `.env` and running `docker compose up -d`. Existing
-  accounts are unaffected.
-- Stop new accounts entirely by replacing the token variable with
-  `CREDVAULT_CLOSED_REGISTRATION=true`.
+- **A token.** Set `CREDVAULT_REGISTRATION_TOKEN`; clients send it as
+  `registration_token` when creating an account. Give it only to people who
+  should have accounts here. Rotate it by editing `.env` and running
+  `docker compose up -d`; existing accounts are unaffected.
+- **Blank: anyone who can reach the server.** This is what an unset variable
+  means, and what the shipped `.env.example` gives you. The app then shows no
+  token field at all. Fine on loopback; on a public host it is a decision to
+  make on purpose, because anyone on the internet can then create an account
+  and store data you are hosting.
+- **Closed.** Set `CREDVAULT_CLOSED_REGISTRATION=true` and leave the token
+  unset. Existing accounts keep working. `yes`, `on` and `1` mean the same, as
+  do capitals and stray whitespace. `false`, `0` and blank all mean this
+  setting is not in use. Anything else -- including `off` and `no`, which read
+  both ways on a variable with this name -- stops the server and names what it
+  takes, rather than guessing at what you meant. Setting both a token and
+  closed at once stops it too.
+
+The server prints which state it is in on every start, so
+
+```sh
+docker compose logs credvault | grep "registration policy"
+```
+
+tells you what a host was last started with. It is one line per start, not a
+running status: if you need to know what a long-running container is doing
+now, restart it or read the policy you configured. No line at all means the
+container did not start -- `docker compose ps` will show it restarting, and
+the reason is above the last line of its log.
 
 ## Sign in with Google (optional)
 

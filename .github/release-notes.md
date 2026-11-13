@@ -8,9 +8,42 @@ there is no password recovery, by design: nobody, including whoever runs the
 server, can reset your passphrase or decrypt your vault for you. Use throwaway
 credentials, or expect to type everything in again.
 
-**The app and the server have to come from the same release.** The app checks
-what the server speaks before it sends anything and will tell you plainly if
-the two cannot work together.
+**The app and the server have to come from the same release, and this one is
+strict about it.** The app checks what the server speaks before it sends
+anything. This release raised the minimum: against any server from before it,
+the app refuses to connect and says so, and refusing happens before any
+credential is sent, so the vault does not open either — not just the new
+features. If you run your own server, **upgrade the server first, then the
+app**. If you are on the pre-filled test server and the app says the server is
+too old, that upgrade has not landed yet; give it a little while and try
+again.
+
+## What is new in __TAG__
+
+**Projects.** You can group your secrets under a heading — say a project
+called Perspectiv holding Cloudflare, Gmail and Jira. Make one from the
+Project box while adding or editing a secret, or from **Projects** in the
+account menu, where you can also rename and delete them. Deleting a project
+never deletes the secrets in it; they are kept and simply stop being grouped,
+and the confirmation asks you to type the project's name so you cannot lose a
+heading by misclicking a row.
+
+**Choosing what a project tells other people.** When you share a secret that
+is in a project, the invite has a separate tick box for whether that person is
+also told which project. It is off unless you tick it: sharing one password is
+not sharing how your vault is organised. A secret that is not in a project yet
+has nothing to tell, so the box only appears once it is filed. You can change
+your mind for each person afterwards from the Sharing list, once they have
+accepted. Someone you share with is shown the project's *name* and never which
+other secrets of yours are filed there.
+
+**What the server can see.** A project's name is stored unencrypted, the same
+way a secret's name already is, because the server has to be able to send back
+a heading it can draw. So whoever runs the server can see that you keep a
+project called Perspectiv and which of your secrets are filed under it. The
+secrets themselves are unchanged: still encrypted on your device, still
+unreadable to the server. If a grouping is itself sensitive, do not put it in
+a project name.
 
 ## Installing
 

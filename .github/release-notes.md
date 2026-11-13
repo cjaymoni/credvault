@@ -8,42 +8,72 @@ there is no password recovery, by design: nobody, including whoever runs the
 server, can reset your passphrase or decrypt your vault for you. Use throwaway
 credentials, or expect to type everything in again.
 
-**The app and the server have to come from the same release, and this one is
-strict about it.** The app checks what the server speaks before it sends
-anything. This release raised the minimum: against any server from before it,
-the app refuses to connect and says so, and refusing happens before any
-credential is sent, so the vault does not open either — not just the new
-features. If you run your own server, **upgrade the server first, then the
-app**. If you are on the pre-filled test server and the app says the server is
-too old, that upgrade has not landed yet; give it a little while and try
-again.
+**The app checks the server before it sends anything, and will refuse one
+that is too old.** This release does not raise that minimum: a __TAG__ app
+works against a 0.2.0 server. Anything older than 0.2.0 is refused, and
+refusing happens before any credential is sent, so the vault does not open at
+all rather than opening without the new features. If you run your own server
+and are coming from 0.1.x, **upgrade the server first, then the app**.
 
 ## What is new in __TAG__
 
-**Projects.** You can group your secrets under a heading — say a project
-called Perspectiv holding Cloudflare, Gmail and Jira. Make one from the
-Project box while adding or editing a secret, or from **Projects** in the
-account menu, where you can also rename and delete them. Deleting a project
-never deletes the secrets in it; they are kept and simply stop being grouped,
-and the confirmation asks you to type the project's name so you cannot lose a
-heading by misclicking a row.
+**Counting how many builds reach the server.** The app has always asked the
+server which sign-in methods it offers, before the sign-in screen is drawn.
+It now says which version of the app is asking and which operating system it
+is on, the way a web browser does, and the test server counts those requests.
 
-**Choosing what a project tells other people.** When you share a secret that
-is in a project, the invite has a separate tick box for whether that person is
-also told which project. It is off unless you tick it: sharing one password is
-not sharing how your vault is organised. A secret that is not in a project yet
-has nothing to tell, so the box only appears once it is filed. You can change
-your mind for each person afterwards from the Sharing list, once they have
-accepted. Someone you share with is shown the project's *name* and never which
-other secrets of yours are filed there.
+The point of it is dull and practical: installers were being downloaded and
+nothing said whether anybody ran them, on what, or whether old builds were
+still in use.
 
-**What the server can see.** A project's name is stored unencrypted, the same
-way a secret's name already is, because the server has to be able to send back
-a heading it can draw. So whoever runs the server can see that you keep a
+**It is a trend, not a headcount.** Everyone in one office behind a single
+internet connection counts as one. A laptop that moves between home, a train
+and an office counts as several. Updating the app reads as a new
+installation. It tells us which platforms and which versions are in use; it
+does not tell us how many people there are, and we are not going to pretend
+otherwise.
+
+What each count holds: the operating system, the app version, the country the
+request came from, the time, and a scrambled reference number. The scrambling
+uses a random value the server makes up, keeps only in memory and replaces
+every midnight UTC, so two requests from you on the same day look like one
+installation and the same two a day apart cannot be recognised as related, by
+us or by anyone we send them to. Your IP address is used to produce that
+number and is then discarded — it is not part of the count. The ordinary web
+server logs still record it for 14 days, as they always have; the privacy
+policy covers that, and this changes nothing about it.
+
+What is **not** counted: anything to do with your account or your vault.
+Signing in, creating a secret, reading one, sharing one — none of it is
+counted anywhere. The counting happens before you have signed in, so there is
+no account for it to be attached to, and vault contents were never readable
+by the server in the first place.
+
+**The version and platform go to whatever server you point the app at**, on
+every request, not only the one described above. That is one line of ordinary
+HTTP and no more than a web browser sends, but it is new, and a server you do
+not run will see it.
+
+Separately, how many times each installer has been downloaded from the
+releases page is now recorded too. GitHub has always counted that and the
+count has always been public; it says nothing about who downloaded anything.
+
+The privacy policy in the app describes all of this. It previously said the
+service used no analytics at all, which was true when it was written and is
+not any more, so it was rewritten rather than left standing.
+
+A server you run yourself counts nothing unless you switch it on and point it
+at your own analytics project. It is off by default and makes no outbound
+analytics request at all.
+
+**A reminder carried over from 0.2.0, because projects still ship and this is
+easy to miss:** a project's name is stored unencrypted, the same way a
+secret's name already is, because the server has to be able to send back a
+heading it can draw. So whoever runs the server can see that you keep a
 project called Perspectiv and which of your secrets are filed under it. The
 secrets themselves are unchanged: still encrypted on your device, still
 unreadable to the server. If a grouping is itself sensitive, do not put it in
-a project name.
+a project name. This is now in the privacy policy as well, where it belongs.
 
 ## Installing
 
@@ -94,7 +124,7 @@ still blank.
 The address is only a default: whatever you type replaces it and is
 remembered. Running your own server is described in
 [deploy/README.md](https://github.com/cjaymoni/credvault/blob/__TAG__/deploy/README.md),
-and a server you run has to come from this same release.
+and a server you run has to be 0.2.0 or newer.
 
 To share a secret with someone, both of you need accounts on the same server.
 You will also need their key fingerprint, read to you over a channel that is

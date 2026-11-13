@@ -58,6 +58,13 @@ says nothing about your machine beyond those two things.
 - **The name you give each entry.** Entry names are stored in the clear so that
   lists and sharing invitations can display them. If you call something
   "Barclays — joint account", we can see that. Name entries accordingly.
+- **The name of any project you file entries under, and which entries are in
+  it.** Projects are stored in the clear for the same reason entry names are:
+  the server has to be able to send back a heading it can draw. So we can see
+  that you keep a project called "Barclays — joint account" and which of your
+  entries sit under it. The entries themselves are unaffected — still
+  encrypted on your device, still unreadable to us. If a grouping is itself
+  sensitive, do not put it in a project name.
 - **Who has access to what.** Which accounts can read which entries, who
   invited whom, and when.
 - **Any message you attach to a sharing invitation.** These are stored in the
@@ -88,8 +95,10 @@ passphrase still does that, and Google never sees it.
   terms.
 - **A count of installations.** When the app starts, it asks the server which
   sign-in methods are available, before you have typed anything. We count those
-  requests so we can tell how many people are actually running a build and on
-  what. What is recorded for each one is: the operating system, the version of
+  requests so we can tell which builds and which platforms are actually in
+  use. It is a trend and not a headcount — everyone behind one office
+  connection counts as one, a laptop that moves counts as several, and
+  updating the app counts as a new installation. What is recorded for each one is: the operating system, the version of
   the app, the country the request came from, the time it arrived, and a
   scrambled reference number.
   Nothing else.
@@ -116,7 +125,7 @@ so that it cannot be turned into a record of you.
   nobody can work out what yesterday's numbers were, including us.
   Two requests from you on the same day look like one installation; the same
   two a day apart cannot be recognised as related, by us or by anyone we send
-  them to. That is what makes this a headcount rather than a trail.
+  them to. That is what makes this a tally rather than a trail.
 - **There is no tracking in the app itself.** No third-party script, no
   advertising, no profiling, no cookies, and no record of which screens you
   open or what you do in them.

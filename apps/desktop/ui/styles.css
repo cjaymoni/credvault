@@ -565,6 +565,7 @@ select { padding-right: 34px; cursor: pointer; }
 .identity-email { font-size: var(--text-small); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
 .identity-server { font-size: var(--text-caption); color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
 .chip-label { color: var(--text-3); }
+.app-version { margin: 0; font-size: var(--text-caption); color: var(--text-3); }
 .account-tools { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 8px; min-width: 0; }
 .brand { flex: none; }
 .mobile-only, .btn-label, .backdrop, .item .chev { display: none; }
@@ -1202,6 +1203,7 @@ input.mono.mismatch { border-color: var(--danger); }
     text-align: left;
     overflow-wrap: anywhere;
   }
+  .account-tools .app-version { margin: 2px 0 0; text-align: center; font-size: var(--text-small); }
   .account-tools .theme-switch { padding: 5px; border-radius: var(--radius); }
   .account-tools .theme-switch button { flex: 1; height: 46px; border-radius: 11px; }
   .account-tools .theme-switch .ic { width: 20px; height: 20px; }

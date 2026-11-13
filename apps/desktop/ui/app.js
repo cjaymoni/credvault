@@ -2573,6 +2573,38 @@ invoke("ui_constants")
     if (hint) hint.textContent = `At least ${UI.minPasswordLength} characters. There is no password reset.`;
   })
   .catch(() => { /* the defaults above match the crates today */ });
+// Served rather than written into the markup for the same reason the limits
+// above are: the crate that is running is the only thing that knows which
+// version it is, and a number typed into the HTML would survive the next bump.
+//
+// Two separate things can go wrong here and they get separate messages: the
+// markup no longer carries the line, or the command did not answer. Rolled
+// into one catch, the first would be reported as the second, and whoever read
+// the warning would go looking in the wrong half of the app.
+//
+// The line stays hidden until there is a number to put in it: a build that
+// cannot say which build it is says nothing.
+const versionLine = $("app-version");
+if (!versionLine) {
+  console.warn("index.html no longer carries #app-version, so the version line cannot be shown");
+} else {
+  // The rejection handler is the second argument rather than a .catch, so it
+  // covers the command and not the handler beside it: a throw from the lines
+  // below is this file's bug and should not be reported as the server-side
+  // one.
+  invoke("app_version").then(
+    (version) => {
+      const label = Screens.appVersionLabel(version);
+      if (label === null) {
+        console.warn("the app_version command answered with no version, so the version line stays hidden");
+        return;
+      }
+      versionLine.textContent = label;
+      versionLine.hidden = false;
+    },
+    (error) => console.warn("could not read the app version", error),
+  );
+}
 invoke("startup_warnings")
   // This is the only notice that the pinned-key file was corrupt and moved
   // aside, i.e. that every key confirmed so far must be confirmed again

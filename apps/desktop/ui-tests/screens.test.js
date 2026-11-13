@@ -6,7 +6,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
-const { esc, serverSummaryText, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE } = require("../ui/screens.js");
+const { esc, serverSummaryText, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE } = require("../ui/screens.js");
 
 const DEFAULT_SERVER = "http://127.0.0.1:8787";
 
@@ -98,6 +98,56 @@ test("a half-typed address is shown as typed rather than silently replaced", () 
 test("a unicode host is shown in the form the URL parser resolves it to", () => {
   // Punycode is what the request will use, so it is what the line must show.
   assert.equal(serverSummaryText("https://vaült.example.com", DEFAULT_SERVER), "xn--valt-1ra.example.com");
+});
+
+// ----- the version line ------------------------------------------------------
+
+test("the running version is labelled and shown as the bundle names it", () => {
+  assert.equal(appVersionLabel("0.3.0"), "Version 0.3.0");
+});
+
+test("a pre-release suffix is carried through rather than tidied away", () => {
+  assert.equal(appVersionLabel("1.0.0-rc.2"), "Version 1.0.0-rc.2");
+});
+
+test("whitespace around the number does not reach the screen", () => {
+  assert.equal(appVersionLabel("  0.3.0\n"), "Version 0.3.0");
+});
+
+// The label is the easy half. What can actually break is the wiring between
+// the command, the element app.js writes to, and the element index.html
+// ships -- none of which a unit test of the function above would notice.
+test("the version line app.js fills is the one the page ships, and it starts hidden", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+  const html = fs.readFileSync(path.join(__dirname, "../ui/index.html"), "utf8");
+
+  assert.ok(source.includes('invoke("app_version")'), "app.js no longer asks the Rust side for the version");
+  // Captured rather than written out twice: hardcoding the id on both sides
+  // would let them drift together and still pass. Matched loosely on purpose
+  // -- if this fails after a rename or a reformat of that line, the wiring is
+  // probably fine and it is this pattern that needs updating.
+  const found = source.match(/versionLine\s*=\s*\$\(\s*"([^"]+)"/);
+  assert.ok(found, "app.js does not look the version line up where this test can find it");
+  // The element ships hidden, so something has to unhide it; without this the
+  // line could stay invisible forever with the suite still green.
+  assert.ok(/versionLine\.hidden\s*=\s*false/.test(source), "nothing in app.js ever reveals the version line");
+
+  const element = html.match(new RegExp(`<p[^>]*id="${found[1]}"[^>]*>`));
+  assert.ok(element, `index.html has no element with id ${found[1]}`);
+  // Hidden until the command answers, so a build that cannot name itself
+  // leaves no empty row at the foot of the account panel.
+  // The attribute, not the substring: `class="app-version hidden"` would
+  // satisfy a plain includes() while relying on a stylesheet rule instead.
+  assert.ok(/\shidden(?=[\s>=])/.test(element[0]), "the version line does not start hidden");
+});
+
+// A command that did not answer must leave the line out. The alternative --
+// the word "Version" with nothing after it, or a number written into the
+// markup as a fallback -- is read as a fact about the build either way.
+test("nothing to show is null, not the word Version on its own", () => {
+  for (const nothing of [undefined, null, "", "   "]) {
+    assert.equal(appVersionLabel(nothing), null, `${JSON.stringify(nothing)} should produce no line`);
+  }
 });
 
 // ----- one section of the secrets list ---------------------------------------

@@ -454,6 +454,40 @@ impl ApiClient {
         self.send(Method::GET, &path, Self::NO_BODY).await
     }
 
+    pub async fn list_projects(&self) -> Result<Vec<ProjectView>, ClientError> {
+        self.send(Method::GET, "/projects", Self::NO_BODY).await
+    }
+
+    pub async fn create_project(&self, body: &ProjectRequest) -> Result<Created, ClientError> {
+        self.send(Method::POST, "/projects", Some(body)).await
+    }
+
+    pub async fn rename_project(&self, id: i64, body: &ProjectRequest) -> Result<(), ClientError> {
+        self.send(Method::PUT, &format!("/projects/{id}"), Some(body)).await
+    }
+
+    /// Delete a project. The secrets filed under it are left alone and become
+    /// unfiled; see the server's handler.
+    pub async fn delete_project(&self, id: i64) -> Result<(), ClientError> {
+        self.send(Method::DELETE, &format!("/projects/{id}"), Self::NO_BODY).await
+    }
+
+    /// Move a secret between projects. Carries no key version because it
+    /// touches no ciphertext.
+    pub async fn move_secret(&self, id: i64, body: &MoveSecretRequest) -> Result<(), ClientError> {
+        self.send(Method::PUT, &format!("/secrets/{id}/project"), Some(body)).await
+    }
+
+    /// Change whether one member may see where a secret is filed.
+    pub async fn set_member_project(
+        &self,
+        id: i64,
+        user_id: i64,
+        body: &ShareProjectRequest,
+    ) -> Result<(), ClientError> {
+        self.send(Method::POST, &format!("/secrets/{id}/access/{user_id}/project"), Some(body)).await
+    }
+
     pub async fn list_secrets(&self) -> Result<Vec<SecretView>, ClientError> {
         self.send(Method::GET, "/secrets", Self::NO_BODY).await
     }

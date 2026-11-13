@@ -6,7 +6,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
-const { esc, serverSummaryText, listGroupHtml } = require("../ui/screens.js");
+const { esc, serverSummaryText, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE } = require("../ui/screens.js");
 
 const DEFAULT_SERVER = "http://127.0.0.1:8787";
 
@@ -517,4 +517,223 @@ test("the prompt cannot be mutated by whoever renders it", () => {
   prompt.required = false;
   assert.equal(prompt.required, true);
   assert.equal(tokenPrompt(true, true).required, true);
+});
+
+// ----- how the vault is divided into sections --------------------------------
+
+/// `project` mirrors what the Rust hands over: an owned secret may carry an
+/// id, a shared one never does.
+function secret(name, { owner = true, project = null } = {}) {
+  return { id: name, name, is_owner: owner, project };
+}
+const titles = (sections) => sections.map((s) => s.title);
+const names = (section) => section.secrets.map((s) => s.name);
+
+test("a vault with nothing to label draws one unlabelled section", () => {
+  const sections = listSections([secret("Gmail"), secret("Jira")], []);
+  assert.deepStrictEqual(titles(sections), [null]);
+  assert.deepStrictEqual(names(sections[0]), ["Gmail", "Jira"]);
+});
+
+test("projects lead, in the order the account lists them, and unfiled follows", () => {
+  const perspectiv = { id: 1, name: "Perspectiv" };
+  const home = { id: 2, name: "Home" };
+  const sections = listSections(
+    [
+      secret("Netflix"),
+      secret("Cloudflare", { project: { id: 1, name: "Perspectiv" } }),
+      secret("Router", { project: { id: 2, name: "Home" } }),
+      secret("Jira", { project: { id: 1, name: "Perspectiv" } }),
+    ],
+    // Deliberately not alphabetical: the order is the server's, so renaming
+    // a project cannot reshuffle the vault under someone mid-scroll.
+    [perspectiv, home],
+  );
+  assert.deepStrictEqual(titles(sections), ["Perspectiv", "Home", UNFILED_TITLE]);
+  assert.deepStrictEqual(names(sections[0]), ["Cloudflare", "Jira"]);
+  assert.deepStrictEqual(names(sections[2]), ["Netflix"]);
+});
+
+test("a vault with no projects keeps the heading it had before projects existed", () => {
+  // Someone who never makes a project should not find their own secrets
+  // relabelled "Unfiled" the day the feature ships.
+  const sections = listSections([secret("Gmail"), secret("Theirs", { owner: false })], []);
+  assert.deepStrictEqual(titles(sections), [MINE_TITLE, SHARED_TITLE]);
+});
+
+test("the leftovers are only called Unfiled when there is something to be unfiled from", () => {
+  const withProject = listSections(
+    [secret("Cloudflare", { project: { id: 1, name: "Perspectiv" } }), secret("Netflix")],
+    [{ id: 1, name: "Perspectiv" }],
+  );
+  assert.deepStrictEqual(titles(withProject), ["Perspectiv", UNFILED_TITLE]);
+});
+
+test("a project with nothing visible under it draws no empty heading", () => {
+  const sections = listSections([secret("Netflix")], [{ id: 1, name: "Perspectiv" }]);
+  assert.deepStrictEqual(titles(sections), [null]);
+});
+
+test("secrets other people own come last and are never grouped by project", () => {
+  // Two owners can both have a project called Perspectiv. Grouping shared
+  // secrets by that name would file two different things as one.
+  const sections = listSections(
+    [
+      secret("Mine", { project: { id: 1, name: "Perspectiv" } }),
+      secret("Hers", { owner: false, project: { id: null, name: "Perspectiv" } }),
+      secret("His", { owner: false, project: { id: null, name: "Perspectiv" } }),
+    ],
+    [{ id: 1, name: "Perspectiv" }],
+  );
+  assert.deepStrictEqual(titles(sections), ["Perspectiv", SHARED_TITLE]);
+  assert.deepStrictEqual(names(sections[0]), ["Mine"]);
+  assert.deepStrictEqual(names(sections[1]), ["Hers", "His"]);
+});
+
+test("a secret filed under a project this list has not heard of is still shown", () => {
+  // Another device renamed or created it since the list was fetched. Losing
+  // the heading is survivable; losing the row is not.
+  const sections = listSections([secret("Cloudflare", { project: { id: 9, name: "Perspectiv" } })], []);
+  assert.deepStrictEqual(titles(sections), ["Perspectiv"]);
+  assert.deepStrictEqual(names(sections[0]), ["Cloudflare"]);
+});
+
+test("a project named after an Object property is not one", () => {
+  const sections = listSections(
+    [
+      secret("A", { project: { id: "__proto__", name: "__proto__" } }),
+      secret("B", { project: { id: "toString", name: "toString" } }),
+    ],
+    [{ id: "__proto__", name: "__proto__" }, { id: "toString", name: "toString" }],
+  );
+  assert.deepStrictEqual(titles(sections), ["__proto__", "toString"]);
+  assert.deepStrictEqual(names(sections[0]), ["A"]);
+});
+
+test("a project name reaches the markup escaped, in both the heading and its label", () => {
+  const html = listGroupHtml('Perspectiv<img src=x onerror="alert(1)">', "<button></button>");
+  assert.ok(!html.includes("<img"), html);
+  assert.ok(html.includes("&lt;img"), html);
+  assert.ok(html.includes('aria-label="Perspectiv&lt;img'), html);
+});
+
+test("an empty or missing vault is no sections at all", () => {
+  assert.deepStrictEqual(listSections([], [{ id: 1, name: "Perspectiv" }]), []);
+  assert.deepStrictEqual(listSections(undefined, undefined), []);
+});
+
+// ----- the limits the interface enforces -------------------------------------
+
+/// `UI` holds the limits the forms enforce: a default for each, overwritten at
+/// startup by what the Rust crates actually enforce. Reading one that was
+/// never declared yields `undefined`, which reaches the markup as
+/// `maxlength="undefined"` — an attribute browsers ignore, so the box silently
+/// accepts anything and the only complaint arrives from the server, after the
+/// round trip the limit existed to avoid. It is not a crash and no amount of
+/// clicking shows it, which is exactly why it is worth a test.
+test("every UI limit the interface reads is one it declares", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+  const declaration = source.match(/^const UI = \{([^}]*)\};/m);
+  assert.ok(declaration, "app.js should declare its UI defaults in one object literal");
+  const declared = new Set([...declaration[1].matchAll(/(\w+):/g)].map((m) => m[1]));
+  const used = new Set([...source.matchAll(/\bUI\.(\w+)/g)].map((m) => m[1]));
+  const missing = [...used].filter((name) => !declared.has(name));
+  assert.deepStrictEqual(missing, [], `UI.${missing.join(", UI.")} is read but never declared`);
+});
+
+/// The other half: a default that nothing overwrites is a number this build
+/// made up. It stays in step with the crates only by luck, and the comment on
+/// the startup fetch ("the defaults above match the crates today") is only
+/// true while every one of them is actually fetched.
+test("every UI limit the interface declares is one the backend sends", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+  const declared = new Set([...source.match(/^const UI = \{([^}]*)\};/m)[1].matchAll(/(\w+):/g)].map((m) => m[1]));
+  const assignment = source.match(/Object\.assign\(UI, \{([^}]*)\}/);
+  assert.ok(assignment, "app.js should refresh its UI defaults from ui_constants");
+  const refreshed = new Set([...assignment[1].matchAll(/(\w+):/g)].map((m) => m[1]));
+  const stale = [...declared].filter((name) => !refreshed.has(name));
+  assert.deepStrictEqual(stale, [], `UI.${stale.join(", UI.")} is a guess the backend never corrects`);
+});
+
+// ----- typing a project's name to confirm deleting it ------------------------
+//
+// The point of the ritual is catching "I clicked the wrong row". So the only
+// question that matters about this comparison is whether it can ever accept
+// the name of a *different* project, and both of the liberties an earlier
+// version took could do exactly that.
+
+test("the whole name, exactly, is what confirms a delete", () => {
+  assert.ok(namesProject("Perspectiv", "Perspectiv"));
+  // Ends trimmed, because the server trims before storing: a trailing space
+  // was never part of the name, so refusing one would be a riddle.
+  assert.ok(namesProject("  Perspectiv  ", "Perspectiv"));
+  // The first word of a two-word name is the commonest way to stall here.
+  assert.ok(!namesProject("Perspectiv", "Perspectiv Ops"));
+  assert.ok(!namesProject("", "Perspectiv"));
+  assert.ok(!namesProject("   ", "Perspectiv"));
+});
+
+test("case is not forgiven, because the server's uniqueness rule is ASCII-only", () => {
+  // `projects_owner_name` is COLLATE NOCASE, which folds A-Z and nothing
+  // else -- so "Café" and "CAFÉ" can both exist in one account. Lower-casing
+  // here would fold them together and accept the name of the project the
+  // user did *not* click.
+  assert.ok(!namesProject("café", "CAFÉ"));
+  assert.ok(!namesProject("perspectiv", "Perspectiv"));
+});
+
+test("interior spaces are not collapsed, because two such names can coexist", () => {
+  // validate_project_name trims the ends and nothing more, so these are two
+  // distinct, simultaneously creatable projects.
+  assert.ok(!namesProject("Perspectiv Ops", "Perspectiv  Ops"));
+  assert.ok(!namesProject("Perspectiv  Ops", "Perspectiv Ops"));
+});
+
+test("a project with no name is never confirmed by typing nothing", () => {
+  assert.ok(!namesProject("", ""));
+  assert.ok(!namesProject("   ", "   "));
+  assert.ok(!namesProject(undefined, undefined));
+});
+
+test("a zero-width prefix makes a different project, and is treated as one", () => {
+  // JS `trim` strips U+FEFF; Rust's does not, so validate_project_name stores
+  // it and the index keeps the two rows apart. The two draw identically, so
+  // re-trimming the *stored* name would confirm a delete on the row the user
+  // did not click. That is the direction that matters, and it is refused.
+  assert.ok(!namesProject("Perspectiv", "\ufeffPerspectiv"));
+  // Both sides are trimmed by the server's rule rather than JavaScript's, so
+  // a stored name that begins with U+FEFF is still reachable by typing it.
+  // Trimming only the typed side with the built-in refused this too, which
+  // left that project undeletable.
+  assert.ok(namesProject("\ufeffPerspectiv", "\ufeffPerspectiv"));
+  // And a zero-width character in front of what was typed no longer matches
+  // a stored name without one -- the same asymmetry, the other way round.
+  assert.ok(!namesProject("\ufeffPerspectiv", "Perspectiv"));
+  // Ordinary padding is still forgiven, because the server trims that too.
+  assert.ok(namesProject("\u00a0 Perspectiv \u2003", "Perspectiv"));
+});
+
+test("the same name composed two ways is the same name", () => {
+  // Precomposed vs decomposed: identical on screen, different strings. Most
+  // keyboards emit NFC, so without normalising, a decomposed name could
+  // never be typed and its project could never be deleted.
+  const precomposed = "Café";
+  const decomposed = "Café";
+  assert.notStrictEqual(precomposed, decomposed);
+  assert.ok(namesProject(precomposed, decomposed));
+  assert.ok(namesProject(decomposed, precomposed));
+  // And it still refuses a different project.
+  assert.ok(!namesProject(precomposed, "CAFÉ"));
+});
+
+// ----- when a phone falls back to the vault list -----------------------------
+
+test("the detail screen is kept while anything is on it", () => {
+  // This conjunction has been wrong once: the Projects panel was missing
+  // from it, so every action in the panel bounced a phone user out of it.
+  assert.ok(shouldPopToList({}));
+  assert.ok(!shouldPopToList({ selected: 7 }));
+  assert.ok(!shouldPopToList({ editing: true }));
+  assert.ok(!shouldPopToList({ showingProjects: true }));
+  assert.ok(!shouldPopToList({ inviteCount: 1 }));
 });

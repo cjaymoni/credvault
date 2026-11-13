@@ -11,6 +11,15 @@ use crate::{CryptoError, Result};
 
 pub const MAX_FIELD_LEN: usize = 4096;
 pub const MAX_NAME_LEN: usize = 200;
+/// Longest project name.
+///
+/// Counted in characters rather than bytes, unlike [`MAX_NAME_LEN`]: a
+/// project name is only ever a heading over a group of secrets, so the limit
+/// should be the one the input box appears to enforce, and a name written in
+/// a script that costs more than a byte a character should not be cut to a
+/// third of its length. The stored size is bounded all the same, at four
+/// bytes per character.
+pub const MAX_PROJECT_NAME_LEN: usize = 100;
 /// How many extra details one secret may carry. Enough for the recovery
 /// codes, PINs and account numbers people keep alongside a login, bounded so
 /// one secret cannot grow without limit.
@@ -233,6 +242,26 @@ pub fn validate_name(name: &str) -> Result<String> {
     }
     if trimmed.len() > MAX_NAME_LEN {
         return Err(CryptoError::InvalidInput(format!("name is longer than {MAX_NAME_LEN} bytes")));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate the plaintext name of a project.
+///
+/// Like [`validate_name`] this trims and hands the trimmed name back, so a
+/// project typed with a trailing space is the same project as the one typed
+/// without it -- which matters more here than it does for a secret, because
+/// a server rejects a duplicate project name and ` Perspectiv` would
+/// otherwise slip past as a second one.
+pub fn validate_project_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(CryptoError::InvalidInput("a project needs a name".into()));
+    }
+    if trimmed.chars().count() > MAX_PROJECT_NAME_LEN {
+        return Err(CryptoError::InvalidInput(format!(
+            "a project name is longer than {MAX_PROJECT_NAME_LEN} characters"
+        )));
     }
     Ok(trimmed.to_string())
 }
@@ -582,6 +611,20 @@ mod tests {
         assert_eq!(validate_name("  GitHub ").unwrap(), "GitHub");
         assert!(validate_name("   ").is_err());
         assert!(validate_name(&"x".repeat(MAX_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn project_name_validation() {
+        assert_eq!(validate_project_name("  Perspectiv ").unwrap(), "Perspectiv");
+        assert!(validate_project_name("").is_err());
+        assert!(validate_project_name("   ").is_err());
+        assert!(validate_project_name(&"x".repeat(MAX_PROJECT_NAME_LEN + 1)).is_err());
+        // Counted in characters, so a name of this length is accepted
+        // whatever it is written in -- the whole point of the limit not
+        // being the byte one next door.
+        let multibyte = "\u{1f510}".repeat(MAX_PROJECT_NAME_LEN);
+        assert_eq!(validate_project_name(&multibyte).unwrap(), multibyte);
+        assert!(validate_project_name(&"\u{1f510}".repeat(MAX_PROJECT_NAME_LEN + 1)).is_err());
     }
 
     #[test]

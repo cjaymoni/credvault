@@ -37,6 +37,13 @@ services:
       # running without the button.
       CREDVAULT_GOOGLE_CLIENT_ID: ${CREDVAULT_GOOGLE_CLIENT_ID:-}
       CREDVAULT_GOOGLE_CLIENT_SECRET: ${CREDVAULT_GOOGLE_CLIENT_SECRET:-}
+      # Optional, and off when blank: counting how many installations reach
+      # this server, on what platform, from what country. Nothing is tied to
+      # an account and no address is stored -- see "Counting installations"
+      # in the top-level README, and analytics.rs for the whole of it. Setting
+      # a key here is a change to what the privacy policy must say.
+      CREDVAULT_POSTHOG_API_KEY: ${CREDVAULT_POSTHOG_API_KEY:-}
+      CREDVAULT_POSTHOG_HOST: ${CREDVAULT_POSTHOG_HOST:-}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - data:/data

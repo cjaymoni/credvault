@@ -2,9 +2,10 @@
 //! server never decrypts anything.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -18,6 +19,7 @@ use subtle::ConstantTimeEq;
 
 use zeroize::Zeroizing;
 
+use crate::analytics;
 use crate::auth::{self, AuthUser};
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ApiJson;
@@ -1319,13 +1321,49 @@ pub async fn health() -> Json<Health> {
     Json(Health::current())
 }
 
-pub async fn capabilities(State(state): State<AppState>) -> Json<Capabilities> {
+/// What this server offers, asked before the sign-in screen is drawn.
+///
+/// Also the one place the server counts anything. This route is reached by
+/// every app that points itself here and by no app that does not, before any
+/// credential exists and so with nobody to attribute it to, which is what
+/// makes it the only route an anonymous reach count can honestly come from.
+/// See [`analytics`] for what that count holds. With no PostHog key
+/// configured -- the default -- the block below is a single `None` test and
+/// the handler is exactly what it was.
+pub async fn capabilities(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Json<Capabilities> {
+    if let Some(telemetry) = &state.config.analytics {
+        let build = analytics::parse_client_build(header_str(&headers, "user-agent"));
+        // The country is believed on exactly the terms the address is, from
+        // the same function, so the two cannot drift: the operator said a
+        // proxy is in front *and* this request actually came from one.
+        // Without both, the header is whatever the client chose to type, and
+        // a count of self-declared countries is worse than no count --
+        // especially here, on a route with no rate limit in front of it.
+        let trust_forwarded_for = state.config.trust_forwarded_for;
+        let from_a_proxy = crate::ratelimit::forwarded_headers_are_trusted(peer, trust_forwarded_for);
+        let country = from_a_proxy.then(|| analytics::parse_country(header_str(&headers, "cf-ipcountry"))).flatten();
+        let ip = crate::ratelimit::client_ip(peer, &headers, trust_forwarded_for);
+        telemetry.capture_reach(ip, &build, country);
+    }
     Json(Capabilities {
         password_sign_in: true,
         google_sign_in: state.config.oauth.is_some(),
         registration_token_required: matches!(state.config.registration, RegistrationPolicy::Token(_)),
         registration_closed: matches!(state.config.registration, RegistrationPolicy::Closed),
     })
+}
+
+/// One header as text, or `None` when it is absent or not valid UTF-8.
+///
+/// Headers are attacker-controlled bytes; a lossy conversion would invent
+/// replacement characters that nothing downstream asked for, so a header that
+/// is not text is treated as a header that is not there.
+fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 /// Begin a sign-in: record the attempt and return the URL to open in a browser.

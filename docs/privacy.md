@@ -2,7 +2,7 @@
 
 **credvault test service — credvault.alphadesigns.dev**
 
-Last updated: 12 November 2026
+Last updated: 13 November 2026
 
 Status: **test service.** Read "What this test service is" below before you put anything in it.
 
@@ -46,6 +46,11 @@ you have named each entry, and who you have shared entries with.
 - Your account's private key. We store it, but encrypted with a key derived
   from your passphrase.
 
+**Your copy of the app also tells our server which version it is and which
+operating system it is running on**, in the same way a web browser does. That
+is how the count described further down knows which platforms are in use. It
+says nothing about your machine beyond those two things.
+
 **We can read:**
 
 - **Your email address.** Used to identify your account and to let other users
@@ -81,16 +86,59 @@ passphrase still does that, and Google never sees it.
   and protection against attacks. Your connection reaches Cloudflare before it
   reaches us, so Cloudflare processes your IP address under its own privacy
   terms.
+- **A count of installations.** When the app starts, it asks the server which
+  sign-in methods are available, before you have typed anything. We count those
+  requests so we can tell how many people are actually running a build and on
+  what. What is recorded for each one is: the operating system, the version of
+  the app, the country the request came from, the time it arrived, and a
+  scrambled reference number.
+  Nothing else.
 
-We do not use analytics, advertising, or tracking of any kind. There are no
-third-party scripts in the app. Nothing about you is sold or shared with anyone
-for marketing.
+## What the installation count cannot tell us
+
+That count is the only analytics in this service, and it is deliberately built
+so that it cannot be turned into a record of you.
+
+- **It does not know who you are.** It is recorded before you sign in, so there
+  is no account to attach it to, and nothing in it is ever linked to your email
+  address or to anything in your vault. Signing in, reading an entry, creating
+  one, and sharing one are not counted at all.
+- **It does not record your IP address.** The country does not come from your
+  address at all — Cloudflare, which sits in front of the service, tells our
+  server which country a request arrived from, and that is the only thing we
+  use. Your address itself is used once, to produce the reference number
+  below, and is then discarded. It is not stored and it is not sent on.
+- **The reference number stops working at midnight.** It is a one-way scramble
+  of your address and the app version, mixed with a random value our server
+  generates and never writes down. That random value is thrown away and
+  replaced at midnight, by a clock rather than by whoever happens to open the
+  app next, and again whenever the server restarts — so once a day has passed,
+  nobody can work out what yesterday's numbers were, including us.
+  Two requests from you on the same day look like one installation; the same
+  two a day apart cannot be recognised as related, by us or by anyone we send
+  them to. That is what makes this a headcount rather than a trail.
+- **There is no tracking in the app itself.** No third-party script, no
+  advertising, no profiling, no cookies, and no record of which screens you
+  open or what you do in them.
+
+The counts are processed on our behalf by **PostHog**, on their EU
+infrastructure, and are configured so that PostHog does not build a profile of
+anyone. Nothing about you is sold or shared with anyone for marketing.
+
+**We also count downloads.** The installers are on our GitHub releases page,
+and GitHub tells us how many times each file has been fetched. That is a count
+of files, not of people: it does not say who downloaded anything or where from,
+and we cannot connect it to an account or to the count above.
 
 ## Where your data is
 
 On a single rented server in `[DATA CENTRE LOCATION]`, operated by Contabo.
 Backups of the database — the same encrypted blobs — are taken nightly and kept
 for 30 days.
+
+The installation counts described above are the one exception: those are held
+by PostHog on their EU infrastructure, and they contain no account data and no
+vault data of any kind.
 
 ## How long we keep it
 
@@ -99,6 +147,9 @@ for 30 days.
 - Sign-in sessions: 30 days, then they expire automatically. You can end all
   other sessions from within the app at any time.
 - Web server logs: 14 days.
+- Installation counts: `[RETENTION, e.g. 12 months]` in PostHog. They stop
+  being traceable to anyone long before that — the reference number is useless
+  the next day — so what remains is a chart.
 - Backups: 30 days. An entry you delete may persist in a backup for up to 30
   days afterwards.
 

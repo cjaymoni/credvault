@@ -2094,3 +2094,222 @@ async fn an_edit_from_a_client_that_has_never_heard_of_projects_keeps_the_filing
     // And the edit itself still landed, so this is not passing by doing nothing.
     assert_eq!(key.decrypt("Cloudflare", &view.payload).unwrap().password, "rotated-by-an-old-app");
 }
+
+// ----- anonymous reach telemetry -------------------------------------------
+//
+// The server's only outbound analytics. These drive it end to end against a
+// stand-in for PostHog, because the thing worth testing is not that an event
+// is sent -- it is what is in one, and the claims the privacy policy makes
+// about that are only as good as these assertions.
+
+/// A stand-in for PostHog's `/batch/` endpoint that keeps what it was sent.
+struct FakePosthog {
+    base: String,
+    received: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl FakePosthog {
+    async fn spawn() -> Self {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let app = axum::Router::new().route(
+            "/batch/",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let sink = sink.clone();
+                async move {
+                    // A poisoned lock here means a previous assertion panicked
+                    // while holding it; take the contents anyway so the test
+                    // that follows fails on its own assertion rather than on
+                    // this one.
+                    let mut held = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    held.push(body);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self { base, received }
+    }
+
+    /// The events delivered so far, flattened out of their batches.
+    fn events(&self) -> Vec<serde_json::Value> {
+        let held = self.received.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.iter().filter_map(|batch| batch["batch"].as_array()).flatten().cloned().collect()
+    }
+
+    /// Wait for at least one event, rather than sleeping a fixed time: the
+    /// send is a background task and a fixed sleep is either slow or flaky.
+    async fn first_event(&self) -> serde_json::Value {
+        for _ in 0..200 {
+            if let Some(event) = self.events().into_iter().next() {
+                return event;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no analytics event arrived within five seconds");
+    }
+}
+
+/// Build a config whose telemetry reports to `posthog`.
+///
+/// `trust_forwarded_for` is on because that is the only state in which the
+/// country header is believed, and the country is half of what this feature
+/// is for.
+fn reporting_to(posthog: &FakePosthog) -> ServerConfig {
+    ServerConfig {
+        trust_forwarded_for: true,
+        analytics: Some(credvault_server::analytics::Analytics::start("phc_test".into(), &posthog.base).unwrap()),
+        ..ServerConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn asking_what_a_server_supports_reports_the_build_and_the_country() {
+    let posthog = FakePosthog::spawn().await;
+    let server = spawn_with(reporting_to(&posthog)).await;
+
+    let response = server
+        .client
+        .get(format!("{}/capabilities", server.base))
+        .header("user-agent", "credvault/0.1.3 (macos)")
+        // What a reverse proxy in front of the server would have written.
+        .header("x-forwarded-for", "203.0.113.9")
+        .header("cf-ipcountry", "GH")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let event = posthog.first_event().await;
+    assert_eq!(event["event"], credvault_server::analytics::APP_REACHED_SERVER);
+    assert_eq!(event["properties"]["platform"], "macos");
+    assert_eq!(event["properties"]["app_version"], "0.1.3");
+    assert_eq!(event["properties"]["country"], "GH");
+}
+
+/// The claim the privacy policy has to be able to make. An event may carry a
+/// country, a platform and a version, and must carry nothing that points at a
+/// person or a machine.
+#[tokio::test]
+async fn an_event_carries_nothing_that_identifies_anyone() {
+    let posthog = FakePosthog::spawn().await;
+    let server = spawn_with(reporting_to(&posthog)).await;
+    let address = "203.0.113.9";
+
+    server
+        .client
+        .get(format!("{}/capabilities", server.base))
+        .header("user-agent", "credvault/0.1.3 (linux)")
+        .header("x-forwarded-for", address)
+        .header("cf-ipcountry", "DE")
+        .send()
+        .await
+        .unwrap();
+
+    let event = posthog.first_event().await;
+    let whole = event.to_string();
+    assert!(!whole.contains(address), "the client address must not leave the server: {whole}");
+    // PostHog resolves a location from the calling address unless this is
+    // null, and the calling address here is the server's own.
+    assert!(event["properties"]["$ip"].is_null(), "{whole}");
+    // And without this, PostHog would stamp the event with the hosting data
+    // centre's geography beside the real country.
+    assert_eq!(event["properties"]["$geoip_disable"], true, "{whole}");
+    // And without this, it would keep a durable profile per distinct id.
+    assert_eq!(event["properties"]["$process_person_profile"], false, "{whole}");
+
+    let distinct_id = event["distinct_id"].as_str().expect("an event needs a distinct id");
+    assert_eq!(distinct_id.len(), 32, "an opaque digest, not something readable: {distinct_id}");
+    assert!(distinct_id.chars().all(|c| c.is_ascii_hexdigit()), "{distinct_id}");
+}
+
+/// A country is only believed from a proxy the operator vouched for. Left on
+/// the default, a client may write the header itself and must not be counted
+/// as being anywhere.
+#[tokio::test]
+async fn a_client_cannot_put_itself_in_a_country_it_chooses() {
+    let posthog = FakePosthog::spawn().await;
+    let config = ServerConfig {
+        analytics: Some(credvault_server::analytics::Analytics::start("phc_test".into(), &posthog.base).unwrap()),
+        ..ServerConfig::default()
+    };
+    let server = spawn_with(config).await;
+
+    server
+        .client
+        .get(format!("{}/capabilities", server.base))
+        .header("user-agent", "credvault/0.1.3 (windows)")
+        .header("cf-ipcountry", "AQ")
+        .send()
+        .await
+        .unwrap();
+
+    let event = posthog.first_event().await;
+    assert!(event["properties"]["country"].is_null(), "an unvouched-for country must not be recorded");
+    // The build still is: it says nothing about where anyone is.
+    assert_eq!(event["properties"]["platform"], "windows");
+}
+
+/// Everything else the server does stays off this path. A reach count that
+/// could be raised by a logged-in request would be a count of sessions, and
+/// the privacy policy's promise that nothing here is tied to an account would
+/// be a matter of which handlers remembered not to call it.
+#[tokio::test]
+async fn nothing_but_the_capabilities_route_reports_anything() {
+    let posthog = FakePosthog::spawn().await;
+    let server = spawn_with(reporting_to(&posthog)).await;
+    let user = register(&server, "reach@example.com", "correct horse battery staple").await;
+
+    // Registering, signing in, and reading a vault: the whole authenticated
+    // surface, exercised against a server that is reporting.
+    assert_eq!(server.req(Method::GET, "/me", &user).send().await.unwrap().status(), StatusCode::OK);
+    assert!(server.list(&user).await.is_empty());
+    let health = server.client.get(format!("{}/health", server.address)).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    // Now ask what the server supports, which *is* counted, and wait for that
+    // event to land. A fixed sleep would prove nothing on a loaded machine --
+    // it would pass equally well if the pipeline were simply slow. This
+    // instead waits for proof the pipeline is flowing: events leave through
+    // one queue in order, so anything the calls above had raised would have
+    // arrived ahead of this one.
+    server
+        .client
+        .get(format!("{}/capabilities", server.base))
+        .header("user-agent", "credvault/0.2.0 (linux)")
+        .send()
+        .await
+        .unwrap();
+    // Identified by something only *this* request carries. Every event this
+    // module sends has the same name, so asserting the name would pass on a
+    // leaked event from one of the calls above -- and `first_event` returns
+    // as soon as anything lands, so the count below could then run while the
+    // capabilities event was still in flight. The authenticated calls are
+    // made by a client that sends no `credvault/...` User-Agent, so a leak
+    // from one of them reports an unknown version and this does not.
+    let arrived = posthog.first_event().await;
+    assert_eq!(arrived["event"], credvault_server::analytics::APP_REACHED_SERVER);
+    assert_eq!(arrived["properties"]["app_version"], "0.2.0", "waited for the wrong event: {arrived:?}");
+
+    assert_eq!(posthog.events().len(), 1, "registering and reading a vault must count nothing: {:?}", posthog.events());
+}
+
+/// With no key configured -- every self-hosted server, and the default -- the
+/// handler must behave exactly as it did before any of this existed.
+#[tokio::test]
+async fn a_server_without_a_key_answers_the_same_and_sends_nothing() {
+    let server = spawn().await;
+    let response = server
+        .client
+        .get(format!("{}/capabilities", server.base))
+        .header("user-agent", "credvault/0.1.3 (macos)")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let capabilities: Capabilities = response.json().await.unwrap();
+    assert!(capabilities.password_sign_in);
+    assert!(!capabilities.google_sign_in);
+}

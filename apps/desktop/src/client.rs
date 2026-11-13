@@ -151,12 +151,37 @@ struct ErrorBody {
     error: String,
 }
 
+/// What this app calls itself when it talks to a server.
+///
+/// `credvault/<version> (<platform>)`, and nothing else. Two things are being
+/// traded here, so both are worth writing down.
+///
+/// What it costs: every server this app is pointed at, and anything in front
+/// of one, learns which build and which operating system is calling. That is
+/// one line of ordinary HTTP and it is already inferable from the protocol
+/// version the client negotiates, but it is new, and a vault app should not
+/// add a header without saying why.
+///
+/// What it buys: an operator can tell which platforms their testers are
+/// actually on and which builds are still in use -- which is the difference
+/// between knowing a release was downloaded and knowing it was run. Nothing
+/// identifying is in it: no machine name, no locale, no CPU, no reqwest
+/// version. Without this line reqwest sends no `User-Agent` at all, and the
+/// server sees a build it cannot name.
+///
+/// The spelling of the platform is `std::env::consts::OS`, which the server's
+/// parser holds to an allow-list of exactly these values.
+fn user_agent() -> String {
+    format!("credvault/{} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
+}
+
 impl ApiClient {
     pub fn new(server_url: &str) -> Result<Self, ClientError> {
         reqwest::Url::parse(server_url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .pool_idle_timeout(IDLE_CONNECTION_LIFETIME)
+            .user_agent(user_agent())
             // Not optional, and not merely tidy for a typed JSON API: it is
             // what makes the retry in `send_retrying_connects` safe. reqwest
             // follows up to ten redirects by default, and a connect failure on

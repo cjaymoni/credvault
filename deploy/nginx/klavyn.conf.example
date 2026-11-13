@@ -1,0 +1,72 @@
+# klavyn behind an existing nginx: the API on vault., the site on the apex.
+#
+# An EXAMPLE, not a deployed file. Copy it, replace example.com throughout,
+# and keep your copy out of this repo. Checking in the live file instead
+# would mean a copy nobody deploys from, quietly drifting from the box it
+# claims to describe.
+#
+# TLS is a Cloudflare Origin Certificate, so these names only work through
+# Cloudflare -- which is also what ufw enforces, allowing 80/443 from
+# Cloudflare ranges only. A grey-clouded record here is unreachable, not
+# merely unprotected.
+#
+# The container listens on 127.0.0.1:8787 only; see
+# /opt/credvault/deploy/docker-compose.override.yml for why.
+
+server {
+  listen 80;
+  server_name example.com www.example.com vault.example.com;
+  return 301 https://$host$request_uri;
+}
+
+# ----- the API -------------------------------------------------------------
+server {
+  # nginx 1.24 on this box predates `http2 on;` (1.25.1+), so HTTP/2 goes on
+  # the listen line, matching the sibling sites.
+  listen 443 ssl http2;
+  server_name vault.example.com;
+
+  ssl_certificate     /etc/ssl/cloudflare/example.com.pem;
+  ssl_certificate_key /etc/ssl/cloudflare/example.com.key;
+
+  # Encrypted secrets travel as JSON bodies; the app refuses oversized ones
+  # itself, so this only needs to be larger than any legitimate payload.
+  client_max_body_size 10m;
+
+  # The server mounts /health at the root and everything else under /api
+  # (see the router in crates/server/src/lib.rs). Nothing outside those two
+  # is part of the API, so it is refused here rather than reaching the
+  # application.
+  location = /health { proxy_pass http://127.0.0.1:8787; include /etc/nginx/snippets/klavyn-proxy.conf; }
+  location /api/     { proxy_pass http://127.0.0.1:8787; include /etc/nginx/snippets/klavyn-proxy.conf; }
+  location = /api    { proxy_pass http://127.0.0.1:8787; include /etc/nginx/snippets/klavyn-proxy.conf; }
+  location / { return 404; }
+}
+
+# ----- the marketing site --------------------------------------------------
+server {
+  listen 443 ssl http2;
+  server_name example.com;
+
+  ssl_certificate     /etc/ssl/cloudflare/example.com.pem;
+  ssl_certificate_key /etc/ssl/cloudflare/example.com.key;
+
+  root /var/www/klavyn;
+  index index.html;
+
+  add_header X-Content-Type-Options "nosniff" always;
+
+  location / { try_files $uri $uri/ =404; }
+}
+
+# One canonical name for the site. www exists because people type it; it is a
+# permanent redirect rather than a second copy.
+server {
+  listen 443 ssl http2;
+  server_name www.example.com;
+
+  ssl_certificate     /etc/ssl/cloudflare/example.com.pem;
+  ssl_certificate_key /etc/ssl/cloudflare/example.com.key;
+
+  return 301 https://example.com$request_uri;
+}

@@ -212,6 +212,31 @@ rollout rather than never:
   could have a credential minted for someone else's hostname. Empty the list
   once no account can still be on an old binding.
 
+## How the test server is actually deployed
+
+`deploy/` describes two things, and they are not the same. The compose stack
+with Caddy is the reference deployment for a fresh VPS. The maintainer's host
+does not use it: nginx already on the box terminates TLS with a **Cloudflare
+Origin Certificate**, Caddy is never started, and the app publishes only to
+`127.0.0.1:8787`. Its files are `deploy/nginx/` and
+`deploy/docker-compose.override.yml.example`; the section is "Running behind
+an existing nginx".
+
+Three consequences worth holding on to, because each one contradicts a step
+in the reference path:
+
+- **Never a bare `docker compose up -d` there.** It would start Caddy, which
+  collides with nginx on 80 and 443. Name the service: `up -d --build klavyn`.
+- **The records stay proxied.** An origin certificate is trusted only by
+  Cloudflare, so a grey-clouded record serves something no browser accepts —
+  the opposite of the Let's Encrypt path, which needs grey to issue.
+- **`cloudflare-origin.sh` is unnecessary there**, and now refuses to run
+  when it finds 80/443 rules it did not write. nginx restores the real client
+  address itself via `set_real_ip_from`, and the firewall is already narrowed.
+
+That host also serves another production site, so `nginx -t` before a reload
+is not a formality.
+
 ## Claims about privacy are load-bearing
 
 `docs/privacy.md` is shown in the app before sign-up, so a sentence there is a

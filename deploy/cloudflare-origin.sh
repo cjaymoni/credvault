@@ -12,15 +12,41 @@
 # A cron entry once a week is enough:
 #   0 4 * * 1 root /opt/klavyn/deploy/cloudflare-origin.sh >> /var/log/klavyn-cf.log 2>&1
 #
-# Usage: ./cloudflare-origin.sh [--dry-run]
+# NOT NEEDED where nginx is already the edge with Cloudflare real-IP
+# restoration (set_real_ip_from): nginx resolves the caller itself, and such a
+# host has usually narrowed the firewall already. Running this there adds a
+# second, redundant rule set, so it stops when it finds 80/443 rules it did
+# not write. --force says you meant it.
+#
+# Usage: ./cloudflare-origin.sh [--dry-run|--force]
 set -euo pipefail
 
 DRY_RUN=""
-[ "${1:-}" = "--dry-run" ] && DRY_RUN="yes"
+FORCE=""
+case "${1:-}" in
+  --dry-run) DRY_RUN="yes" ;;
+  --force)   FORCE="yes" ;;
+  "")        ;;
+  *)         echo "cloudflare-origin: unknown argument ${1}" >&2; exit 2 ;;
+esac
 
 if [ -z "$DRY_RUN" ] && [ "$(id -u)" -ne 0 ]; then
   echo "cloudflare-origin: run as root — this edits the firewall" >&2
   exit 1
+fi
+
+# Someone else's rules on these ports mean another thing is already managing
+# this, and two overlapping allow-lists are worse than either: whichever is
+# stale silently refuses real traffic, and neither owner knows which. Said
+# before anything is fetched or changed.
+if [ -z "$DRY_RUN" ] && [ -z "$FORCE" ]; then
+  EXISTING="$(ufw status 2>/dev/null | grep -E '^(80|443|80,443)' | grep -vc 'klavyn-cloudflare' || true)"
+  if [ "${EXISTING:-0}" -gt 0 ]; then
+    echo "cloudflare-origin: $EXISTING existing rule(s) on 80/443 were not written by this script." >&2
+    echo "  If nginx already restores real client addresses, this script is unnecessary -- see" >&2
+    echo "  \"Restricting the origin to Cloudflare\" in README.md. Re-run with --force to proceed." >&2
+    exit 1
+  fi
 fi
 
 # Fetched rather than pinned: a stale list silently refuses real traffic from

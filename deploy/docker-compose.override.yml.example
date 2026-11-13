@@ -1,0 +1,9 @@
+# This host already terminates TLS with nginx and a Cloudflare origin
+# certificate, so Caddy is never started -- only the klavyn service is.
+# The port is bound to loopback on purpose: Docker inserts its own iptables
+# rules ahead of ufw, so a 0.0.0.0 publish would be reachable from the
+# internet despite the firewall allowing 80/443 from Cloudflare only.
+services:
+  klavyn:
+    ports:
+      - "127.0.0.1:8787:8787"

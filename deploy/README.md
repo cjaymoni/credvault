@@ -3,6 +3,18 @@
 Caddy terminates TLS and proxies to the server over an internal Docker
 network. The server itself publishes no ports.
 
+> **This file describes the reference deployment, not the one the maintainer
+> runs.** Everything below works on a fresh VPS and is what a self-hoster
+> should follow. The maintainer's own server does something different: TLS is
+> terminated by an **nginx already on the host**, with a Cloudflare Origin
+> Certificate rather than Let's Encrypt, Caddy is never started, and the
+> firewall is already restricted to Cloudflare. That setup is in
+> "Running behind an existing nginx" near the end, and its files are in
+> `deploy/nginx/`. Read whichever matches your host; the two differ in how
+> TLS is obtained and how the caller's address survives the proxy, and taking
+> steps from the wrong one is how a certificate fails to issue or a rate
+> limit starts counting the wrong thing.
+
 ## Prerequisites
 
 - Domains with A (and AAAA, if you have IPv6) records pointing at the VPS.
@@ -68,66 +80,153 @@ only source of the country in the installation count — `docs/privacy.md`
 describes both, so turning this off later means editing that file, not just a
 setting.
 
-**What it breaks if you stop here.** Cloudflare terminates the connection, so
-the address Caddy sees is a Cloudflare edge rather than the caller. The server
-takes the rightmost `X-Forwarded-For` entry as the one its own proxy wrote, so
-every request from everyone behind one edge would be rate-limited as a single
-address: one person guessing passwords spends the login budget for all of
-them, and someone rotating edges collects a fresh budget each time. The same
-address feeds the installation count, which would become one per edge per day.
+**What it costs.** Cloudflare terminates the connection, so the origin no
+longer sees the caller's address by default and has to recover it. Get that
+wrong and everyone behind one edge shares a rate-limit budget and counts as
+one installation. "Restricting the origin to Cloudflare" below is where that
+is dealt with, and it differs depending on whether Caddy or nginx is the edge.
 
-The Caddyfile already handles this — it takes the caller's address from
-`CF-Connecting-IP` — but that header is only worth believing while Cloudflare
-is the only thing that can open a connection to this host. Otherwise anyone
-reaching the origin directly can write any address into it and be limited as
-somebody else. `cloudflare-origin.sh` is what makes it true, and it is the
-second half of the Caddyfile change rather than a hardening extra.
+### Which certificate, and therefore which order
 
-### In this order
+Two ways to hold a certificate at the origin, and they want **opposite**
+things from the proxy. Pick first; the order below follows from it.
+
+**Let's Encrypt, issued by Caddy** — the reference deployment above. Caddy
+needs the HTTP challenge to reach it, and a proxied record intercepts that.
+So the records start grey:
 
 1. **DNS only (grey cloud) for all three names**, with 80 and 443 open as in
    the Firewall section. Start the stack and let Caddy get its certificates.
-   A proxied record intercepts the HTTP challenge, so issuing comes first.
-2. **Confirm all three answer**, including the API: `curl https://vault.example.com/health`.
+2. **Confirm all three answer**, the API included:
+   `curl https://vault.example.com/health`.
 3. **Turn the proxy on (orange cloud)** and set SSL/TLS to **Full (strict)**.
-   Flexible gives a redirect loop against a Caddy that is already serving
-   HTTPS, and Full without strict accepts any certificate at all.
-4. **Restrict the origin**, once the proxy is confirmed working:
+4. **Restrict the origin** (below), once the proxy is confirmed working.
 
-   ```sh
-   ./cloudflare-origin.sh --dry-run    # read the ranges first
-   sudo ./cloudflare-origin.sh
-   ufw status                          # confirm SSH is still allowed
-   ```
+Renewal is the part that fails quietly here: Caddy renews about 30 days
+before expiry over that same HTTP challenge, now through a proxied record.
+Leave **Always Use HTTPS off** in Cloudflare — Caddy already redirects, and
+that setting is what swallows the challenge. Watch the first renewal
+(`docker compose logs caddy | grep -i certificate`) rather than assuming it.
+The durable fix is the DNS challenge, which needs a Caddy image built with
+the Cloudflare DNS module and an API token.
 
-5. **Check the server is seeing real callers, not edges.** This is the step
-   that catches a `header_up` that did not take effect, and it is much easier
-   to notice now than as mysterious rate limiting later:
+**A Cloudflare Origin Certificate** — what the maintainer's host uses. It is
+issued by Cloudflare and only trusted *by* Cloudflare, so it is the exact
+opposite case: there is no challenge to complete, nothing to issue, and a
+grey-clouded record serves a certificate no browser accepts. **Go proxied
+from the start.** Generate the key and CSR on the server so the private key
+never leaves it, and paste only the CSR into Cloudflare:
 
-   ```sh
-   docker compose logs klavyn | grep -i 'rate limited'
-   ```
+```sh
+umask 077
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout /etc/ssl/cloudflare/example.com.key \
+  -out /root/example.com.csr -subj "/CN=example.com"
+```
 
-   More directly, make a request from a known address and look for it. If what
-   you see are Cloudflare addresses, stop and fix it before testers arrive.
+Save the issued certificate beside it, then check the pair matches before
+reloading anything — a mismatch is the common way nginx refuses to start:
+
+```sh
+openssl x509 -noout -modulus -in /etc/ssl/cloudflare/example.com.pem | openssl md5
+openssl rsa  -noout -modulus -in /etc/ssl/cloudflare/example.com.key | openssl md5
+```
+
+Either way set SSL/TLS to **Full (strict)**. Flexible gives a redirect loop
+against an origin already serving HTTPS, and plain Full accepts any
+certificate at all, including an expired or self-signed one. Strict accepts
+Cloudflare's own origin certificates, so it is correct for both paths.
+
+### Restricting the origin to Cloudflare
+
+Only needed where the origin takes the caller's address from a header. The
+Caddyfile does, from `CF-Connecting-IP`, because Caddy's own peer is a
+Cloudflare edge and the address it would otherwise record is the edge's. The
+server reads the rightmost `X-Forwarded-For` entry as the one its proxy
+wrote, so getting this wrong means everyone behind one edge shares a
+rate-limit budget — one password guesser spends it for all of them — and the
+installation count becomes one per edge per day.
+
+That header is an ordinary header to anyone connecting directly, so it is
+only worth believing while nothing but Cloudflare can reach the host:
+
+```sh
+./cloudflare-origin.sh --dry-run    # read the ranges first
+sudo ./cloudflare-origin.sh
+ufw status                          # confirm SSH is still allowed
+```
+
+**Skip this if nginx is already in front with real-IP restoration**
+(`set_real_ip_from` for Cloudflare's ranges). nginx resolves the caller
+itself and the firewall is usually already narrowed; the script would add a
+second, redundant rule set. It refuses to run if it finds rules it did not
+write.
+
+Then check the origin is seeing real callers rather than edges. This is the
+step that catches a header rewrite that did not take effect, and it is far
+easier to notice now than as mysterious rate limiting later:
+
+```sh
+docker compose logs klavyn | grep -i "rate limited"
+tail -50 /var/log/nginx/access.log      # if nginx is the edge
+```
+
+If what you see are Cloudflare addresses, stop and fix it before users arrive.
 
 ### Two things to know afterwards
 
-**Grey-clouding again will black-hole the site.** The firewall now refuses
-everything that is not Cloudflare, so a record switched back to DNS-only is
+**Grey-clouding again will black-hole the site.** Once the firewall refuses
+everything that is not Cloudflare, a record switched back to DNS-only is
 unreachable. Re-open 80/443 first.
 
-**Renewal is the part that fails quietly.** Caddy renews about 30 days before
-expiry, over the same HTTP challenge that step 1 had to avoid a proxied record
-for. If it cannot complete, nothing breaks on the day it fails — it breaks
-weeks later, when the certificate actually expires. Watch the first renewal
-(`docker compose logs caddy | grep -i certificate`) rather than assuming it.
-The durable fix is the DNS challenge, which needs a Caddy image built with the
-Cloudflare DNS module and an API token; worth doing if this host is going to
-run unattended.
+Re-run `cloudflare-origin.sh` when Cloudflare changes its ranges — weekly
+from cron is plenty. The same applies to nginx's `set_real_ip_from` list.
 
-Re-run `cloudflare-origin.sh` when Cloudflare changes its ranges — weekly from
-cron is plenty.
+## Running behind an existing nginx
+
+What the maintainer's host does, and a reasonable pattern for any box that
+already serves other sites: nginx owns 80 and 443, the app publishes only to
+loopback, and Caddy never starts.
+
+The files are in the repo rather than only on the server:
+
+- `deploy/nginx/klavyn.conf.example` — the API on `vault.`, the site on the
+  apex, and `www` redirecting to it. `/health` and `/api` are proxied and
+  everything else is refused, matching what the Caddyfile does. An example,
+  with `example.com` throughout: copy it and edit, and keep your edited copy
+  out of the repo. A checked-in live file is one nobody deploys from, which
+  drifts from the host it claims to describe.
+- `deploy/nginx/klavyn-proxy.conf` — the shared proxy headers. Not an
+  example: it names no host, so it installs verbatim. `X-Forwarded-For`
+  is **set, not appended**: the server reads the rightmost entry, and
+  `$remote_addr` is already the real caller because Cloudflare real-IP
+  restoration runs ahead of it.
+- `deploy/docker-compose.override.yml.example` — publishes the app on
+  `127.0.0.1:8787` only. Docker inserts its own iptables rules ahead of ufw,
+  so a `0.0.0.0` publish would be reachable from the internet even with the
+  firewall restricted.
+
+Install them, then bring up only the app service — never a bare
+`docker compose up -d`, which would start Caddy and collide with nginx on 80
+and 443:
+
+```sh
+cp deploy/docker-compose.override.yml.example deploy/docker-compose.override.yml
+cp deploy/nginx/klavyn-proxy.conf /etc/nginx/snippets/
+cp deploy/nginx/klavyn.conf.example /etc/nginx/sites-available/klavyn
+$EDITOR /etc/nginx/sites-available/klavyn     # replace example.com throughout
+ln -sfn /etc/nginx/sites-available/klavyn /etc/nginx/sites-enabled/klavyn
+nginx -t && systemctl reload nginx     # reload only if the test passes
+docker compose up -d --build klavyn    # the service by name, not the stack
+```
+
+`nginx -t` before the reload is not optional on a host serving other sites: a
+bad block takes them all down, and testing first means the worst case is a
+symlink to remove.
+
+Nothing in this setup reads `KLAVYN_ACME_EMAIL` or `KLAVYN_SITE_DOMAIN` —
+they belong to Caddy — but compose still requires them to be present, so keep
+them in `.env`.
 
 ## Accounts
 

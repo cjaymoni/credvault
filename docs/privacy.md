@@ -125,7 +125,7 @@ so that it cannot be turned into a record of you.
   nobody can work out what yesterday's numbers were, including us.
   Two requests from you on the same day look like one installation; the same
   two a day apart cannot be recognised as related, by us or by anyone we send
-  them to. That is what makes this a headcount rather than a trail.
+  them to. That is what makes this a tally rather than a trail.
 - **There is no tracking in the app itself.** No third-party script, no
   advertising, no profiling, no cookies, and no record of which screens you
   open or what you do in them.

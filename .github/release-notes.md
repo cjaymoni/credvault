@@ -9,7 +9,7 @@ server, can reset your passphrase or decrypt your vault for you. Use throwaway
 credentials, or expect to type everything in again.
 
 **The app checks the server before it sends anything, and will refuse one
-that is too old.** This release does not raise that minimum: a 0.3.0 app
+that is too old.** This release does not raise that minimum: a __TAG__ app
 works against a 0.2.0 server. Anything older than 0.2.0 is refused, and
 refusing happens before any credential is sent, so the vault does not open at
 all rather than opening without the new features. If you run your own server
@@ -55,8 +55,8 @@ HTTP and no more than a web browser sends, but it is new, and a server you do
 not run will see it.
 
 Separately, how many times each installer has been downloaded from the
-releases page is now recorded too. GitHub has always counted that and always
-shown it publicly; it says nothing about who downloaded anything.
+releases page is now recorded too. GitHub has always counted that and the
+count has always been public; it says nothing about who downloaded anything.
 
 The privacy policy in the app describes all of this. It previously said the
 service used no analytics at all, which was true when it was written and is

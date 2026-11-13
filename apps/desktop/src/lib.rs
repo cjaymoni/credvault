@@ -1471,6 +1471,16 @@ fn ui_constants() -> UiConstants {
     }
 }
 
+/// The version of the running build, for the line the account panel shows.
+///
+/// Read from the crate's own metadata, which is the same source the
+/// `User-Agent` in `client.rs` is built from, so the version a user reads off
+/// their screen and the version the server recorded for them cannot disagree.
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// Change the passphrase this vault is derived from.
 ///
 /// Everything the old passphrase produced is replaced at once, because half a
@@ -2422,6 +2432,7 @@ pub fn run() {
             session_info,
             startup_warnings,
             ui_constants,
+            app_version,
             list_secrets,
             reveal_password,
             copy_password,
@@ -2454,6 +2465,80 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The value a plist gives `key`, read as text.
+    ///
+    /// Matched rather than parsed: a plist reader and a YAML reader, pulled in
+    /// to read one string each, would be two dependencies for a test.
+    fn plist_string(source: &str, key: &str) -> String {
+        let tag = format!("<key>{key}</key>");
+        let stated = source.matches(&tag).count();
+        assert_eq!(stated, 1, "the plist states {key} {stated} times, and this reads the first");
+        let after = source.split_once(&tag).expect("counted above").1;
+        let (between, value) =
+            after.split_once("<string>").unwrap_or_else(|| panic!("{key} is not followed by a string"));
+        // Without this, a key whose value is not a string would run on to the
+        // *next* key's string, and the version would be pinned to its
+        // neighbour -- the one outcome a drift test must not have.
+        assert!(between.trim().is_empty(), "{key}'s value is not a <string> but {}", between.trim());
+        value.split_once("</string>").unwrap_or_else(|| panic!("{key}'s string is never closed")).0.to_string()
+    }
+
+    /// The value a YAML mapping gives `key`, quoted or not.
+    fn yaml_string(source: &str, key: &str) -> String {
+        let prefix = format!("{key}:");
+        // Exactly one, because a second target added to the project file would
+        // otherwise be pinned by nothing while this test stayed green.
+        let mut lines = source.lines().filter(|line| line.trim_start().starts_with(&prefix));
+        let line = lines.next().unwrap_or_else(|| panic!("the project file has no {key}"));
+        assert!(lines.next().is_none(), "{key} is in the project file more than once; this reads the first");
+        let value = line.split_once(':').unwrap_or_else(|| panic!("{key} has no value")).1.trim();
+        value.trim_matches('"').to_string()
+    }
+
+    /// Every file that states this app's version says the crate's number.
+    ///
+    /// `app_version` reports the crate's, and that is what the account panel
+    /// shows. The installer is named from `tauri.conf.json`, and what iOS puts
+    /// in Settings comes from the plist and the project file. A release bumps
+    /// all of them by hand (see CLAUDE.md), so a build that reports a version
+    /// other than the one it shipped as is one forgotten edit away — and every
+    /// bug report quoting that number would name the wrong release.
+    #[test]
+    fn every_file_that_states_the_version_agrees_with_the_crate() {
+        let crate_version = app_version();
+
+        let bundled: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json is not valid JSON");
+        assert_eq!(bundled["version"].as_str(), Some(crate_version.as_str()), "tauri.conf.json");
+
+        let plist = include_str!("../gen/apple/credvault-desktop_iOS/Info.plist");
+        let project = include_str!("../gen/apple/project.yml");
+        for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
+            assert_eq!(plist_string(plist, key), crate_version, "Info.plist {key}");
+            assert_eq!(yaml_string(project, key), crate_version, "project.yml {key}");
+        }
+    }
+
+    /// The command exists and the UI calls it, and nothing else notices if it
+    /// is never wired up: dropping it from `generate_handler!` compiles, passes
+    /// every other test, and leaves the version line quietly blank. So the list
+    /// is read as text, which is the only place that link is stated.
+    #[test]
+    fn the_version_command_is_registered_with_tauri() {
+        let registered = include_str!("lib.rs")
+            .split_once("generate_handler![")
+            .expect("the handler list has moved or been renamed")
+            .1
+            .split_once("])")
+            .expect("the handler list is never closed")
+            .0;
+        // Line-wise and whole: `contains` would be satisfied by a
+        // `get_app_version,` and broken by a reorder that leaves this one last
+        // without its comma.
+        let listed = registered.lines().any(|line| line.trim().trim_end_matches(',') == "app_version");
+        assert!(listed, "app_version is not in the invoke handler");
+    }
 
     /// "Clear now" and the timer must not both act on one copy: whichever
     /// runs first takes the digest and the other finds nothing to clear.

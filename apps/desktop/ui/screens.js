@@ -353,5 +353,20 @@
     return PLACED_CONTROLS.map((control) => [control, table[control]]);
   }
 
-  return { esc, serverSummaryText, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
+  /// What the account panel shows for the build that is running.
+  ///
+  /// `null` when there is nothing to show, which the caller answers by
+  /// leaving the line hidden rather than drawing the word "Version" with a
+  /// blank after it. The string comes from our own binary and is not user
+  /// input; the guard is there for the one case that can really happen, which
+  /// is the command not answering at all.
+  ///
+  /// The number is given on its own, unprefixed by a `v`, because it is read
+  /// out loud and typed into bug reports as often as it is read.
+  function appVersionLabel(version) {
+    const shown = String(version ?? "").trim();
+    return shown ? `Version ${shown}` : null;
+  }
+
+  return { esc, serverSummaryText, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
 });

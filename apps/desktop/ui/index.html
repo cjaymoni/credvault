@@ -283,6 +283,12 @@
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
       <span class="btn-label">Log out</span>
     </button>
+
+    <!-- Which build this is. Plain text rather than a chip: it is something
+         to read off when reporting a problem, not something to press. Hidden
+         until the Rust side answers, so it can never show a number this build
+         is not, and leaves no gap at the foot of the panel if it never does. -->
+    <p class="app-version" id="app-version" hidden></p>
   </div>
 </section>
 

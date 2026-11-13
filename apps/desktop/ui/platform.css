@@ -91,6 +91,9 @@
   .account-tools #btn-fingerprint { flex-wrap: wrap; }
   .account-tools #btn-fingerprint .fp { flex: 1 1 100%; padding-left: 26px; white-space: normal; overflow-wrap: anywhere; text-align: start; }
   .account-tools .theme-switch { align-self: flex-start; margin: 4px 6px; }
+  /* Last line of the popover, under the log-out item, where a desktop app's
+     "About" line sits. */
+  .account-tools .app-version { margin: 6px 10px 2px; }
   .account-tools #btn-logout { color: var(--danger); }
   @media (hover: hover) {
     .account-tools .chip:hover, .account-tools .icon-btn:hover { background: var(--surface-3); }

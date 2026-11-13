@@ -16,7 +16,28 @@
 
 	@api path /api /api/* /health
 	handle @api {
-		reverse_proxy klavyn:8787
+		reverse_proxy klavyn:8787 {
+			# Behind Cloudflare, Caddy's peer is a Cloudflare edge, so the
+			# address it would append to X-Forwarded-For is the edge's, not
+			# the caller's. The server takes the rightmost entry as the one
+			# its own proxy wrote (see ratelimit::client_ip), so without this
+			# every request from everyone behind one edge rate-limits as a
+			# single address -- one password guesser spends the whole budget
+			# for that edge, and rotating edges buys more of it. The same
+			# address feeds the installation count, which would become one
+			# per edge per day instead of one per installation.
+			#
+			# Replacing the header rather than adding to it: the server reads
+			# one entry and this is the only one worth reading.
+			#
+			# SAFE ONLY WHILE NOTHING BUT CLOUDFLARE CAN REACH THIS HOST.
+			# CF-Connecting-IP is an ordinary header to anyone connecting
+			# directly, so a reachable origin means a forgeable client
+			# address, and with it someone else's rate-limit budget. The
+			# firewall is what makes this true -- deploy/cloudflare-origin.sh,
+			# and "Putting Cloudflare in front" in README.md.
+			header_up X-Forwarded-For {http.request.header.Cf-Connecting-Ip}
+		}
 	}
 
 	handle {

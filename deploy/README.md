@@ -55,6 +55,80 @@ ufw allow 80,443/tcp
 ufw enable
 ```
 
+If you put Cloudflare in front, the section below replaces that last rule with
+a narrower one. Do it in the order written there, not now.
+
+## Putting Cloudflare in front
+
+Optional, and it changes two things that are easy to get subtly wrong, so the
+order matters.
+
+**What it buys.** Protection against floods, and `CF-IPCountry`, which is the
+only source of the country in the installation count — `docs/privacy.md`
+describes both, so turning this off later means editing that file, not just a
+setting.
+
+**What it breaks if you stop here.** Cloudflare terminates the connection, so
+the address Caddy sees is a Cloudflare edge rather than the caller. The server
+takes the rightmost `X-Forwarded-For` entry as the one its own proxy wrote, so
+every request from everyone behind one edge would be rate-limited as a single
+address: one person guessing passwords spends the login budget for all of
+them, and someone rotating edges collects a fresh budget each time. The same
+address feeds the installation count, which would become one per edge per day.
+
+The Caddyfile already handles this — it takes the caller's address from
+`CF-Connecting-IP` — but that header is only worth believing while Cloudflare
+is the only thing that can open a connection to this host. Otherwise anyone
+reaching the origin directly can write any address into it and be limited as
+somebody else. `cloudflare-origin.sh` is what makes it true, and it is the
+second half of the Caddyfile change rather than a hardening extra.
+
+### In this order
+
+1. **DNS only (grey cloud) for all three names**, with 80 and 443 open as in
+   the Firewall section. Start the stack and let Caddy get its certificates.
+   A proxied record intercepts the HTTP challenge, so issuing comes first.
+2. **Confirm all three answer**, including the API: `curl https://vault.example.com/health`.
+3. **Turn the proxy on (orange cloud)** and set SSL/TLS to **Full (strict)**.
+   Flexible gives a redirect loop against a Caddy that is already serving
+   HTTPS, and Full without strict accepts any certificate at all.
+4. **Restrict the origin**, once the proxy is confirmed working:
+
+   ```sh
+   ./cloudflare-origin.sh --dry-run    # read the ranges first
+   sudo ./cloudflare-origin.sh
+   ufw status                          # confirm SSH is still allowed
+   ```
+
+5. **Check the server is seeing real callers, not edges.** This is the step
+   that catches a `header_up` that did not take effect, and it is much easier
+   to notice now than as mysterious rate limiting later:
+
+   ```sh
+   docker compose logs klavyn | grep -i 'rate limited'
+   ```
+
+   More directly, make a request from a known address and look for it. If what
+   you see are Cloudflare addresses, stop and fix it before testers arrive.
+
+### Two things to know afterwards
+
+**Grey-clouding again will black-hole the site.** The firewall now refuses
+everything that is not Cloudflare, so a record switched back to DNS-only is
+unreachable. Re-open 80/443 first.
+
+**Renewal is the part that fails quietly.** Caddy renews about 30 days before
+expiry, over the same HTTP challenge that step 1 had to avoid a proxied record
+for. If it cannot complete, nothing breaks on the day it fails — it breaks
+weeks later, when the certificate actually expires. Watch the first renewal
+(`docker compose logs caddy | grep -i certificate`) rather than assuming it.
+The durable fix is the DNS challenge, which needs a Caddy image built with the
+Cloudflare DNS module and an API token; worth doing if this host is going to
+run unattended.
+
+Re-run `cloudflare-origin.sh` when Cloudflare changes its ranges — weekly from
+cron is plenty.
+
 ## Accounts
 
 Who may create an account is one of three states, and `.env` as shipped

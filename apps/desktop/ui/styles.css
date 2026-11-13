@@ -224,7 +224,7 @@ input:not([type="checkbox"]):focus-visible, textarea:focus-visible {
    checkbox is not a text field, and `appearance: none` plus a field's width,
    height and padding turned the one in the custom-field editor into an empty
    rectangle that never showed a tick. It is drawn below instead. */
-input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea {
+input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea, select {
   font: inherit;
   width: 100%;
   min-height: 38px;
@@ -240,6 +240,38 @@ input:not([type="search"]):not([type="checkbox"]), input[type="search"], textare
 input::placeholder, textarea::placeholder { color: var(--text-3); opacity: 1; }
 textarea { min-height: 96px; resize: vertical; line-height: 1.5; }
 input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+
+/* The caret is a rotated square border rather than an image, because the
+   page's CSP allows no `data:` URLs to draw one with. The right padding
+   leaves it room, so a long project name never runs underneath. */
+select { padding-right: 34px; cursor: pointer; }
+/* The caret is a rotated square's two borders rather than an image: the
+   page's CSP allows no `data:` URLs to draw one with. */
+.select-wrap { position: relative; display: block; }
+.select-wrap::after {
+  content: "";
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-right: 1.6px solid var(--text-3);
+  border-bottom: 1.6px solid var(--text-3);
+  transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+}
+
+/* A checkbox and its words as one target, the way `.cf-hide` is. Left as the
+   platform's own control for the reason given there. */
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-small);
+  color: var(--text-2);
+}
+.checkbox input[type="checkbox"] { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.people .sees-project { flex: none; white-space: nowrap; }
 
 .field { margin-bottom: 14px; }
 .field label {
@@ -834,6 +866,30 @@ input.mono.mismatch { border-color: var(--danger); }
 .people li:first-child { border-top: 0; }
 .people .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .people .only-you { color: var(--text-3); font-size: var(--text-small); }
+#project-delete-name[aria-invalid="true"] { border-color: var(--border-strong); }
+
+/* A project's name and its count belong together, so the count sits beside
+   the name and the gap goes after it. Pushing the count to the far right,
+   the way the sharing list does with an address and a status, left the two
+   halves of one fact at opposite ends of a very wide pane. */
+.project-row .who { flex: 0 1 auto; }
+.project-row .people-status { margin-right: auto; }
+/* Room between the last project and the buttons under it. */
+#project-list { margin-bottom: 14px; }
+
+/* A row of the Projects panel being edited: the form takes the place of the
+   name and the two buttons, so the row keeps its height and the list does
+   not jump as rows open and close. */
+.project-row .project-inline { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.project-row .project-name { flex: 1; min-width: 0; }
+/* The delete confirmation is a sentence, not a name, so it wraps rather than
+   being cut off with an ellipsis the way `.who` is elsewhere. */
+.people .who.wrap { white-space: normal; overflow: visible; text-overflow: clip; }
+@media (max-width: 720px) {
+  .project-row.editing, .project-row.confirming { flex-wrap: wrap; }
+  .project-row .project-inline { flex-wrap: wrap; }
+  .project-row .project-name { flex-basis: 100%; }
+}
 
 /* form */
 .form .input-row > input { flex: 1; }
@@ -901,7 +957,7 @@ input.mono.mismatch { border-color: var(--danger); }
   button, .item { -webkit-touch-callout: none; user-select: none; }
 
   /* ----- controls ----- */
-  input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea {
+  input:not([type="search"]):not([type="checkbox"]), input[type="search"], textarea, select {
     /* 17px: a field below 16px makes iOS zoom the page when it takes focus */
     font-size: var(--text-body);
     min-height: var(--control-h);
@@ -910,6 +966,12 @@ input.mono.mismatch { border-color: var(--danger); }
     background: var(--surface-2);
   }
   textarea { min-height: 112px; }
+  .checkbox input[type="checkbox"] { width: 20px; height: 20px; }
+  /* The sharing row carries an address, a status, a toggle and a button; on
+     a phone it wraps, with the address on its own line and the controls
+     below it in source order -- which leaves the destructive one last,
+     where it should be. */
+  .people li { flex-wrap: wrap; }
   .field { margin-bottom: 18px; }
   .field label, .field-label { font-size: var(--text-small); margin-bottom: 8px; }
   .hint { margin-top: 8px; }

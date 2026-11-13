@@ -92,6 +92,7 @@ async fn an_account_cannot_grow_past_its_secret_quota() {
         name: "the last one".into(),
         payload: key.encrypt("the last one", &payload()).unwrap(),
         wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&alice.self_wrap_key)),
+        project_id: None,
     };
     let response = server.req(Method::POST, "/secrets", &alice).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -101,6 +102,7 @@ async fn an_account_cannot_grow_past_its_secret_quota() {
         name: "one too many".into(),
         payload: key.encrypt("one too many", &payload()).unwrap(),
         wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&alice.self_wrap_key)),
+        project_id: None,
     };
     let response = server.req(Method::POST, "/secrets", &alice).json(&body).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -161,6 +163,7 @@ async fn an_account_cannot_grow_past_its_pending_invite_quota() {
             wrapped_key: wrapped,
             message: String::new(),
             key_version: 0,
+            share_project: false,
         })
         .send()
         .await
@@ -230,6 +233,7 @@ impl TestServer {
             name: name.into(),
             payload: key.encrypt(name, payload).unwrap(),
             wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&account.self_wrap_key)),
+            project_id: None,
         };
         let response = self.req(Method::POST, "/secrets", account).json(&body).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -282,6 +286,7 @@ impl TestServer {
             fingerprint,
             wrapped_key: key.wrap_for(&lookup.public_key).unwrap(),
             message: "for you".into(),
+            share_project: false,
         };
         self.req(Method::POST, &format!("/secrets/{secret_id}/invites"), owner).json(&body).send().await.unwrap()
     }
@@ -701,6 +706,7 @@ async fn lookup_is_rate_limited_per_account_not_per_address() {
         fingerprint: bob_fp.clone(),
         wrapped_key: key.wrap_for(bob.identity.public_key()).unwrap(),
         message: String::new(),
+        share_project: false,
     };
     let response =
         server.req(Method::POST, &format!("/secrets/{id}/invites"), &second).json(&body).send().await.unwrap();
@@ -794,6 +800,7 @@ async fn secret_lifecycle_for_owner() {
             key_version: 0,
             name: "GitHub (work)".into(),
             payload: key.encrypt("GitHub (work)", &changed).unwrap(),
+            project: ProjectAssignment::Keep,
         })
         .send()
         .await
@@ -806,7 +813,12 @@ async fn secret_lifecycle_for_owner() {
     // Updating a nonexistent secret is a 404; an oversized blob is a 400.
     let response = server
         .req(Method::PUT, "/secrets/999", &alice)
-        .json(&UpdateSecretRequest { key_version: 0, name: "x".into(), payload: key.encrypt("x", &changed).unwrap() })
+        .json(&UpdateSecretRequest {
+            key_version: 0,
+            name: "x".into(),
+            payload: key.encrypt("x", &changed).unwrap(),
+            project: ProjectAssignment::Keep,
+        })
         .send()
         .await
         .unwrap();
@@ -815,7 +827,12 @@ async fn secret_lifecycle_for_owner() {
         Sealed { v: credvault_core::aead::SEALED_FORMAT, nonce: vec![0; 12], ciphertext: vec![0; MAX_BLOB_BYTES + 1] };
     let response = server
         .req(Method::PUT, &format!("/secrets/{id}"), &alice)
-        .json(&UpdateSecretRequest { key_version: 0, name: "x".into(), payload: oversized })
+        .json(&UpdateSecretRequest {
+            key_version: 0,
+            name: "x".into(),
+            payload: oversized,
+            project: ProjectAssignment::Keep,
+        })
         .send()
         .await
         .unwrap();
@@ -890,7 +907,12 @@ async fn share_one_secret_via_invite_and_revoke_rotates_the_key() {
     // simply does not exist for those operations.
     let response = server
         .req(Method::PUT, &format!("/secrets/{id}"), &bob)
-        .json(&UpdateSecretRequest { key_version: 0, name: "x".into(), payload: key.encrypt("x", &payload()).unwrap() })
+        .json(&UpdateSecretRequest {
+            key_version: 0,
+            name: "x".into(),
+            payload: key.encrypt("x", &payload()).unwrap(),
+            project: ProjectAssignment::Keep,
+        })
         .send()
         .await
         .unwrap();
@@ -1069,6 +1091,7 @@ async fn an_invite_cannot_be_created_against_a_rotated_away_key() {
         fingerprint: carol.identity.public_key().fingerprint(),
         wrapped_key: key.wrap_for(carol.identity.public_key()).unwrap(),
         message: String::new(),
+        share_project: false,
     };
     let response =
         server.req(Method::POST, &format!("/secrets/{id}/invites"), &alice).json(&stale).send().await.unwrap();
@@ -1100,6 +1123,7 @@ async fn inviting_never_reveals_whether_an_address_has_an_account() {
             fingerprint: fingerprint.into(),
             wrapped_key: key.wrap_for(bob.identity.public_key()).unwrap(),
             message: String::new(),
+            share_project: false,
         };
         server.req(Method::POST, &format!("/secrets/{id}/invites"), &alice).json(&body).send()
     };
@@ -1137,6 +1161,7 @@ async fn invite_edge_cases() {
         fingerprint: fingerprint.into(),
         wrapped_key: key.wrap_for(alice.identity.public_key()).unwrap(),
         message,
+        share_project: false,
     };
     let post_invite =
         |body: InviteRequest| server.req(Method::POST, &format!("/secrets/{id}/invites"), &alice).json(&body).send();
@@ -1210,8 +1235,12 @@ async fn writes_with_a_stale_key_version_are_rejected() {
     // Device B, still holding version 0 and the old key, tries to update: 409, nothing written.
     let mut changed = payload();
     changed.password = "leaked-to-bob".into();
-    let stale =
-        UpdateSecretRequest { key_version: 0, name: "Bank".into(), payload: key.encrypt("Bank", &changed).unwrap() };
+    let stale = UpdateSecretRequest {
+        key_version: 0,
+        name: "Bank".into(),
+        payload: key.encrypt("Bank", &changed).unwrap(),
+        project: ProjectAssignment::Keep,
+    };
     let response = server.req(Method::PUT, &format!("/secrets/{id}"), &alice).json(&stale).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(decrypt(&server.list(&alice).await[0], &alice), payload());
@@ -1232,6 +1261,7 @@ async fn writes_with_a_stale_key_version_are_rejected() {
         fingerprint: carol_fp.clone(),
         wrapped_key: key.wrap_for(&lookup.public_key).unwrap(),
         message: String::new(),
+        share_project: false,
     };
     let response =
         server.req(Method::POST, &format!("/secrets/{id}/invites"), &alice).json(&stale_invite).send().await.unwrap();
@@ -1259,6 +1289,7 @@ async fn writes_with_a_stale_key_version_are_rejected() {
         key_version: 1,
         name: "Bank".into(),
         payload: new_key.encrypt("Bank", &changed).unwrap(),
+        project: ProjectAssignment::Keep,
     };
     let response = server.req(Method::PUT, &format!("/secrets/{id}"), &alice).json(&fresh).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1281,6 +1312,7 @@ async fn an_owner_copy_must_always_be_self_wrapped() {
         name: "Bank".into(),
         payload: key.encrypt("Bank", &payload()).unwrap(),
         wrapped_key: WrappedKey::Shared(key.wrap_for(alice.identity.public_key()).unwrap()),
+        project_id: None,
     };
     let response = server.req(Method::POST, "/secrets", &alice).json(&sealed_owner_copy).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1543,6 +1575,7 @@ async fn one_person_cannot_be_buried_in_invitations_by_a_crowd() {
             wrapped_key: key.wrap_for(victim.identity.public_key()).unwrap(),
             message: String::new(),
             key_version: 0,
+            share_project: false,
         })
         .send()
         .await
@@ -1625,6 +1658,7 @@ async fn one_account_cannot_fill_a_strangers_invite_list() {
                 wrapped_key: key.wrap_for(victim.identity.public_key()).unwrap(),
                 message: String::new(),
                 key_version: 0,
+                share_project: false,
             })
             .send()
             .await
@@ -1636,4 +1670,427 @@ async fn one_account_cannot_fill_a_strangers_invite_list() {
         assert_eq!(response.status(), StatusCode::CREATED);
     }
     assert_eq!(refused_at, Some(MAX_PENDING_INVITES_PER_PAIR), "the cap must be the per-pair one");
+}
+
+// ----- projects --------------------------------------------------------------
+
+/// Create a project and hand back its id.
+async fn new_project(server: &TestServer, account: &Account, name: &str) -> i64 {
+    let response = server
+        .req(Method::POST, "/projects", account)
+        .json(&ProjectRequest { name: name.into() })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: Created = response.json().await.unwrap();
+    created.id
+}
+
+async fn projects(server: &TestServer, account: &Account) -> Vec<ProjectView> {
+    let response = server.req(Method::GET, "/projects", account).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json().await.unwrap()
+}
+
+/// Invite someone, saying whether they may also see where the secret is filed.
+async fn invite_sharing(
+    server: &TestServer,
+    owner: &Account,
+    secret_id: i64,
+    key: &SecretKey,
+    email: &str,
+    share_project: bool,
+) -> i64 {
+    let fingerprint = server.fingerprint_of(email).await;
+    let lookup: PublicUser = server
+        .req(Method::GET, &format!("/users/lookup?email={email}&fingerprint={fingerprint}"), owner)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let body = InviteRequest {
+        key_version: server.key_version(owner, secret_id).await,
+        email: email.into(),
+        fingerprint,
+        wrapped_key: key.wrap_for(&lookup.public_key).unwrap(),
+        message: String::new(),
+        share_project,
+    };
+    let response =
+        server.req(Method::POST, &format!("/secrets/{secret_id}/invites"), owner).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED, "{}", error_text(response).await);
+    let created: Created = response.json().await.unwrap();
+    created.id
+}
+
+#[tokio::test]
+async fn a_project_groups_secrets_and_deleting_it_keeps_every_one_of_them() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let project = new_project(&server, &alice, "Perspectiv").await;
+
+    // Filed on the way in, and filed afterwards: both routes reach the same place.
+    let key = SecretKey::generate();
+    let body = CreateSecretRequest {
+        name: "Cloudflare".into(),
+        payload: key.encrypt("Cloudflare", &payload()).unwrap(),
+        wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&alice.self_wrap_key)),
+        project_id: Some(project),
+    };
+    let response = server.req(Method::POST, "/secrets", &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let cloudflare: Created = response.json().await.unwrap();
+
+    let (jira, _) = server.create_secret(&alice, "Jira", &payload()).await;
+    let response = server
+        .req(Method::PUT, &format!("/secrets/{jira}/project"), &alice)
+        .json(&MoveSecretRequest { project_id: Some(project) })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let listed = server.list(&alice).await;
+    for view in &listed {
+        assert_eq!(
+            view.project,
+            Some(SecretProject::Own { id: project, name: "Perspectiv".into() }),
+            "{} should be filed under Perspectiv",
+            view.name
+        );
+    }
+    assert_eq!(
+        projects(&server, &alice).await,
+        vec![ProjectView { id: project, name: "Perspectiv".into(), secret_count: 2 }]
+    );
+
+    // Deleting the heading must never delete what was under it.
+    let response = server.req(Method::DELETE, &format!("/projects/{project}"), &alice).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let listed = server.list(&alice).await;
+    assert_eq!(listed.len(), 2, "the secrets must outlive the project");
+    assert!(listed.iter().all(|v| v.project.is_none()), "they should simply be unfiled");
+    assert!(projects(&server, &alice).await.is_empty());
+    // And the secrets are still readable, which is the point of keeping them.
+    let view = listed.iter().find(|v| v.id == cloudflare.id).unwrap();
+    assert_eq!(key.decrypt("Cloudflare", &view.payload).unwrap().password, payload().password);
+}
+
+#[tokio::test]
+async fn a_project_name_is_unique_within_an_account_and_free_between_accounts() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let bob = register(&server, "bob@example.com", "correct horse battery").await;
+    new_project(&server, &alice, "Perspectiv").await;
+
+    for taken in ["Perspectiv", "perspectiv", "  Perspectiv  "] {
+        let response = server
+            .req(Method::POST, "/projects", &alice)
+            .json(&ProjectRequest { name: taken.into() })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{taken} is already taken");
+    }
+    // Someone else's project names are none of this account's business.
+    new_project(&server, &bob, "Perspectiv").await;
+    assert_eq!(projects(&server, &alice).await.len(), 1);
+    assert_eq!(projects(&server, &bob).await.len(), 1);
+
+    // A rename collides the same way, and a blank name is refused outright.
+    let second = new_project(&server, &alice, "Home").await;
+    let response = server
+        .req(Method::PUT, &format!("/projects/{second}"), &alice)
+        .json(&ProjectRequest { name: "Perspectiv".into() })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = server
+        .req(Method::PUT, &format!("/projects/{second}"), &alice)
+        .json(&ProjectRequest { name: "   ".into() })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn one_account_cannot_reach_another_accounts_projects() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let bob = register(&server, "bob@example.com", "correct horse battery").await;
+    let hers = new_project(&server, &alice, "Perspectiv").await;
+    let (his_secret, _) = server.create_secret(&bob, "His", &payload()).await;
+
+    // Filing his own secret under her project, on the way in and afterwards.
+    let key = SecretKey::generate();
+    let body = CreateSecretRequest {
+        name: "Sneaky".into(),
+        payload: key.encrypt("Sneaky", &payload()).unwrap(),
+        wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&bob.self_wrap_key)),
+        project_id: Some(hers),
+    };
+    let response = server.req(Method::POST, "/secrets", &bob).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "a project id is not a capability");
+
+    let response = server
+        .req(Method::PUT, &format!("/secrets/{his_secret}/project"), &bob)
+        .json(&MoveSecretRequest { project_id: Some(hers) })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = server
+        .req(Method::PUT, &format!("/secrets/{his_secret}"), &bob)
+        .json(&UpdateSecretRequest {
+            key_version: 0,
+            name: "His".into(),
+            payload: key.encrypt("His", &payload()).unwrap(),
+            project: ProjectAssignment::Set(hers),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Renaming and deleting it are the same answer, and it is still hers.
+    let response = server
+        .req(Method::PUT, &format!("/projects/{hers}"), &bob)
+        .json(&ProjectRequest { name: "Mine now".into() })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = server.req(Method::DELETE, &format!("/projects/{hers}"), &bob).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(projects(&server, &alice).await[0].name, "Perspectiv");
+    // Nothing of his ended up filed anywhere.
+    assert!(server.list(&bob).await.iter().all(|v| v.project.is_none()));
+}
+
+#[tokio::test]
+async fn sharing_a_secret_shares_where_it_is_filed_only_when_the_owner_says_so() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let bob = register(&server, "bob@example.com", "correct horse battery").await;
+    let carol = register(&server, "carol@example.com", "correct horse battery").await;
+    let project = new_project(&server, &alice, "Perspectiv").await;
+    let (id, key) = server.create_secret(&alice, "Cloudflare", &payload()).await;
+    server
+        .req(Method::PUT, &format!("/secrets/{id}/project"), &alice)
+        .json(&MoveSecretRequest { project_id: Some(project) })
+        .send()
+        .await
+        .unwrap();
+
+    // Bob is told; Carol is not.
+    let for_bob = invite_sharing(&server, &alice, id, &key, "bob@example.com", true).await;
+    let for_carol = invite_sharing(&server, &alice, id, &key, "carol@example.com", false).await;
+
+    // What each sees before answering is what they will see after.
+    let bobs_invites: Vec<InviteView> =
+        server.req(Method::GET, "/invites", &bob).send().await.unwrap().json().await.unwrap();
+    assert_eq!(bobs_invites[0].project.as_deref(), Some("Perspectiv"));
+    let carols_invites: Vec<InviteView> =
+        server.req(Method::GET, "/invites", &carol).send().await.unwrap().json().await.unwrap();
+    assert_eq!(carols_invites[0].project, None);
+
+    server.accept(&bob, for_bob).await;
+    server.accept(&carol, for_carol).await;
+
+    // A member gets the name and never the id: an id repeats across secrets
+    // and would say which of the owner's others sit beside this one.
+    let bobs = server.list(&bob).await.remove(0);
+    assert_eq!(bobs.project, Some(SecretProject::Shared { name: "Perspectiv".into() }));
+    let carols = server.list(&carol).await.remove(0);
+    assert_eq!(carols.project, None, "withheld must look exactly like unfiled");
+
+    // A rename reaches whoever may see it, because the name is read now and
+    // not copied when the invite was sent.
+    server
+        .req(Method::PUT, &format!("/projects/{project}"), &alice)
+        .json(&ProjectRequest { name: "Perspectiv Ltd".into() })
+        .send()
+        .await
+        .unwrap();
+    let bobs = server.list(&bob).await.remove(0);
+    assert_eq!(bobs.project, Some(SecretProject::Shared { name: "Perspectiv Ltd".into() }));
+}
+
+#[tokio::test]
+async fn an_owner_can_change_their_mind_about_showing_the_project() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let bob = register(&server, "bob@example.com", "correct horse battery").await;
+    let mallory = register(&server, "mallory@example.com", "correct horse battery").await;
+    let project = new_project(&server, &alice, "Perspectiv").await;
+    let (id, key) = server.create_secret(&alice, "Cloudflare", &payload()).await;
+    server
+        .req(Method::PUT, &format!("/secrets/{id}/project"), &alice)
+        .json(&MoveSecretRequest { project_id: Some(project) })
+        .send()
+        .await
+        .unwrap();
+    let invite = invite_sharing(&server, &alice, id, &key, "bob@example.com", false).await;
+    server.accept(&bob, invite).await;
+
+    let toggle = format!("/secrets/{id}/access/{}/project", bob.id);
+    let set = |who: &Account, share_project: bool, path: String| {
+        server.req(Method::POST, &path, who).json(&ShareProjectRequest { share_project })
+    };
+
+    // The owner's own panel reports what each member can see.
+    assert!(!server.access(&alice, id).await.members[0].sees_project);
+    assert_eq!(set(&alice, true, toggle.clone()).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert!(server.access(&alice, id).await.members[0].sees_project);
+    assert_eq!(server.list(&bob).await.remove(0).project, Some(SecretProject::Shared { name: "Perspectiv".into() }));
+
+    // And can take it back, which is what makes it a choice.
+    assert_eq!(set(&alice, false, toggle.clone()).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.list(&bob).await.remove(0).project, None);
+
+    // Nobody else may set it: not the member, not a stranger, not for a
+    // person who holds no key for this secret.
+    assert_eq!(set(&bob, true, toggle.clone()).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(set(&mallory, true, toggle.clone()).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    let stranger = format!("/secrets/{id}/access/{}/project", mallory.id);
+    assert_eq!(set(&alice, true, stranger).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    // The owner's own row is not a membership and cannot be toggled.
+    let herself = format!("/secrets/{id}/access/{}/project", alice.id);
+    assert_eq!(set(&alice, true, herself).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(server.list(&bob).await.remove(0).project, None, "none of that moved anything");
+}
+
+#[tokio::test]
+async fn an_edit_files_unfiles_or_leaves_the_secret_exactly_as_asked() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let project = new_project(&server, &alice, "Perspectiv").await;
+    let (id, key) = server.create_secret(&alice, "Cloudflare", &payload()).await;
+
+    let edit = |project: ProjectAssignment| {
+        server.req(Method::PUT, &format!("/secrets/{id}"), &alice).json(&UpdateSecretRequest {
+            key_version: 0,
+            name: "Cloudflare".into(),
+            payload: key.encrypt("Cloudflare", &payload()).unwrap(),
+            project,
+        })
+    };
+    let filed = Some(SecretProject::Own { id: project, name: "Perspectiv".into() });
+
+    assert_eq!(edit(ProjectAssignment::Set(project)).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.list(&alice).await[0].project, filed);
+    // The case an older client produces on every edit it makes.
+    assert_eq!(edit(ProjectAssignment::Keep).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.list(&alice).await[0].project, filed, "an edit that says nothing must change nothing");
+    assert_eq!(edit(ProjectAssignment::Clear).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(server.list(&alice).await[0].project, None);
+}
+
+#[tokio::test]
+async fn moving_a_secret_does_not_claim_the_credential_changed() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let project = new_project(&server, &alice, "Perspectiv").await;
+    let (id, _) = server.create_secret(&alice, "Cloudflare", &payload()).await;
+    let before = server.list(&alice).await.remove(0);
+
+    let response = server
+        .req(Method::PUT, &format!("/secrets/{id}/project"), &alice)
+        .json(&MoveSecretRequest { project_id: Some(project) })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let after = server.list(&alice).await.remove(0);
+    assert!(after.project.is_some());
+    // Refiling touches no ciphertext, so it must not look like an edit.
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(after.key_version, before.key_version);
+    assert_eq!(after.payload.ciphertext, before.payload.ciphertext);
+
+    // Moving a secret that is not the caller's is a 404, not a silent no-op.
+    let response = server
+        .req(Method::PUT, "/secrets/9999/project", &alice)
+        .json(&MoveSecretRequest { project_id: Some(project) })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_account_cannot_grow_past_its_project_quota() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let now = Utc::now();
+    for i in 0..MAX_PROJECTS_PER_ACCOUNT {
+        sqlx::query("INSERT INTO projects (owner_id, name, created_at) VALUES (?, ?, ?)")
+            .bind(alice.id)
+            .bind(format!("filler {i}"))
+            .bind(now)
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+    let response = server
+        .req(Method::POST, "/projects", &alice)
+        .json(&ProjectRequest { name: "one too many".into() })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let message = error_text(response).await;
+    assert!(message.contains(&MAX_PROJECTS_PER_ACCOUNT.to_string()), "{message}");
+}
+
+/// The promise the README makes to anyone running an app one release behind.
+///
+/// `an_edit_files_unfiles_or_leaves_the_secret_exactly_as_asked` sends
+/// `ProjectAssignment::Keep`, which is `{"action":"keep"}` on the wire. That
+/// is not what a protocol-3 client produces: it has never heard of projects
+/// and sends no `project` key at all. This builds that body by hand, because
+/// the typed request cannot express a missing field, and it is the only test
+/// that would fail if the enum's serde representation changed in a way that
+/// made an absent field mean something else.
+#[tokio::test]
+async fn an_edit_from_a_client_that_has_never_heard_of_projects_keeps_the_filing() {
+    let server = spawn().await;
+    let alice = register(&server, "alice@example.com", "correct horse battery").await;
+    let project = new_project(&server, &alice, "Perspectiv").await;
+    let (id, key) = server.create_secret(&alice, "Cloudflare", &payload()).await;
+    server
+        .req(Method::PUT, &format!("/secrets/{id}/project"), &alice)
+        .json(&MoveSecretRequest { project_id: Some(project) })
+        .send()
+        .await
+        .unwrap();
+
+    // Exactly the four fields protocol 3 knew about, and nothing else.
+    let mut changed = payload();
+    changed.password = "rotated-by-an-old-app".into();
+    let body = serde_json::json!({
+        "key_version": 0,
+        "name": "Cloudflare",
+        "payload": key.encrypt("Cloudflare", &changed).unwrap(),
+    });
+    assert!(!body.to_string().contains("project"), "this body must not mention the project: {body}");
+
+    let response = server.req(Method::PUT, &format!("/secrets/{id}"), &alice).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "{}", error_text(response).await);
+
+    let view = server.list(&alice).await.remove(0);
+    assert_eq!(
+        view.project,
+        Some(SecretProject::Own { id: project, name: "Perspectiv".into() }),
+        "an edit that never mentioned the project must leave it where it was"
+    );
+    // And the edit itself still landed, so this is not passing by doing nothing.
+    assert_eq!(key.decrypt("Cloudflare", &view.payload).unwrap().password, "rotated-by-an-old-app");
 }

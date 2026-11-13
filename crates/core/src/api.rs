@@ -52,6 +52,14 @@ pub const MAX_PENDING_INVITES_RECEIVED: i64 = 500;
 /// rather than five, and no single account can take more than a twentieth.
 pub const MAX_PENDING_INVITES_PER_PAIR: i64 = 25;
 
+/// How many projects one account may own.
+///
+/// A bound for the same reason [`MAX_SECRETS_PER_ACCOUNT`] is one, and far
+/// below it: projects are headings over secrets, so an account that has more
+/// of them than it has secrets has stopped organising anything. Well above
+/// what anyone files by hand.
+pub const MAX_PROJECTS_PER_ACCOUNT: i64 = 200;
+
 const REDACTED: &str = "<redacted>";
 
 // ----- protocol version -------------------------------------------------------
@@ -67,6 +75,18 @@ const REDACTED: &str = "<redacted>";
 /// speaking it can be running somewhere. That is the condition the paragraph
 /// under 2 set for the next change being a 3 rather than an edit to 2.
 ///
+/// 4: projects. `/projects` is new — list, create, rename, delete — a
+/// secret says which project it is filed under, and `PUT
+/// /secrets/{id}/project` moves one between projects without touching its
+/// ciphertext or its key. An invite now says whether the person being
+/// invited may also see where the secret is filed, which is off unless
+/// asked for, and `POST /secrets/{id}/access/{user_id}/project` changes that
+/// answer afterwards. Every change to a route that already existed is a
+/// field older peers can ignore — a request they omit, or a response field
+/// they do not read — which is why `MIN_CLIENT_PROTOCOL` does not move; the
+/// new routes are the part a protocol-3 server does not have, and that is
+/// what `MIN_SERVER_PROTOCOL` answers for.
+///
 /// 3: `/oauth/start` answers with the parts of an authorization request —
 /// `client_id`, `nonce` and `code_challenge` — where it answered with a
 /// finished `authorization_url`. The client composes the URL itself, so the
@@ -79,10 +99,23 @@ const REDACTED: &str = "<redacted>";
 /// have minted; `DELETE /sessions` answers with a fresh session too, and now
 /// spares the caller's rather than ending it, so the request that evicts
 /// someone can be followed immediately by the one that locks them out.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The oldest server protocol a client built from this source will talk to.
 ///
+/// 4, because a protocol-3 server has no `/projects` at all and answers 404
+/// to every one of them.
+///
+/// This is the stricter kind of refusal, and worth saying plainly:
+/// `check_protocol` runs before a credential is sent, so the vault does not
+/// open either. It is still the right answer. Projects are not one button on
+/// one sign-in path, they are the shape of the list itself: an app that
+/// connected anyway would group a vault it had no way to regroup, offer a
+/// panel that could not list, create or delete, and fail with a bare 404 at
+/// the moment someone tried to fix it. Which side to upgrade first is in the
+/// README, under Versions.
+///
+/// It was 3 for the reason below, which still holds and is covered by this.
 /// 3, because a protocol-2 server answers `/oauth/start` with a finished URL
 /// and none of the three values this client needs to build one. The response
 /// does not deserialise, and the sign-in fails somewhere with nothing useful
@@ -107,7 +140,7 @@ pub const PROTOCOL_VERSION: u32 = 3;
 ///
 /// Refusing at `check_protocol` says so before any credential is sent, which
 /// is what that path is for.
-pub const MIN_SERVER_PROTOCOL: u32 = 3;
+pub const MIN_SERVER_PROTOCOL: u32 = 4;
 
 /// The oldest client protocol a server built from this source still serves.
 ///
@@ -281,12 +314,91 @@ pub struct LookupQuery {
 /// characters and this leaves room for whatever separators someone types.
 pub const MAX_FINGERPRINT_INPUT_LEN: usize = 128;
 
+/// One of the caller's own projects.
+///
+/// The name is stored and returned in plaintext, like a secret's name and
+/// for the same reason: it is a label the interface has to draw. It is worth
+/// stating what that costs, because it is new metadata -- a server operator
+/// learns that this account keeps a project called Perspectiv and which of
+/// its secrets are filed together. Nothing about the credentials themselves
+/// changes; payloads stay sealed and keys stay wrapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectView {
+    pub id: i64,
+    pub name: String,
+    /// How many of the caller's secrets are filed under it. Zero is a real
+    /// answer: an empty project draws no heading in the vault, so this is
+    /// the only place it is visible.
+    pub secret_count: i64,
+}
+
+/// Where a secret is filed, told to someone who may know.
+///
+/// Tagged, and two shapes rather than one, because only one of the two
+/// carries an id. A project id names one of the *owner's* projects: it is
+/// what a move request takes, and handing it to a member would let them
+/// learn which of the owner's other secrets sit beside this one by watching
+/// the id repeat. A member gets the name and nothing else, and the type
+/// makes that a fact about the shape rather than a rule someone has to
+/// remember to apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "as", rename_all = "snake_case")]
+pub enum SecretProject {
+    /// The viewer owns this secret, and `id` is one of their own projects.
+    Own { id: i64, name: String },
+    /// The viewer is a member, and the owner chose to tell them where it
+    /// sits. The name is the project's name now, not a copy taken when the
+    /// invite was sent, so a rename reaches everyone who may see it.
+    Shared { name: String },
+}
+
+/// Create a project, or rename one.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectRequest {
+    pub name: String,
+}
+
+/// Where an edit leaves the secret filed.
+///
+/// Three answers rather than two, and deliberately not an `Option<i64>`. An
+/// `Option` cannot tell "I did not mention the project" apart from "take it
+/// out of its project", and the first is what every client older than
+/// protocol 4 sends with each edit it makes. [`Keep`](Self::Keep) is the
+/// default, so one of those clients editing a password leaves the filing
+/// alone instead of quietly emptying it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "project_id", rename_all = "snake_case")]
+pub enum ProjectAssignment {
+    /// Leave the secret where it is. What an absent field means.
+    #[default]
+    Keep,
+    /// File it under no project.
+    Clear,
+    /// File it under this project, which must be one the caller owns.
+    Set(i64),
+}
+
+/// Move a secret between projects, or out of one.
+///
+/// Its own request, and its own route, because refiling reads and writes no
+/// ciphertext: there is no payload to re-encrypt and so no `key_version` to
+/// carry. `None` means no project; the body is nothing but the assignment,
+/// so there is no absent case for it to be confused with.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MoveSecretRequest {
+    pub project_id: Option<i64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateSecretRequest {
     pub name: String,
     pub payload: Sealed,
     /// The secret key wrapped for the creator; must be `WrappedKey::Owner`.
     pub wrapped_key: WrappedKey,
+    /// The project to file it under, if any. `default` so a client that
+    /// knows nothing about projects still creates secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -295,6 +407,10 @@ pub struct UpdateSecretRequest {
     pub key_version: i64,
     pub name: String,
     pub payload: Sealed,
+    /// Where this edit leaves the secret filed. Absent means leave it alone;
+    /// see [`ProjectAssignment`].
+    #[serde(default)]
+    pub project: ProjectAssignment,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -309,6 +425,13 @@ pub struct SecretView {
     pub updated_at: DateTime<Utc>,
     /// Incremented by every key rotation. Clients send it back with writes.
     pub key_version: i64,
+    /// Where this secret is filed, as far as this viewer may see.
+    ///
+    /// `None` means either that it is filed nowhere or that it is filed
+    /// somewhere this viewer was not shown; the two are deliberately the
+    /// same answer, so that a member cannot tell an unfiled secret from one
+    /// whose filing was withheld. See [`SecretProject`].
+    pub project: Option<SecretProject>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -322,6 +445,9 @@ pub struct Member {
     pub email: String,
     /// Included so the owner can re-wrap a rotated key without extra lookups.
     pub public_key: PublicKey,
+    /// Whether this member may see which project the secret is filed under.
+    /// What the owner's sharing panel draws the toggle from.
+    pub sees_project: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -376,6 +502,25 @@ pub struct InviteRequest {
     pub wrapped_key: SealedBox,
     #[serde(default)]
     pub message: String,
+    /// Whether this person may also see which project the secret is filed
+    /// under.
+    ///
+    /// Off unless asked for, and `default` so a client that knows nothing
+    /// about projects shares a credential and nothing more. Sharing one
+    /// password is not sharing how a vault is organised, and the quiet
+    /// answer is the one that cannot be regretted. The owner can change
+    /// their mind either way afterwards; see [`ShareProjectRequest`].
+    #[serde(default)]
+    pub share_project: bool,
+}
+
+/// Turn one member's view of a secret's project on or off after the fact.
+///
+/// A privacy choice that could not be taken back would not be much of a
+/// choice, so the answer given at invite time is not final.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShareProjectRequest {
+    pub share_project: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -385,6 +530,12 @@ pub struct InviteView {
     pub inviter_email: String,
     pub message: String,
     pub created_at: DateTime<Utc>,
+    /// The project the secret is filed under, when the inviter chose to
+    /// share that. Shown before the invite is answered, deliberately: it is
+    /// part of what is being offered, and someone deciding whether to accept
+    /// should see the same thing they would see afterwards. Declining does
+    /// not unlearn it, which is why the inviter has to ask for it.
+    pub project: Option<String>,
 }
 
 // ----- sign in with Google (OpenID Connect) ---------------------------------
@@ -826,9 +977,68 @@ mod tests {
     /// two-line edit rather than something to remember.
     #[test]
     fn the_protocol_numbers_are_what_this_source_documents() {
-        assert_eq!(PROTOCOL_VERSION, 3);
-        assert_eq!(MIN_SERVER_PROTOCOL, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(MIN_SERVER_PROTOCOL, 4);
         assert_eq!(MIN_CLIENT_PROTOCOL, 1);
+    }
+
+    /// The property the three-state assignment exists for.
+    ///
+    /// A protocol-3 client edits a secret by sending the four fields it knows
+    /// about and nothing else. If that read as "unfile it", every edit made
+    /// from an app one release behind would silently empty the filing of the
+    /// secret it touched, and the user would find out by looking at a vault
+    /// that had quietly reorganised itself.
+    #[test]
+    fn an_edit_that_does_not_mention_the_project_leaves_it_alone() {
+        let json =
+            r#"{"key_version":0,"name":"Cloudflare","payload":{"v":1,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA=="}}"#;
+        let request: UpdateSecretRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.project, ProjectAssignment::Keep);
+    }
+
+    #[test]
+    fn the_three_assignments_are_distinct_on_the_wire() {
+        for assignment in [ProjectAssignment::Keep, ProjectAssignment::Clear, ProjectAssignment::Set(7)] {
+            let json = serde_json::to_string(&assignment).unwrap();
+            let back: ProjectAssignment = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, assignment, "{json}");
+        }
+        assert_eq!(serde_json::to_string(&ProjectAssignment::Clear).unwrap(), r#"{"action":"clear"}"#);
+        assert_eq!(serde_json::to_string(&ProjectAssignment::Set(7)).unwrap(), r#"{"action":"set","project_id":7}"#);
+    }
+
+    /// Sharing a credential must not quietly share the shape of the vault it
+    /// came from, so the flag that does is off unless the inviter asked for
+    /// it -- including when the inviter is an app that has never heard of
+    /// projects.
+    #[test]
+    fn an_invite_shares_no_project_unless_it_says_so() {
+        let json = r#"{"key_version":0,"email":"bob@example.com","fingerprint":"AAAA","wrapped_key":{"ephemeral_public":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","v":1,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA=="}}"#;
+        let request: InviteRequest = serde_json::from_str(json).unwrap();
+        assert!(!request.share_project);
+        assert!(request.message.is_empty());
+    }
+
+    /// A member's view of a project carries a name and no id. The id would
+    /// let them watch it repeat across the secrets they hold and work out
+    /// which of the owner's others sit together.
+    #[test]
+    fn only_an_owner_gets_a_project_id() {
+        let shared = serde_json::to_string(&SecretProject::Shared { name: "Perspectiv".into() }).unwrap();
+        assert_eq!(shared, r#"{"as":"shared","name":"Perspectiv"}"#);
+        let own = serde_json::to_string(&SecretProject::Own { id: 3, name: "Perspectiv".into() }).unwrap();
+        assert_eq!(own, r#"{"as":"own","id":3,"name":"Perspectiv"}"#);
+    }
+
+    /// The other half of the same guarantee, on the other route: a client
+    /// that does not know about projects creates unfiled secrets rather than
+    /// failing to create any.
+    #[test]
+    fn the_project_is_optional_when_creating_a_secret() {
+        let json = r#"{"name":"Cloudflare","payload":{"v":1,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA=="},"wrapped_key":{"wrap":"owner","key":{"v":1,"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AA=="}}}"#;
+        let request: CreateSecretRequest = serde_json::from_str(json).unwrap();
+        assert!(request.project_id.is_none());
     }
 
     /// The set is the intersection of what the server's base64url tokens use

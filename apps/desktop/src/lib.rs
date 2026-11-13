@@ -66,6 +66,43 @@ struct SecretSummary {
     owner_email: String,
     updated_at: chrono::DateTime<chrono::Utc>,
     error: Option<String>,
+    /// The project this is filed under, as far as this account may see it.
+    /// `None` covers both "filed nowhere" and "filed somewhere the owner did
+    /// not show me"; the interface cannot tell them apart because it is not
+    /// told which it is.
+    project: Option<ProjectLabel>,
+}
+
+/// A project as the interface draws it.
+///
+/// Flattened out of [`SecretProject`] rather than passed through: the
+/// interface groups by project and needs a key to group on, and `id` being
+/// absent on a shared secret is exactly the distinction it has to respect.
+/// Grouping shared secrets by name would quietly merge two owners' projects
+/// that happen to share one.
+#[derive(Clone, Serialize)]
+struct ProjectLabel {
+    /// Present only when this account owns the secret, so only an owned
+    /// secret can be moved or grouped by identity.
+    id: Option<i64>,
+    name: String,
+}
+
+impl From<SecretProject> for ProjectLabel {
+    fn from(project: SecretProject) -> Self {
+        match project {
+            SecretProject::Own { id, name } => Self { id: Some(id), name },
+            SecretProject::Shared { name } => Self { id: None, name },
+        }
+    }
+}
+
+/// One of the account's own projects, with how many secrets it holds.
+#[derive(Clone, Serialize)]
+struct ProjectSummary {
+    id: i64,
+    name: String,
+    secret_count: i64,
 }
 
 /// A custom field as the list shows it. The value of a field the user marked
@@ -113,6 +150,19 @@ struct SecretForm {
     notes: String,
     #[serde(default)]
     fields: Vec<FieldInput>,
+    /// Where this should be filed, in the same three states the wire type
+    /// uses.
+    ///
+    /// It was an `Option<i64>` here, on the argument that the form always
+    /// shows its current answer and so never needs to say "leave it alone".
+    /// That was an assumption about the caller rather than something the
+    /// type enforced, and it put the absent-means-unfile reading that
+    /// [`ProjectAssignment`] exists to prevent back at this boundary: a form
+    /// that failed to render its current project would submit silence, and
+    /// silence would erase the filing. Saying it in the same three states
+    /// all the way down removes the class rather than the instance.
+    #[serde(default)]
+    project: ProjectAssignment,
 }
 
 fn field_summaries(payload: &SecretPayload) -> Vec<FieldSummary> {
@@ -232,6 +282,7 @@ struct UiConstants {
     max_custom_fields: usize,
     max_label_length: usize,
     max_field_length: usize,
+    max_project_name_length: usize,
 }
 
 struct Session {
@@ -1416,6 +1467,7 @@ fn ui_constants() -> UiConstants {
         max_custom_fields: secret::MAX_CUSTOM_FIELDS,
         max_label_length: secret::MAX_LABEL_LEN,
         max_field_length: secret::MAX_FIELD_LEN,
+        max_project_name_length: secret::MAX_PROJECT_NAME_LEN,
     }
 }
 
@@ -1782,6 +1834,7 @@ async fn list_secrets(state: State<'_, AppState>) -> CommandResult<Vec<SecretSum
                 owner_email: view.owner_email,
                 updated_at: view.updated_at,
                 error,
+                project: view.project.map(ProjectLabel::from),
             });
         }
         Ok(summaries)
@@ -1923,6 +1976,12 @@ async fn create_secret(state: State<'_, AppState>, form: SecretForm) -> CommandR
             payload: key.encrypt(&name, &payload).map_err(user_facing)?,
             wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&session.self_wrap_key)),
             name,
+            // Nothing is stored yet, so `Keep` has nothing to keep: both it
+            // and `Clear` mean the secret starts out filed nowhere.
+            project_id: match form.project {
+                ProjectAssignment::Set(id) => Some(id),
+                ProjectAssignment::Keep | ProjectAssignment::Clear => None,
+            },
         })
     })?;
     let created = api(&state)?.create_secret(&request).await?;
@@ -1975,6 +2034,7 @@ async fn update_secret(state: State<'_, AppState>, id: i64, form: SecretForm) ->
                 key_version: loaded.version,
                 payload: loaded.key.encrypt(&name, &payload).map_err(user_facing)?,
                 name: name.clone(),
+                project: form.project,
             })
         })?;
         match api.update_secret(id, &request).await {
@@ -2005,6 +2065,50 @@ fn generate_password(length: usize, symbols: bool) -> CommandResult<Zeroizing<St
 #[tauri::command]
 async fn get_access(state: State<'_, AppState>, id: i64) -> CommandResult<AccessView> {
     Ok(api(&state)?.get_access(id).await?)
+}
+
+#[tauri::command]
+async fn list_projects(state: State<'_, AppState>) -> CommandResult<Vec<ProjectSummary>> {
+    let projects = api(&state)?.list_projects().await?;
+    Ok(projects.into_iter().map(|p| ProjectSummary { id: p.id, name: p.name, secret_count: p.secret_count }).collect())
+}
+
+/// Create a project and hand back its id, so the form that asked for it can
+/// file the secret it is about to save without a second round trip.
+#[tauri::command]
+async fn create_project(state: State<'_, AppState>, name: String) -> CommandResult<i64> {
+    let name = secret::validate_project_name(&name).map_err(user_facing)?;
+    Ok(api(&state)?.create_project(&ProjectRequest { name }).await?.id)
+}
+
+#[tauri::command]
+async fn rename_project(state: State<'_, AppState>, id: i64, name: String) -> CommandResult<()> {
+    let name = secret::validate_project_name(&name).map_err(user_facing)?;
+    Ok(api(&state)?.rename_project(id, &ProjectRequest { name }).await?)
+}
+
+/// Delete a project. Every secret filed under it stays exactly where it is
+/// and becomes unfiled; nothing is removed but the heading.
+#[tauri::command]
+async fn delete_project(state: State<'_, AppState>, id: i64) -> CommandResult<()> {
+    Ok(api(&state)?.delete_project(id).await?)
+}
+
+/// Move one secret into a project, or out of whatever it is in.
+#[tauri::command]
+async fn move_secret(state: State<'_, AppState>, id: i64, project_id: Option<i64>) -> CommandResult<()> {
+    Ok(api(&state)?.move_secret(id, &MoveSecretRequest { project_id }).await?)
+}
+
+/// Change whether one member may see which project a secret is filed under.
+#[tauri::command]
+async fn set_member_project(
+    state: State<'_, AppState>,
+    id: i64,
+    user_id: i64,
+    share_project: bool,
+) -> CommandResult<()> {
+    Ok(api(&state)?.set_member_project(id, user_id, &ShareProjectRequest { share_project }).await?)
 }
 
 /// Step one of inviting: fetch the invitee's key and report whether it matches
@@ -2117,6 +2221,10 @@ fn check_confirmed_key(served: &PublicKey, confirmed_public_key: &str) -> Comman
 /// Step two: `confirmed_public_key` is the key the user saw and approved. The
 /// key is fetched again, must still match, and is pinned once the server has
 /// accepted the invite. A 409 (key rotated meanwhile) is retried once.
+///
+/// `share_project` is a separate answer from sharing the secret at all: it
+/// says whether this person may also see which project it is filed under,
+/// and is off unless the form asked for it.
 #[tauri::command]
 async fn invite(
     state: State<'_, AppState>,
@@ -2124,6 +2232,7 @@ async fn invite(
     email: String,
     message: String,
     confirmed_public_key: String,
+    share_project: bool,
 ) -> CommandResult<()> {
     let api = api(&state)?;
     // Ask with the fingerprint of the very key the user approved: if the
@@ -2141,6 +2250,7 @@ async fn invite(
                 fingerprint: invitee.public_key.fingerprint(),
                 wrapped_key: loaded.key.wrap_for(&invitee.public_key).map_err(user_facing)?,
                 message: message.clone(),
+                share_project,
             })
         })?;
         match api.create_invite(id, &request).await {
@@ -2323,6 +2433,12 @@ pub fn run() {
             delete_secret,
             generate_password,
             get_access,
+            list_projects,
+            create_project,
+            rename_project,
+            delete_project,
+            move_secret,
+            set_member_project,
             lookup_invitee,
             invite,
             revoke_access,
@@ -2503,6 +2619,7 @@ mod tests {
             wrapped_key: WrappedKey::Owner(key.wrap_for_owner(&session.self_wrap_key)),
             updated_at: chrono::Utc::now(),
             key_version: version,
+            project: None,
         }
     }
 
@@ -2578,7 +2695,7 @@ mod tests {
     }
 
     fn member(id: i64, email: &str, identity: &Identity) -> Member {
-        Member { user_id: id, email: email.into(), public_key: identity.public_key().clone() }
+        Member { user_id: id, email: email.into(), public_key: identity.public_key().clone(), sees_project: false }
     }
 
     #[test]
@@ -2917,5 +3034,40 @@ mod tests {
         assert!(warning.unwrap().contains("could not be read"));
         let bob = Identity::generate();
         assert_eq!(known.check("https://x", "bob@example.com", bob.public_key()), KeyStatus::New);
+    }
+
+    /// The exact bodies the interface submits, deserialised the way Tauri
+    /// deserialises a command argument.
+    ///
+    /// This is the one seam neither side's tests reach on their own: the UI
+    /// tests prove what JavaScript sends, and the server tests prove what the
+    /// server does with a `SecretForm` once it exists, but nothing checked
+    /// that the first turns into the second. A field renamed on either side
+    /// would have shown up only as a runtime "invalid args" in a built app.
+    ///
+    /// The strings below are copied from what the running interface actually
+    /// sent, not written to match the struct.
+    #[test]
+    fn the_form_the_interface_submits_deserialises() {
+        let filed: SecretForm = serde_json::from_str(
+            r#"{"name":"Cloudflare","username":"me@example.com","password":null,"url":"","notes":"","fields":[],"project":{"action":"set","project_id":4}}"#,
+        )
+        .expect("the body the form sends when a project is chosen");
+        assert_eq!(filed.project, ProjectAssignment::Set(4));
+
+        let unfiled: SecretForm = serde_json::from_str(
+            r#"{"name":"Netflix","username":"","password":"hunter2","url":"","notes":"","fields":[],"project":{"action":"clear"}}"#,
+        )
+        .expect("the body the form sends for No project");
+        assert_eq!(unfiled.project, ProjectAssignment::Clear);
+
+        // No `project` key at all. The form always sends one, so this is the
+        // guard rather than the case: if anything ever submits a form without
+        // it, the secret must stay where it is rather than being unfiled.
+        let silent: SecretForm = serde_json::from_str(
+            r#"{"name":"Jira","username":"","password":"hunter2","url":"","notes":"","fields":[]}"#,
+        )
+        .expect("a form that says nothing about the project");
+        assert_eq!(silent.project, ProjectAssignment::Keep);
     }
 }

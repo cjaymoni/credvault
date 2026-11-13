@@ -237,6 +237,12 @@
       <span class="chip-label">Link Google</span>
     </button>
 
+    <button type="button" class="chip" id="btn-projects"
+      title="Rename or delete the projects your secrets are grouped under.">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+      <span class="chip-label">Projects</span>
+    </button>
+
     <button type="button" class="chip" id="btn-change-passphrase"
       title="Change the passphrase this vault is encrypted with.">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 11V7a5 5 0 0 1 10 0v4"/><rect x="4" y="11" width="16" height="10" rx="2"/></svg>
@@ -296,6 +302,27 @@
   </div>
 </dialog>
 
+<!-- Deleting a project, confirmed by typing its name.
+     The secrets in it are kept, so this is not the irreversible kind of
+     delete; the name has to be typed because a project is a heading several
+     secrets sit under and losing the wrong one is tedious to rebuild. -->
+<dialog class="dialog" id="project-delete-dialog" aria-labelledby="project-delete-title">
+  <form id="project-delete-form" novalidate>
+    <h2 id="project-delete-title" class="dialog-title">Delete project</h2>
+    <p class="dialog-lead" id="project-delete-lead"></p>
+    <div class="field">
+      <label for="project-delete-name">Type the project's name to confirm</label>
+      <input id="project-delete-name" autocomplete="off" spellcheck="false" autocapitalize="off">
+      <p class="hint" id="project-delete-hint" aria-live="polite"></p>
+    </div>
+    <div class="error" id="project-delete-error" role="alert"></div>
+    <div class="dialog-actions">
+      <button type="submit" class="btn danger solid" id="btn-project-delete-confirm" disabled>Delete project</button>
+      <button type="button" class="btn" id="btn-project-delete-cancel">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- Invite someone to the open secret. A modal dialog on every platform: it
      holds the email, the fingerprint check and the confirmation in one place. -->
 <dialog class="dialog" id="invite-dialog" aria-labelledby="invite-dialog-title">
@@ -314,6 +341,15 @@
     <div class="field">
       <label for="invite-message">Message <span class="label-note">(optional)</span></label>
       <input id="invite-message" placeholder="e.g. The shared Wi-Fi password">
+    </div>
+    <!-- A separate answer from sharing the secret, and off by default: the
+         project name is the owner's own label for a group of their secrets,
+         and handing one credential over is not handing over how a vault is
+         organised. Hidden by the app when the secret is filed nowhere. -->
+    <div class="field hidden" id="invite-project-field">
+      <label class="checkbox"><input type="checkbox" id="invite-share-project">
+        <span id="invite-project-label">Also tell them which project this is in</span></label>
+      <p class="hint">They will see the project's name on this secret. Once they accept, you can change your mind from the Sharing list.</p>
     </div>
     <div class="error" id="invite-error" role="alert"></div>
     <div class="dialog-actions">

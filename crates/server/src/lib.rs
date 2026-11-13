@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{middleware, Router};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -289,10 +289,14 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         .route("/me", get(handlers::me))
         .route("/password", post(handlers::change_password))
         .route("/users/lookup", get(handlers::lookup_user))
+        .route("/projects", get(handlers::list_projects).post(handlers::create_project))
+        .route("/projects/{id}", put(handlers::rename_project).delete(handlers::delete_project))
         .route("/secrets", get(handlers::list_secrets).post(handlers::create_secret))
         .route("/secrets/keys", get(handlers::list_secret_keys))
         .route("/secrets/{id}", get(handlers::get_secret).put(handlers::update_secret).delete(handlers::delete_secret))
+        .route("/secrets/{id}/project", put(handlers::move_secret))
         .route("/secrets/{id}/access", get(handlers::secret_access))
+        .route("/secrets/{id}/access/{user_id}/project", post(handlers::set_member_project))
         .route("/secrets/{id}/access/{user_id}/revoke", post(handlers::revoke_access))
         .route("/secrets/{id}/invites", post(handlers::create_invite))
         .route("/secrets/{id}/invites/{invite_id}", delete(handlers::cancel_invite))

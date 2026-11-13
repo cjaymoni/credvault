@@ -55,7 +55,10 @@ The server never sees a password, a username, or a key that could decrypt one.
    blob, so the server cannot even tell which of them a secret has. Only the
    secret's *name* is stored in plaintext so lists and invites can show it;
    the name is authenticated as associated data, so the server cannot present
-   one secret's contents under another secret's name.
+   one secret's contents under another secret's name. The name of a
+   **project** sits beside it in plaintext for the same reason, and costs the
+   same thing: an operator can read that you keep a project called Perspectiv
+   and see which of your secrets are filed under it.
 4. That key is wrapped once per person who may read the secret. Your own copy
    is encrypted under a key derived from your master key, so nobody else,
    the server included, can produce one. Everyone else's copy is sealed to
@@ -182,8 +185,14 @@ against the convenience before enabling it.
   delete every secret, so this adds no reach — but it fails as "wrong
   passphrase" rather than as anything obviously destructive. Sign out of
   devices you do not recognise.
-- The server operator can see who shares with whom and the names of secrets,
-  but not their contents. The operator cannot alter, relabel or replace a
+- Secrets can be grouped into **projects** — Perspectiv holding Cloudflare,
+  Gmail, Jira. A project is just a heading: deleting one keeps every secret in
+  it and only stops the grouping. Someone you share a secret with is *not*
+  told which project it is in unless you tick the box that says so, which you
+  can tick or untick for each person at any time from the Sharing list.
+- The server operator can see who shares with whom, the names of secrets, and
+  the names of projects and which secrets are in them, but not their
+  contents. The operator cannot alter, relabel or replace a
   secret you own. For a secret shared *with* you the operator could show you
   fabricated contents (your copy of its key is a sealed box anyone can make),
   but cannot learn the real ones, and you cannot write to it, so nothing
@@ -209,7 +218,7 @@ numbers and nothing else — not the build version, which would only tell a
 passer-by which advisories to look up.
 
 ```json
-{ "status": "ok", "protocol": 3, "min_client_protocol": 1 }
+{ "status": "ok", "protocol": 4, "min_client_protocol": 1 }
 ```
 
 `protocol` is what the server speaks; `min_client_protocol` is the oldest
@@ -217,6 +226,14 @@ client it serves. The app reads both before it derives a key or sends a
 credential, and stops with a plain message when the two cannot work together.
 A server ahead of the app works normally for everything the app's protocol
 covers.
+
+Protocol 4 added projects: the `/projects` routes, the project a secret is
+filed under, and the per-person choice of whether someone you share with is
+told what that is. Everything it changed on a route that already existed is a
+field an older app can leave out or ignore, so a protocol-4 server still
+serves one — an edit sent by an older app says nothing about the project and
+is understood to mean "leave it where it is", rather than quietly unfiling the
+secret it touched.
 
 Protocol 3 moved the Google sign-in URL. The server used to compose the address
 the browser opens and the app checked it; now the server sends only the parts
@@ -226,11 +243,26 @@ anything a server can choose. Protocol 2 added the passphrase proof on linking,
 the unlink route, and the replacement session that signing out other devices
 hands back.
 
-This app will not talk to a server older than protocol 3. A protocol-2 server
+This app will not talk to a server older than protocol 4. A protocol-3 server
+has no `/projects` at all, and since the check runs before any credential is
+sent, the vault does not open either. That is a real cost, taken deliberately:
+projects are not one button on one path but the shape of the list itself, and
+an app that connected anyway would group a vault it could not regroup and fail
+with a bare 404 the moment anyone tried to fix it. **Upgrade the server
+first.**
+
+Earlier, this app would not talk to a server older than protocol 3. A protocol-2 server
 answers the sign-in request in the old shape and the app cannot build an address
 from it; a protocol-1 server would also accept a link request, ignore the proof,
 and answer in a shape the app reads as failure — leaving a Google sign-in on the
 account that the app cannot show you and that server cannot remove.
+
+**Upgrading to protocol 4.** Simpler than the one below it: an older app
+against a protocol-4 server keeps working throughout, because nothing it
+sends or reads changed meaning. It will not show projects, and a secret it
+edits keeps whatever filing it had. A protocol-4 app against an older server
+refuses to connect at all, so the order is the plain one — **server first,
+then apps**, at your leisure.
 
 **Upgrading to protocol 3.** The sentence above about a newer server working
 normally has one exception, and it decides the order to update in. An app older

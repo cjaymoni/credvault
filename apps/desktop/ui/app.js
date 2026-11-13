@@ -14,7 +14,7 @@ const REVEAL_HIDE_AFTER_MS = 30_000;
 const TOAST_MS = 2200;
 const MASKED = "••••••••••••";
 // Limits owned by the Rust crates; `ui_constants` overwrites these defaults at startup.
-const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLength: 20, maxCustomFields: 20, maxLabelLength: 100, maxFieldLength: 4096 };
+const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLength: 20, maxCustomFields: 20, maxLabelLength: 100, maxFieldLength: 4096, maxProjectNameLength: 100 };
 // What the token field says, and what the form says when it is left empty.
 // The server would also refuse a blank token, but its answer is written for
 // an API caller ("a registration token is required") and arrives only after a
@@ -25,7 +25,15 @@ const TOKEN_MISSING_ERROR = "Paste the registration token for this server. Ask w
 const THEME_KEY = "theme";
 const THEME_CHOICES = ["system", "light", "dark"];
 
-const state = { secrets: [], selected: null, editing: false, editTitle: "", authMode: "login", inviteCount: 0, formFields: [],
+const state = { secrets: [], projects: [], selected: null, editing: false, editTitle: "", authMode: "login", inviteCount: 0, formFields: [],
+  // The Projects panel is open in the detail pane, the way the invitations
+  // view is. Renaming and deleting live there; filing lives in the form.
+  showingProjects: false,
+  // Which row of the Projects panel is open and for what:
+  // `{ id, mode: "rename" }`, or `{ id: null, mode: "new" }` for the row
+  // that creates one. Null when every row is at rest. Deleting is not here:
+  // it is confirmed in a dialog, not on the row.
+  projectRow: null,
   // The invitations view is open in the detail pane (reached from the
   // invitations entry in the list), and the secret the invite dialog is for.
   showingInvites: false, inviteFor: null,
@@ -122,6 +130,7 @@ const ICONS = {
   wand: '<path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"/><path d="m19 17 .7 2.3L22 20l-2.3.7L19 23l-.7-2.3L16 20l2.3-.7L19 17Z"/>',
   mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m2 7 10 7 10-7"/>',
   note: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18"/>',
@@ -369,8 +378,13 @@ function goBack() {
 }
 /// After a refresh the detail screen may have nothing left to show.
 function syncScreenAfterRefresh() {
-  const nothingToShow = state.selected === null && !state.editing && state.inviteCount === 0;
-  if (isMobile() && $("app").dataset.screen === "detail" && nothingToShow) showListScreen();
+  // `showingProjects` belongs here for the same reason `editing` does: the
+  // detail screen has something on it. Without it, every create, rename or
+  // delete refreshed, found "nothing to show" and dropped a phone user back
+  // on the vault list, because the panel sets `selected` to null and leaves
+  // `editing` false. The invites view escapes only by accident, its count
+  // being non-zero whenever it is up.
+  if (isMobile() && $("app").dataset.screen === "detail" && Screens.shouldPopToList(state)) showListScreen();
 }
 
 /// Everything outside the sheet goes inert while it is open, so Tab cannot
@@ -901,7 +915,8 @@ function showApp(user) {
   renderGoogleChip();
   $("auth").classList.add("hidden");
   $("app").classList.remove("hidden");
-  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0; state.showingInvites = false;
+  state.secrets = []; state.projects = []; state.selected = null; state.editing = false; state.inviteCount = 0;
+  state.showingInvites = false; state.showingProjects = false; state.projectRow = null;
   $("filter").value = "";
   $("app").dataset.screen = "list";
   renderDetail();
@@ -918,9 +933,13 @@ function resetToSignedOut() {
   // Dropped with the rest of it: the chip reads the signed-in account, and a
   // stale one would describe the last person to use this app.
   state.user = null;
-  state.secrets = []; state.selected = null; state.editing = false; state.inviteCount = 0; state.showingInvites = false;
+  state.secrets = []; state.projects = []; state.selected = null; state.editing = false; state.inviteCount = 0;
+  state.showingInvites = false; state.showingProjects = false; state.projectRow = null;
   closeDialog($("invite-dialog"));
   closeDialog($("form-dialog"));
+  // Lives outside #detail, so emptying that below does not reach it: a modal
+  // left open would sit over the sign-in screen still naming a project.
+  closeDialog($("project-delete-dialog"));
   syncScreenChrome();
   $("list").innerHTML = ""; $("detail").innerHTML = ""; $("invites").innerHTML = ""; $("invites-banner").innerHTML = "";
   closeAccountSheet({ restoreFocus: false });
@@ -950,12 +969,21 @@ async function refresh() {
   setError("main-error", "");
   setSyncing(true);
   try {
-    const [secrets, invites] = await Promise.all([invoke("list_secrets"), invoke("list_invites")]);
+    // One round trip for all three: the list cannot be grouped without the
+    // projects, so fetching them after it would draw the vault twice.
+    const [secrets, invites, projects] = await Promise.all([
+      invoke("list_secrets"),
+      invoke("list_invites"),
+      invoke("list_projects"),
+    ]);
     state.secrets = secrets;
+    state.projects = projects;
     renderList();
     renderInvites(invites);
     if (state.selected !== null && !secrets.some((s) => s.id === state.selected)) state.selected = null;
-    if (!state.editing) renderDetail();
+    // The Projects panel owns the detail pane while it is open, and redraws
+    // itself after the refreshes it starts.
+    if (!state.editing && !state.showingProjects) renderDetail();
     syncScreenAfterRefresh();
   } catch (error) {
     setError("main-error", error);
@@ -985,7 +1013,10 @@ async function act(command, args, successMessage, button) {
 
 function matchesFilter(secret, needle) {
   if (!needle) return true;
-  return [secret.name, secret.username, secret.url].some((v) => String(v ?? "").toLowerCase().includes(needle));
+  // The project name is searchable too: typing "Perspectiv" should pull up
+  // what is filed under it, which is the whole reason for filing it there.
+  const fields = [secret.name, secret.username, secret.url, secret.project?.name];
+  return fields.some((v) => String(v ?? "").toLowerCase().includes(needle));
 }
 
 function itemHtml(s) {
@@ -1011,9 +1042,6 @@ function renderList() {
   const rows = state.secrets
     .filter((s) => matchesFilter(s, needle))
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
-  const mine = rows.filter((s) => s.is_owner);
-  const shared = rows.filter((s) => !s.is_owner);
-
   const total = state.secrets.length;
   const sharedTotal = state.secrets.filter((s) => !s.is_owner).length;
   $("count").textContent = needle
@@ -1031,8 +1059,9 @@ function renderList() {
   }
   // Always wrapped, titled or not: the phone layout draws each group as one
   // inset card with hairlines between its rows.
-  const group = (title, items) => Screens.listGroupHtml(title, items.map(itemHtml).join(""));
-  list.innerHTML = shared.length ? group("Mine", mine) + group("Shared with me", shared) : group(null, mine);
+  list.innerHTML = Screens.listSections(rows, state.projects)
+    .map((section) => Screens.listGroupHtml(section.title, section.secrets.map(itemHtml).join("")))
+    .join("");
 
   const items = list.querySelectorAll(".item");
   if (!list.querySelector('.item[tabindex="0"]') && items.length) items[0].tabIndex = 0;
@@ -1057,6 +1086,8 @@ function selectSecret(id) {
   state.selected = id;
   state.editing = false;
   state.showingInvites = false;
+  state.showingProjects = false;
+  state.projectRow = null;
   renderList();
   renderDetail();
   showDetailScreen();
@@ -1065,6 +1096,8 @@ function selectSecret(id) {
 function startNew() {
   state.selected = null;
   state.showingInvites = false;
+  state.showingProjects = false;
+  state.projectRow = null;
   renderList();
   renderForm(null);
   showDetailScreen();
@@ -1074,6 +1107,8 @@ function showInvitesScreen() {
   state.selected = null;
   state.editing = false;
   state.showingInvites = true;
+  state.showingProjects = false;
+  state.projectRow = null;
   closeDialog($("form-dialog"));
   renderList();
   renderDetail();
@@ -1194,6 +1229,21 @@ function customFieldRows(secret) {
     .join("");
 }
 
+/// Where the secret is filed. The owner gets a picker that moves it; anyone
+/// else gets the name, and only when the owner chose to show it.
+///
+/// A secret shared with you has no row at all when its project was withheld,
+/// rather than one reading "None": you have not been told it is unfiled, you
+/// have been told nothing, and the two should not look like the same claim.
+function projectRow(secret) {
+  if (!secret.is_owner) {
+    return secret.project ? kvRow("folder", "Project", secret.project.name) : "";
+  }
+  return `
+    <div class="kv-row"><dt>${icon("folder")}<span class="kv-label">Project</span></dt>
+      <dd>${projectSelectHtml(secret.project, { id: "detail-project", includeNew: false })}</dd></div>`;
+}
+
 function renderDetail() {
   clearReveals();
   syncScreenChrome();
@@ -1230,6 +1280,7 @@ function renderDetail() {
       </header>
       <div id="confirm-delete"></div>
       <dl class="kv">
+        ${projectRow(s)}
         ${kvRow("user", "Username", s.username, { mono: true, copyLabel: "Username" })}
         ${secretRow("key", "Password", "pw")}
         ${s.url ? kvRow("globe", "URL", s.url, { copyLabel: "URL" }) : ""}
@@ -1267,6 +1318,18 @@ function renderDetail() {
       field.label,
     );
   });
+  const moveSelect = $("detail-project");
+  if (moveSelect) moveSelect.onchange = async () => {
+    const projectId = moveSelect.value === NO_PROJECT ? null : Number(moveSelect.value);
+    moveSelect.disabled = true;
+    // `act` refreshes, which redraws this pane with the new filing in place.
+    if (!await act("move_secret", { id: s.id, projectId }, "Secret moved", null)) {
+      // Put the picker back to what is stored rather than leaving it showing
+      // a move that did not happen.
+      moveSelect.value = s.project?.id ?? NO_PROJECT;
+      moveSelect.disabled = false;
+    }
+  };
   $("btn-delete").onclick = () => renderDeleteConfirm(s);
   $("btn-delete-bottom").onclick = () => renderDeleteConfirm(s);
   if (s.is_owner) {
@@ -1479,9 +1542,28 @@ async function loadSharing(id) {
     if (!box.isConnected || state.selected !== id) return; // user moved on
     // Members and pending invites in one list, each saying where it stands,
     // the way every platform's own sharing list reads.
+    // Always drawn, even when the secret is filed nowhere.
+    //
+    // The flag belongs to the membership, not to the project, and it
+    // outlives any particular filing. Hiding the control while a secret is
+    // unfiled hid a grant that was still switched on: the owner could not
+    // see it and had no way to clear it, and filing the secret under a
+    // *different* project later would show that person its name without
+    // anyone being asked again. Unfiled, the control says what it will do
+    // rather than disappearing.
+    const filed = state.secrets.find((s) => s.id === id)?.project ?? null;
+    const seesProject = (m) => {
+      const label = filed
+        ? `Let ${esc(m.email)} see that this is in ${esc(filed.name)}`
+        : `Let ${esc(m.email)} see which project this is in, if it is filed under one`;
+      return `
+      <label class="checkbox sees-project"><input type="checkbox" data-sees="${m.user_id}" ${m.sees_project ? "checked" : ""}
+        aria-label="${label}"> ${filed ? "Sees project" : "Would see project"}</label>`;
+    };
     const members = access.members.map((m) => `
       <li>${avatar(m.email, { size: "sm" })}<span class="who">${esc(m.email)}</span>
         <span class="people-status">Can view</span>
+        ${seesProject(m)}
         <button type="button" class="btn danger sm" data-revoke="${m.user_id}" aria-label="Revoke access for ${esc(m.email)}"><span>Revoke<span class="ell">…</span></span></button></li>`);
     const pending = access.invites.map((i) => `
       <li>${avatar(i.email, { size: "sm" })}<span class="who">${esc(i.email)}</span>
@@ -1503,6 +1585,21 @@ async function loadSharing(id) {
     for (const el of box.querySelectorAll("[data-revoke]")) {
       el.onclick = () => revokeMember(id, Number(el.dataset.revoke), el, []);
     }
+    for (const el of box.querySelectorAll("[data-sees]")) el.onchange = async () => {
+      const wanted = el.checked;
+      el.disabled = true;
+      try {
+        await invoke("set_member_project", { id, userId: Number(el.dataset.sees), shareProject: wanted });
+        toast(wanted ? "They can see the project" : "They can no longer see the project");
+      } catch (error) {
+        // Put the box back: leaving it ticked would say someone can see
+        // something they cannot, which is the wrong direction to be wrong in.
+        el.checked = !wanted;
+        setError("main-error", error);
+      } finally {
+        el.disabled = false;
+      }
+    };
     for (const el of box.querySelectorAll("[data-cancel]")) el.onclick = async () => {
       if (await act("cancel_invite", { id, inviteId: Number(el.dataset.cancel) }, "Invite cancelled", el)) loadSharing(id);
     };
@@ -1515,6 +1612,11 @@ async function loadSharing(id) {
 function openInviteDialog(id) {
   state.inviteFor = id;
   $("invite-form").reset();
+  // Nothing to offer when the secret is filed nowhere, and a checkbox that
+  // did nothing would still read as a promise that something was shared.
+  const project = state.secrets.find((s) => s.id === id)?.project ?? null;
+  $("invite-project-field").classList.toggle("hidden", !project);
+  if (project) $("invite-project-label").textContent = `Also tell them this is in ${project.name}`;
   $("invite-form").classList.remove("hidden");
   $("invite-message").maxLength = UI.maxMessageLength;
   $("invite-confirm").innerHTML = "";
@@ -1689,7 +1791,15 @@ function renderInviteConfirm(id, info) {
   $("btn-invite-confirm").onclick = async () => {
     const button = $("btn-invite-confirm");
     // The whole key goes back, not the fingerprint: the command compares bytes.
-    const args = { id, email: info.email, message: $("invite-message").value.trim(), confirmedPublicKey: info.public_key };
+    // shareProject is a separate answer from sharing the secret: off unless
+    // the form's own checkbox asked for it.
+    const args = {
+      id,
+      email: info.email,
+      message: $("invite-message").value.trim(),
+      confirmedPublicKey: info.public_key,
+      shareProject: Boolean($("invite-share-project")?.checked),
+    };
     setError("invite-confirm-error", "");
     setBusy(button, true);
     try {
@@ -1716,6 +1826,282 @@ function renderInviteConfirm(id, info) {
 /// form and a single request. For an account that signs in with Google the
 /// passphrase is not the login, and the copy says so rather than implying the
 /// Google password is involved.
+/// Create, rename and delete the headings secrets are grouped under.
+///
+/// Every action happens on the row it belongs to. The first version of this
+/// panel could not create a project at all -- its empty state sent you to the
+/// secret form to make one -- and put the rename box and the delete
+/// confirmation in a single slot above the list, so with several projects the
+/// only thing saying which one you were about to change was the wording
+/// inside the box.
+function renderProjectsPanel() {
+  closeAccountSheet({ restoreFocus: false });
+  state.selected = null;
+  state.editing = false;
+  state.showingInvites = false;
+  state.showingProjects = true;
+  state.projectRow = null;
+  syncInvitesView();
+  renderList();
+  showDetailScreen();
+  drawProjectsPanel();
+}
+
+/// Redraw the panel's contents only. Separate from the screen switching above
+/// so that acting on one row does not re-run the navigation, which would
+/// scroll the pane and throw focus away mid-edit.
+function drawProjectsPanel({ focus = null } = {}) {
+  const open = state.projectRow;
+  const nameBox = (value, label) =>
+    `<input class="project-name" id="project-name" value="${esc(value)}" aria-label="${esc(label)}"
+       autocomplete="off" spellcheck="false" maxlength="${UI.maxProjectNameLength}" placeholder="e.g. Perspectiv">`;
+
+  const rows = state.projects.map((p) => {
+    const mode = open && open.id === p.id ? open.mode : null;
+    if (mode === "rename") {
+      return `
+        <li class="project-row editing">
+          <form class="project-inline" id="project-form">
+            ${nameBox(p.name, `New name for ${p.name}`)}
+            <button type="submit" class="btn primary sm" id="btn-project-save">Save</button>
+            <button type="button" class="btn sm" data-cancel-row>Cancel</button>
+          </form>
+        </li>`;
+    }
+    return `
+      <li class="project-row">
+        <span class="who">${esc(p.name)}</span>
+        <span class="people-status">${plural(p.secret_count, "secret", "secrets")}</span>
+        <button type="button" class="btn sm" data-rename="${p.id}" aria-label="Rename ${esc(p.name)}"><span>Rename<span class="ell">\u2026</span></span></button>
+        <button type="button" class="btn danger sm" data-delete="${p.id}" aria-label="Delete ${esc(p.name)}"><span>Delete<span class="ell">\u2026</span></span></button>
+      </li>`;
+  });
+
+  const adding = Boolean(open) && open.id === null;
+  if (adding) {
+    rows.push(`
+      <li class="project-row editing">
+        <form class="project-inline" id="project-form">
+          ${nameBox("", "Name for the new project")}
+          <button type="submit" class="btn primary sm" id="btn-project-save">Create</button>
+          <button type="button" class="btn sm" data-cancel-row>Cancel</button>
+        </form>
+      </li>`);
+  }
+  const empty = `<li class="only-you">No projects yet. Make one here, or from the Project box when you add a secret.</li>`;
+
+  $("detail").innerHTML = `
+    <section class="card" aria-labelledby="projects-title">
+      <h2 id="projects-title" class="card-title pane-title">${icon("folder")} Projects</h2>
+      <p class="card-lead">Headings your secrets are grouped under. Deleting one never deletes the secrets in it \u2014 they simply stop being grouped.</p>
+      <div class="error" id="projects-error" role="alert"></div>
+      <ul class="people" id="project-list">${rows.length ? rows.join("") : empty}</ul>
+      <div class="actions">
+        ${adding ? "" : `<button type="button" class="btn primary" id="btn-project-new">${icon("plus")} New project</button>`}
+        <button type="button" class="btn" id="btn-projects-done">Done</button>
+      </div>
+    </section>`;
+
+  const openRow = (id, mode) => {
+    setError("projects-error", "");
+    state.projectRow = { id, mode };
+    drawProjectsPanel();
+    // The control that replaced the one just clicked takes the focus, so the
+    // keyboard stays where the eye is.
+    const box = $("project-name");
+    box?.focus();
+    box?.select();
+  };
+
+  $("btn-projects-done").onclick = () => {
+    state.showingProjects = false;
+    state.projectRow = null;
+    renderDetail();
+  };
+  $("btn-project-new")?.addEventListener("click", () => openRow(null, "new"));
+  for (const el of $("detail").querySelectorAll("[data-rename]")) {
+    el.onclick = () => openRow(Number(el.dataset.rename), "rename");
+  }
+  for (const el of $("detail").querySelectorAll("[data-delete]")) {
+    el.onclick = () => openProjectDeleteDialog(Number(el.dataset.delete), el);
+  }
+  const backToRow = () => (open && open.id != null ? `[data-rename="${open.id}"]` : "#btn-project-new");
+  for (const el of $("detail").querySelectorAll("[data-cancel-row]")) {
+    el.onclick = () => {
+      state.projectRow = null;
+      setError("projects-error", "");
+      drawProjectsPanel({ focus: backToRow() });
+    };
+  }
+  const form = $("project-form");
+  if (form) {
+    form.onsubmit = (event) => {
+      event.preventDefault();
+      const name = $("project-name").value.trim();
+      if (!name) {
+        setError("projects-error", "Give the project a name.");
+        $("project-name").focus();
+        return;
+      }
+      // `adding` is the one bit of the row's identity the markup does not
+      // carry, because a new project has no id to put in an attribute yet.
+      // `create_project` answers with the new id; a rename keeps the one it
+      // had. Either way focus lands on that project's own Rename button.
+      const rowOf = (id) => `[data-rename="${id}"]`;
+      if (adding) {
+        runProjectAction("create_project", { name }, $("btn-project-save"), "Project created", (id) => rowOf(id));
+      } else {
+        runProjectAction("rename_project", { id: open.id, name }, $("btn-project-save"), "Project renamed", () =>
+          rowOf(open.id));
+      }
+    };
+    // Escape leaves the row alone rather than the panel, which is the
+    // smaller undo and the one a half-typed name wants.
+    form.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      state.projectRow = null;
+      drawProjectsPanel({ focus: backToRow() });
+    });
+  }
+
+  // Redrawing replaces the whole pane, so whatever had focus is detached and
+  // focus falls to <body>. An action that succeeded says where to put it
+  // back: someone who renames a project with the keyboard should land on
+  // that project, not at the top of the page.
+  if (focus) (document.querySelector(focus) ?? $("btn-project-new"))?.focus();
+}
+
+/// Confirm deleting a project by typing its name.
+///
+/// The name is required rather than a plain yes/no because a project is a
+/// heading several secrets sit under: the delete itself is recoverable --
+/// every secret survives and simply stops being grouped -- but rebuilding
+/// the grouping by hand is tedious, and the rows in this list differ by one
+/// word. Typing the name is the step that makes you read which row you are
+/// on.
+///
+/// `opener` is the button that was clicked, so focus can go back to it if
+/// the dialog is dismissed.
+function openProjectDeleteDialog(id, opener) {
+  const project = state.projects.find((p) => p.id === id);
+  if (!project) return;
+  const dialog = $("project-delete-dialog");
+  const confirm = $("btn-project-delete-confirm");
+  const box = $("project-delete-name");
+
+  // Built as nodes rather than markup: the name is the one part of these
+  // sentences the user wrote, and setting it as `textContent` on its own
+  // element means there is no string for it to escape out of.
+  const named = (text) => {
+    const strong = document.createElement("strong");
+    strong.textContent = text;
+    return strong;
+  };
+  $("project-delete-lead").replaceChildren(
+    named(project.name),
+    document.createTextNode(
+      ` holds ${plural(project.secret_count, "secret", "secrets")}. ` +
+      "They are kept and simply stop being grouped; only the heading goes.",
+    ),
+  );
+
+  setError("project-delete-error", "");
+  box.value = "";
+  box.setAttribute("aria-label", `Type ${project.name} to confirm deleting it`);
+  box.maxLength = UI.maxProjectNameLength;
+  // setBusy(.., false) ends by enabling the button, so it has to run before
+  // the line that disables it -- the other order leaves the confirmation
+  // armed before anything has been typed, which is the whole point lost.
+  setBusy(confirm, false);
+  confirm.disabled = true;
+
+  const matches = () => Screens.namesProject(box.value, project.name);
+
+  const hint = $("project-delete-hint");
+  // A disabled button with nothing to explain it is a dead end, and the
+  // commonest way to reach one here is typing the first word of a name that
+  // has two. The hint says which state you are in as you type.
+  const sayState = () => {
+    const typed = box.value.trim();
+    hint.replaceChildren(
+      ...(!typed
+        ? [document.createTextNode("Type "), named(project.name), document.createTextNode(" exactly.")]
+        : matches()
+          ? [document.createTextNode("That matches \u2014 Delete project is ready.")]
+          : [document.createTextNode("Doesn't match "), named(project.name), document.createTextNode(" yet.")]),
+    );
+    box.setAttribute("aria-invalid", String(Boolean(typed) && !matches()));
+  };
+  box.oninput = () => {
+    confirm.disabled = !matches();
+    sayState();
+  };
+
+  const close = ({ restoreFocus = true } = {}) => {
+    closeDialog(dialog);
+    box.oninput = null;
+    if (restoreFocus && opener?.isConnected) opener.focus();
+  };
+  $("btn-project-delete-cancel").onclick = () => close();
+  // Escape reaches `cancel` (a native dialog's backdrop does not, unless it
+  // is wired up, and this one is not). Either way the handlers of a project
+  // that is no longer on screen should not stay attached.
+  dialog.oncancel = () => close();
+  $("project-delete-form").onsubmit = async (event) => {
+    event.preventDefault();
+    if (!matches()) {
+      setError("project-delete-error", `That is not the whole name. Type ${project.name} exactly, or cancel.`);
+      box.focus();
+      return;
+    }
+    setError("project-delete-error", "");
+    setBusy(confirm, true);
+    try {
+      // Where focus goes once this row is gone: the project that takes its
+      // place, or the button that makes a new one when nothing is left.
+      // Worked out before the refresh, while the old order is still known.
+      const order = state.projects.map((p) => p.id);
+      const next = order[order.indexOf(id) + 1] ?? order[order.indexOf(id) - 1];
+      await invoke("delete_project", { id });
+      state.projectRow = null;
+      await refresh();
+      close({ restoreFocus: false });
+      drawProjectsPanel({ focus: next === undefined ? "#btn-project-new" : `[data-rename="${next}"]` });
+      toast("Project deleted");
+    } catch (error) {
+      // Reported inside the dialog: the panel's own error line is behind it.
+      setError("project-delete-error", error);
+      setBusy(confirm, false);
+    }
+  };
+
+  sayState();
+  openDialog(dialog);
+  box.focus();
+}
+
+/// Run one project command, then redraw from fresh data.
+///
+/// Shared by all three because they differ only in the call: each needs the
+/// same busy state, the same error slot, and the same guarantee that the
+/// button comes back on failure so the panel can be retried rather than
+/// stranded.
+async function runProjectAction(command, args, button, success, focusFor = null) {
+  setError("projects-error", "");
+  setBusy(button, true);
+  try {
+    const result = await invoke(command, args);
+    state.projectRow = null;
+    await refresh();
+    drawProjectsPanel({ focus: focusFor ? focusFor(result) : null });
+    toast(success);
+  } catch (error) {
+    setError("projects-error", error);
+    if (button?.isConnected) setBusy(button, false);
+  }
+}
+
 function renderPassphraseForm() {
   closeAccountSheet({ restoreFocus: false });
   state.selected = null;
@@ -1875,6 +2261,69 @@ function addFormField() {
   rows[rows.length - 1]?.querySelector(".cf-label").focus();
 }
 
+/// The value the picker carries for "file this nowhere" and for "make a new
+/// project". Strings, because that is what a `<select>` holds; a numeric id
+/// could never collide with either, but naming them keeps the comparison
+/// readable rather than magic.
+const NO_PROJECT = "";
+const NEW_PROJECT = "new";
+
+/// The project picker, with `selected` chosen. Built here rather than in
+/// screens.js because it is one element with no ordering decisions of its
+/// own: the list is already in the order the server gave.
+function projectSelectHtml(filed, { id = "f-project", includeNew = true } = {}) {
+  const selected = filed?.id ?? null;
+  const options = state.projects.map((p) =>
+    `<option value="${p.id}"${p.id === selected ? " selected" : ""}>${esc(p.name)}</option>`).join("");
+  // A secret can name a project this list has not caught up with -- renamed
+  // or created on another device since the last refresh. Without an option
+  // for it nothing is selected, the browser falls back to the first ("No
+  // project"), and saving the form would quietly unfile the secret. The row
+  // carries the name, so the picker can show the truth instead.
+  const unknown = selected !== null && !state.projects.some((p) => p.id === selected)
+    ? `<option value="${esc(selected)}" selected>${esc(filed.name)}</option>`
+    : "";
+  // The detail pane's picker moves the secret on the spot and has nowhere to
+  // put a name box, so it offers only projects that already exist.
+  const makeNew = includeNew ? `<option value="${NEW_PROJECT}">New project\u2026</option>` : "";
+  // Wrapped so the caret has something to position against; a `select` on
+  // its own cannot carry one, because the shared field rule sets `background`
+  // and a later one resets it on phones.
+  return `
+    <span class="select-wrap"><select id="${id}" aria-label="Project">
+      <option value="${NO_PROJECT}"${selected === null ? " selected" : ""}>No project</option>
+      ${unknown}
+      ${options}
+      ${makeNew}
+    </select></span>`;
+}
+
+/// What the form is asking for, in the three states [`ProjectAssignment`]
+/// uses on the Rust side, creating a project first if that is what was
+/// chosen.
+///
+/// `keep` is never returned -- the form always shows an answer, so it always
+/// states one. It exists so that a form which somehow submits nothing means
+/// "leave it alone" rather than "unfile it".
+///
+/// Creating before saving means a secret that then fails to save leaves an
+/// empty project behind. That is the better failure of the two: the project
+/// is visible in the Projects panel and can be deleted in one click, whereas
+/// creating it afterwards would mean a saved secret silently landing in no
+/// project at all.
+async function chosenProject() {
+  const choice = $("f-project").value;
+  if (choice === NO_PROJECT) return { action: "clear" };
+  if (choice !== NEW_PROJECT) return { action: "set", project_id: Number(choice) };
+  const name = $("f-new-project").value.trim();
+  if (!name) {
+    const error = new Error("Give the new project a name, or pick No project.");
+    error.field = "f-new-project";
+    throw error;
+  }
+  return { action: "set", project_id: await invoke("create_project", { name }) };
+}
+
 function renderForm(existing) {
   state.editing = true;
   state.editTitle = existing ? "Edit secret" : "New secret";
@@ -1882,7 +2331,7 @@ function renderForm(existing) {
   state.formFields = Fields.formFieldsFrom(existing);
   syncScreenChrome();
   $("main").classList.add("has-selection");
-  const s = existing || { name: "", username: "", url: "", notes: "" };
+  const s = existing || { name: "", username: "", url: "", notes: "", project: null };
   // Windows edits a secret in a dialog over the vault; every other platform
   // uses the detail pane, which on a phone is its own screen.
   const inDialog = PLATFORM === "windows";
@@ -1894,6 +2343,16 @@ function renderForm(existing) {
       <div class="field">
         <label for="f-name">Name</label>
         <input id="f-name" value="${esc(s.name)}" placeholder="e.g. Netflix" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="f-project">Project <span class="label-note">(optional)</span></label>
+        ${projectSelectHtml(s.project ?? null)}
+        <div class="field hidden" id="new-project-field">
+          <label for="f-new-project">New project name</label>
+          <input id="f-new-project" placeholder="e.g. Perspectiv" autocomplete="off"
+            maxlength="${UI.maxProjectNameLength}">
+        </div>
+        <p class="hint">A heading to group this with others. The name is stored unencrypted, like the secret's own name, and is not shared with anyone you share this secret with unless you say so.</p>
       </div>
       <div class="field">
         <label for="f-username">Username</label>
@@ -1948,6 +2407,12 @@ function renderForm(existing) {
   };
   $("btn-cancel").onclick = cancel;
   $("btn-add-field").onclick = addFormField;
+  const projectSelect = $("f-project");
+  projectSelect.onchange = () => {
+    const naming = projectSelect.value === NEW_PROJECT;
+    $("new-project-field").classList.toggle("hidden", !naming);
+    if (naming) $("f-new-project").focus();
+  };
   renderFormFields();
   form.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); cancel(); } });
   form.onsubmit = async (event) => {
@@ -1990,6 +2455,11 @@ function renderForm(existing) {
     if (!existing && !entry.password) { setError("form-error", "Enter a password or generate one."); $("f-password").focus(); return; }
     setBusy($("btn-save"), true, "Saving…");
     try {
+      // May create a project first, so it is inside the try: a name the
+      // server refuses has to land on the form, not in the console.
+      // snake_case: this object is deserialised into `SecretForm` as-is,
+      // unlike a command's own arguments, which Tauri converts.
+      entry.project = await chosenProject();
       if (existing) {
         // A blank password means "keep it"; the current one never passes through here.
         if (!entry.password) entry.password = null;
@@ -2005,6 +2475,8 @@ function renderForm(existing) {
       renderDetail();
     } catch (error) {
       setError("form-error", error);
+      // A field the error names gets the focus, the way the checks above do.
+      if (error?.field) $(error.field)?.focus();
       setBusy($("btn-save"), false);
     }
   };
@@ -2029,6 +2501,7 @@ $("google-form").onsubmit = submitGooglePassphrase;
 $("btn-google-cancel").onclick = cancelGoogleSignIn;
 $("btn-google-toggle-pw").onclick = () => togglePasswordInput($("google-password"), $("btn-google-toggle-pw"));
 $("btn-link-google").onclick = () => renderGoogleLinkForm();
+$("btn-projects").onclick = () => renderProjectsPanel();
 $("btn-change-passphrase").onclick = () => renderPassphraseForm();
 $("btn-sign-out-others").onclick = () => renderSignOutOthersForm();
 // The button belongs to whichever server is in the box, so re-ask when it
@@ -2091,6 +2564,7 @@ invoke("ui_constants")
     maxCustomFields: c.max_custom_fields,
     maxLabelLength: c.max_label_length,
     maxFieldLength: c.max_field_length,
+    maxProjectNameLength: c.max_project_name_length,
   }))
   // Served rather than written into the markup, so the floor is stated in
   // one place: the crate that enforces it.

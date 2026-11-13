@@ -82,6 +82,141 @@
     return `${heading}<div class="list-group" ${wrapper}>${itemsHtml}</div>`;
   }
 
+  /// The heading unfiled secrets sit under, and the one for secrets other
+  /// people own. Both come last, in that order: your own filing first, then
+  /// the leftovers, then what is not yours.
+  const UNFILED_TITLE = "Unfiled";
+  const SHARED_TITLE = "Shared with me";
+  /// What the owned secrets are called when no project is in play at all.
+  ///
+  /// This is the heading the list used before projects existed, and someone
+  /// who never makes a project should not notice they arrived: "Unfiled" is
+  /// a fair name for the leftovers beneath Perspectiv and Home, but a poor
+  /// one for a whole vault, because it describes an absence the person has
+  /// not opted into.
+  const MINE_TITLE = "Mine";
+
+  /// Split the visible secrets into the sections the list draws, in order.
+  ///
+  /// Returns `[{ title, secrets }]`, where `title` is `null` only in the one
+  /// case the list has nothing to label: everything is owned and unfiled.
+  /// A section is omitted when it is empty, so a vault with no shared
+  /// secrets draws no "Shared with me" heading over nothing.
+  ///
+  /// Owned secrets are grouped by project *id*, never by name. Two different
+  /// owners may both have a project called Perspectiv, and grouping by what
+  /// is written on the heading would file their secrets together as though
+  /// they were one thing. Shared secrets are not grouped by project at all,
+  /// for the same reason and a stronger one: a member is given a name and no
+  /// id (see `SecretProject` in the Rust), so there is nothing to group on
+  /// that would mean the same thing twice.
+  ///
+  /// `projects` is the account's own list, used for the order the headings
+  /// appear in and so that a project whose secrets are all filtered out does
+  /// not jump position. Projects with nothing visible under them are left
+  /// out: an empty heading in the vault says a group exists and has nothing
+  /// in it, which is a question the Projects panel answers properly.
+  function listSections(secrets, projects = []) {
+    const rows = Array.isArray(secrets) ? secrets : [];
+    const owned = rows.filter((s) => s.is_owner);
+    const shared = rows.filter((s) => !s.is_owner);
+
+    // Own key lookup only: a project named "__proto__" must not reach
+    // Object's, and a secret naming an id nobody owns must not invent one.
+    const byProject = new Map();
+    for (const secret of owned) {
+      const id = secret.project && secret.project.id != null ? secret.project.id : null;
+      if (!byProject.has(id)) byProject.set(id, []);
+      byProject.get(id).push(secret);
+    }
+
+    const sections = [];
+    for (const project of Array.isArray(projects) ? projects : []) {
+      const items = byProject.get(project.id);
+      if (items && items.length) sections.push({ title: project.name, secrets: items });
+      byProject.delete(project.id);
+    }
+    // Anything filed under a project the list does not know about -- renamed
+    // or deleted on another device since this list was fetched. Its own name
+    // is the best label available, and dropping the rows would hide secrets.
+    for (const [id, items] of byProject) {
+      if (id === null) continue;
+      sections.push({ title: items[0].project?.name ?? UNFILED_TITLE, secrets: items });
+    }
+    const unfiled = byProject.get(null) ?? [];
+    // The one case with nothing to label: no projects in play and nothing
+    // shared, so a heading would only name the whole list.
+    if (unfiled.length && !sections.length && !shared.length) {
+      return [{ title: null, secrets: unfiled }];
+    }
+    if (unfiled.length) {
+      sections.push({ title: sections.length ? UNFILED_TITLE : MINE_TITLE, secrets: unfiled });
+    }
+    if (shared.length) sections.push({ title: SHARED_TITLE, secrets: shared });
+    return sections;
+  }
+
+  /// Whether what someone typed into the delete confirmation names
+  /// `projectName`.
+  ///
+  /// The whole string, compared exactly, with only the ends trimmed -- which
+  /// is the one liberty the server itself takes, since `validate_project_name`
+  /// trims before storing, so a trailing space was never part of the name.
+  ///
+  /// Nothing else is forgiven, and an earlier version that forgave more was
+  /// wrong twice. It lower-cased, on the grounds that the unique index is
+  /// `NOCASE` so no two projects differ only by case: true of A-Z only, so
+  /// `Café` and `CAFÉ` can both exist while JavaScript folds both to `café`.
+  /// It also collapsed runs of whitespace, on the grounds that `a  b` and
+  /// `a b` cannot both exist: they can, because nothing collapses interior
+  /// spaces on the way in. Either slip accepts the name of a *different*
+  /// project, which is exactly the mistake -- clicking the wrong row -- that
+  /// typing the name is there to catch.
+  ///
+  /// Both sides are trimmed by the rule the *server* uses, which is not the
+  /// rule `String.prototype.trim` uses. Rust's `str::trim` strips characters
+  /// with the Unicode White_Space property; JavaScript's also strips U+FEFF,
+  /// which has no such property. That one difference matters twice, in
+  /// opposite directions, so neither side may use the built-in.
+  ///
+  /// Trimming the stored name with the built-in would let `Perspectiv` match
+  /// a stored `\u{feff}Perspectiv`. Those draw identically in the list, so it
+  /// is a false accept on a row the user did not click -- exactly what typing
+  /// the name is here to prevent.
+  ///
+  /// Trimming only the typed side with the built-in refuses the other
+  /// direction too: nothing typable survives to match a stored name that
+  /// begins with U+FEFF, leaving that project undeletable. Using the server's
+  /// own rule on both sides keeps the false accept closed and keeps every
+  /// stored name reachable by typing it.
+  ///
+  /// Both sides are normalised to NFC, because a precomposed and a decomposed
+  /// `Café` are different strings that draw the same glyphs. Without it a
+  /// decomposed name could never be typed, since most keyboards emit NFC, and
+  /// the dialog would refuse forever with no way forward. Normalising is the
+  /// one liberty that cannot accept a different project: NFC is a function,
+  /// so two names that differ before it differ after it.
+  /// `\s` is no use here: JavaScript's character class includes U+FEFF, which
+  /// is the whole character this has to leave alone. `\p{White_Space}` is the
+  /// Unicode property Rust's `trim` reads, and does not.
+  const SERVER_TRIM = /^\p{White_Space}+|\p{White_Space}+$/gu;
+  const trimAsStored = (text) => String(text ?? "").replace(SERVER_TRIM, "");
+
+  function namesProject(typed, projectName) {
+    const name = trimAsStored(projectName).normalize("NFC");
+    return name !== "" && trimAsStored(typed).normalize("NFC") === name;
+  }
+
+  /// Whether a refresh should drop a phone back to the vault list.
+  ///
+  /// Pure, and here rather than in app.js, because it is four flags and a
+  /// conjunction that has already been wrong once: the Projects panel was
+  /// missing from it, so every create, rename or delete bounced a phone user
+  /// out of the panel they were working in.
+  function shouldPopToList({ selected = null, editing = false, showingProjects = false, inviteCount = 0 } = {}) {
+    return selected === null && !editing && !showingProjects && inviteCount === 0;
+  }
+
   /// What a server with no token asks for, and what every form that is not
   /// creating an account shows.
   const NO_TOKEN_PROMPT = Object.freeze({ field: false, disclosure: false, required: false });
@@ -218,5 +353,5 @@
     return PLACED_CONTROLS.map((control) => [control, table[control]]);
   }
 
-  return { esc, serverSummaryText, listGroupHtml, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
+  return { esc, serverSummaryText, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
 });

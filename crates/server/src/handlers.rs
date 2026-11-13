@@ -88,6 +88,27 @@ fn decode_stored_public_key(text: &str) -> ApiResult<PublicKey> {
 
 /// Both "no such secret" and "not yours" are 404 so that secret ids cannot be
 /// probed by users who do not own them.
+/// Resolve the project a write names, proving it is one the caller owns.
+///
+/// Refused as not found rather than forbidden, deliberately: whether a given
+/// project id exists at all is a fact about somebody else's vault, and a
+/// 403 here would answer it. `None` is "no project" and needs no lookup.
+async fn require_own_project<'e>(
+    executor: impl SqliteExecutor<'e>,
+    project_id: Option<i64>,
+    user_id: i64,
+) -> ApiResult<Option<i64>> {
+    let Some(id) = project_id else {
+        return Ok(None);
+    };
+    let found: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM projects WHERE id = ? AND owner_id = ?")
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(executor)
+        .await?;
+    found.map(|_| Some(id)).ok_or_else(|| ApiError::NotFound("project not found".into()))
+}
+
 async fn require_owner<'e>(executor: impl SqliteExecutor<'e>, secret_id: i64, user_id: i64) -> ApiResult<()> {
     let owned: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM secrets WHERE id = ? AND owner_id = ?")
         .bind(secret_id)
@@ -580,17 +601,175 @@ async fn verify_and_rehash(
 
 // ----- secrets --------------------------------------------------------------
 
-type SecretRow = (i64, String, String, i64, String, String, DateTime<Utc>, i64);
+// ----- projects ------------------------------------------------------------
 
+/// The caller's own projects, each with how many of their secrets it holds.
+///
+/// The owner predicate on the join is redundant today -- every path that
+/// sets a `project_id` proves the project belongs to the caller first -- and
+/// is there because this count is a number shown to a person. One stray row
+/// from a later route, or from a hand-edited database, would otherwise be a
+/// small cross-account leak with no other symptom.
+///
+/// One statement with a `LEFT JOIN`, not a count per project: the list is
+/// drawn on every refresh and a query per row would be a query per heading.
+/// `LEFT` so a project nobody has filed anything under still appears, with
+/// zero -- it is the only place an empty project is visible, because it
+/// draws no heading over the vault.
+pub async fn list_projects(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<ProjectView>>> {
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT p.id, p.name, COUNT(s.id) FROM projects p \
+         LEFT JOIN secrets s ON s.project_id = p.id AND s.owner_id = p.owner_id \
+         WHERE p.owner_id = ? GROUP BY p.id, p.name ORDER BY p.name COLLATE NOCASE",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(rows.into_iter().map(|(id, name, secret_count)| ProjectView { id, name, secret_count }).collect()))
+}
+
+pub async fn create_project(
+    State(state): State<AppState>,
+    user: AuthUser,
+    ApiJson(body): ApiJson<ProjectRequest>,
+) -> ApiResult<(StatusCode, Json<Created>)> {
+    let name = secret::validate_project_name(&body.name)?;
+    let mut tx = begin_write(&state.pool).await?;
+    check_quota(
+        &mut tx,
+        "projects",
+        "SELECT COUNT(*) FROM projects WHERE owner_id = ?",
+        user.id,
+        MAX_PROJECTS_PER_ACCOUNT,
+    )
+    .await?;
+    let inserted = sqlx::query("INSERT INTO projects (owner_id, name, created_at) VALUES (?, ?, ?)")
+        .bind(user.id)
+        .bind(name)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await;
+    // The unique index decides this, not a SELECT first: two devices creating
+    // the same project at once would both pass a check and both insert.
+    let project_id = match inserted {
+        Ok(result) => result.last_insert_rowid(),
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            return Err(ApiError::Conflict("you already have a project with that name".into()))
+        }
+        Err(other) => return Err(other.into()),
+    };
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(Created { id: project_id })))
+}
+
+pub async fn rename_project(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(project_id): Path<i64>,
+    ApiJson(body): ApiJson<ProjectRequest>,
+) -> ApiResult<StatusCode> {
+    let name = secret::validate_project_name(&body.name)?;
+    // Scoped by owner in the statement, so another account's project is a
+    // 404 and never a write.
+    let renamed = sqlx::query("UPDATE projects SET name = ? WHERE id = ? AND owner_id = ?")
+        .bind(name)
+        .bind(project_id)
+        .bind(user.id)
+        .execute(&state.pool)
+        .await;
+    let affected = match renamed {
+        Ok(result) => result.rows_affected(),
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            return Err(ApiError::Conflict("you already have a project with that name".into()))
+        }
+        Err(other) => return Err(other.into()),
+    };
+    if affected == 0 {
+        return Err(ApiError::NotFound("project not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete a project. The secrets filed under it are not touched: the column
+/// is `ON DELETE SET NULL`, so they become unfiled and nothing else changes.
+/// Losing a heading must never mean losing a credential.
+pub async fn delete_project(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(project_id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    let affected = sqlx::query("DELETE FROM projects WHERE id = ? AND owner_id = ?")
+        .bind(project_id)
+        .bind(user.id)
+        .execute(&state.pool)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(ApiError::NotFound("project not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Change whether one member may see where a secret is filed.
+///
+/// The answer given when the invite was sent is not final: a choice about
+/// what someone else can see that could not be taken back would not be much
+/// of a choice. Scoped to people who actually hold a key for the secret, so
+/// this cannot be used to probe which accounts exist.
+pub async fn set_member_project(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((secret_id, member_id)): Path<(i64, i64)>,
+    ApiJson(body): ApiJson<ShareProjectRequest>,
+) -> ApiResult<StatusCode> {
+    let mut tx = begin_write(&state.pool).await?;
+    require_owner(&mut *tx, secret_id, user.id).await?;
+    // `user_id != ?` excludes the owner's own membership row, which is not a
+    // member in the sense the sharing panel means and whose flag would do
+    // nothing: owning the secret is already how the owner sees its project.
+    let affected =
+        sqlx::query("UPDATE secret_keys SET share_project = ? WHERE secret_id = ? AND user_id = ? AND user_id != ?")
+            .bind(body.share_project)
+            .bind(secret_id)
+            .bind(member_id)
+            .bind(user.id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    if affected == 0 {
+        return Err(ApiError::NotFound("that person is not a member of this secret".into()));
+    }
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+type SecretRow = (i64, String, String, i64, String, String, DateTime<Utc>, i64, Option<i64>, Option<String>);
+
+/// The id is handed out only to the owner, and the name only to someone who
+/// may see it: the `CASE` decides the first and the join condition decides
+/// the second, so a member's row carries neither unless the owner said so.
+/// Doing it here rather than in Rust means there is no branch to forget on a
+/// route that reuses this projection.
 const SECRET_VIEW_SQL: &str =
-    "SELECT s.id, s.name, s.payload, s.owner_id, owner.email, k.wrapped_key, s.updated_at, s.key_version \
+    "SELECT s.id, s.name, s.payload, s.owner_id, owner.email, k.wrapped_key, s.updated_at, s.key_version, \
+            CASE WHEN s.owner_id = k.user_id THEN s.project_id END, p.name \
      FROM secret_keys k \
      JOIN secrets s ON s.id = k.secret_id \
      JOIN users owner ON owner.id = s.owner_id \
+     LEFT JOIN projects p ON p.id = s.project_id AND (s.owner_id = k.user_id OR k.share_project = 1) \
      WHERE k.user_id = ?";
 
 fn secret_view(row: SecretRow, viewer_id: i64) -> ApiResult<SecretView> {
-    let (id, name, payload, owner_id, owner_email, wrapped_key, updated_at, key_version) = row;
+    let (id, name, payload, owner_id, owner_email, wrapped_key, updated_at, key_version, project_id, project_name) =
+        row;
+    // An id without a name cannot happen -- the owner's join is
+    // unconditional and the foreign key keeps the row alive -- and if it ever
+    // did, saying nothing is the safe half of the pair.
+    let project = match (project_id, project_name) {
+        (Some(id), Some(name)) => Some(SecretProject::Own { id, name }),
+        (None, Some(name)) => Some(SecretProject::Shared { name }),
+        _ => None,
+    };
     Ok(SecretView {
         id,
         name,
@@ -600,6 +779,7 @@ fn secret_view(row: SecretRow, viewer_id: i64) -> ApiResult<SecretView> {
         wrapped_key: decode_stored(&wrapped_key)?,
         updated_at,
         key_version,
+        project,
     })
 }
 
@@ -673,16 +853,21 @@ pub async fn create_secret(
         MAX_SECRETS_PER_ACCOUNT,
     )
     .await?;
-    let secret_id =
-        sqlx::query("INSERT INTO secrets (owner_id, name, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
-            .bind(user.id)
-            .bind(name)
-            .bind(payload)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .last_insert_rowid();
+    // Inside the transaction, so a project deleted between the check and the
+    // insert cannot leave a secret pointing at a row that is gone.
+    let project_id = require_own_project(&mut *tx, body.project_id, user.id).await?;
+    let secret_id = sqlx::query(
+        "INSERT INTO secrets (owner_id, name, payload, project_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user.id)
+    .bind(name)
+    .bind(payload)
+    .bind(project_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .last_insert_rowid();
     sqlx::query("INSERT INTO secret_keys (secret_id, user_id, wrapped_key, created_at) VALUES (?, ?, ?, ?)")
         .bind(secret_id)
         .bind(user.id)
@@ -703,26 +888,66 @@ pub async fn update_secret(
 ) -> ApiResult<StatusCode> {
     let name = secret::validate_name(&body.name)?;
     let payload = encode_sealed("payload", &body.payload)?;
-    // Ownership and key version are checked in the same statement, so there is
-    // no window in which the secret can change hands, disappear or be rotated
-    // between check and write.
-    let affected = sqlx::query(
-        "UPDATE secrets SET name = ?, payload = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND key_version = ?",
-    )
-    .bind(name)
-    .bind(payload)
-    .bind(Utc::now())
-    .bind(secret_id)
-    .bind(user.id)
-    .bind(body.key_version)
-    .execute(&state.pool)
-    .await?
-    .rows_affected();
+    // What the assignment adds to the SET clause. Three literals chosen by a
+    // match, never anything the caller wrote: the id travels as a bind like
+    // every other value.
+    let (set_project, set_to) = match body.project {
+        ProjectAssignment::Keep => ("", None),
+        ProjectAssignment::Clear => (", project_id = NULL", None),
+        ProjectAssignment::Set(id) => (", project_id = ?", Some(id)),
+    };
+
+    // One transaction rather than one statement, now that a project has to be
+    // proved to belong to the caller first. Ownership and key version are
+    // still decided by the write itself, so there is no window in which the
+    // secret can change hands, disappear or be rotated between check and
+    // write; `BEGIN IMMEDIATE` holds the writer lock across both.
+    let mut tx = begin_write(&state.pool).await?;
+    require_own_project(&mut *tx, set_to, user.id).await?;
+    let sql = format!(
+        "UPDATE secrets SET name = ?, payload = ?, updated_at = ?{set_project} \
+         WHERE id = ? AND owner_id = ? AND key_version = ?"
+    );
+    let mut update = sqlx::query(&sql).bind(name).bind(payload).bind(Utc::now());
+    if let Some(id) = set_to {
+        update = update.bind(id);
+    }
+    let affected = update.bind(secret_id).bind(user.id).bind(body.key_version).execute(&mut *tx).await?.rows_affected();
     if affected == 0 {
         // Tell a stale client apart from a wrong one.
-        require_key_version(&state.pool, secret_id, user.id, body.key_version).await?;
+        require_key_version(&mut *tx, secret_id, user.id, body.key_version).await?;
         return Err(ApiError::NotFound("secret not found".into()));
     }
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Move one secret into a project, or out of whatever it is in.
+///
+/// Its own route because refiling reads and writes no ciphertext: there is no
+/// payload to re-encrypt, so there is no `key_version` to carry and no
+/// conflict for a stale one to cause. `updated_at` is deliberately left
+/// alone -- it says when the credential last changed, and moving it between
+/// two headings did not change it.
+pub async fn move_secret(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(secret_id): Path<i64>,
+    ApiJson(body): ApiJson<MoveSecretRequest>,
+) -> ApiResult<StatusCode> {
+    let mut tx = begin_write(&state.pool).await?;
+    let project_id = require_own_project(&mut *tx, body.project_id, user.id).await?;
+    let affected = sqlx::query("UPDATE secrets SET project_id = ? WHERE id = ? AND owner_id = ?")
+        .bind(project_id)
+        .bind(secret_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(ApiError::NotFound("secret not found".into()));
+    }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -761,8 +986,8 @@ pub async fn secret_access(
     Path(secret_id): Path<i64>,
 ) -> ApiResult<Json<AccessView>> {
     require_owner(&state.pool, secret_id, user.id).await?;
-    let members: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT u.id, u.email, u.public_key FROM secret_keys k JOIN users u ON u.id = k.user_id \
+    let members: Vec<(i64, String, String, bool)> = sqlx::query_as(
+        "SELECT u.id, u.email, u.public_key, k.share_project FROM secret_keys k JOIN users u ON u.id = k.user_id \
          WHERE k.secret_id = ? AND k.user_id != ? ORDER BY u.email",
     )
     .bind(secret_id)
@@ -779,8 +1004,8 @@ pub async fn secret_access(
     Ok(Json(AccessView {
         members: members
             .into_iter()
-            .map(|(user_id, email, public_key)| {
-                Ok(Member { user_id, email, public_key: decode_stored_public_key(&public_key)? })
+            .map(|(user_id, email, public_key, sees_project)| {
+                Ok(Member { user_id, email, public_key: decode_stored_public_key(&public_key)?, sees_project })
             })
             .collect::<ApiResult<Vec<_>>>()?,
         invites: invites.into_iter().map(|(id, email)| PendingInvite { id, email }).collect(),
@@ -944,14 +1169,15 @@ pub async fn create_invite(
     }
 
     let inserted = sqlx::query(
-        "INSERT INTO invites (secret_id, inviter_id, invitee_id, wrapped_key, message, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO invites (secret_id, inviter_id, invitee_id, wrapped_key, message, share_project, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(secret_id)
     .bind(user.id)
     .bind(invitee_id)
     .bind(wrapped_key)
     .bind(body.message.trim())
+    .bind(body.share_project)
     .bind(Utc::now())
     .execute(&mut *tx)
     .await;
@@ -986,11 +1212,16 @@ pub async fn cancel_invite(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// id, secret name, inviter's email, message, when, and the project name
+/// when the inviter chose to share it.
+type InviteRow = (i64, String, String, String, DateTime<Utc>, Option<String>);
+
 pub async fn list_invites(State(state): State<AppState>, user: AuthUser) -> ApiResult<Json<Vec<InviteView>>> {
-    let rows: Vec<(i64, String, String, String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT i.id, s.name, u.email, i.message, i.created_at FROM invites i \
+    let rows: Vec<InviteRow> = sqlx::query_as(
+        "SELECT i.id, s.name, u.email, i.message, i.created_at, p.name FROM invites i \
          JOIN secrets s ON s.id = i.secret_id \
          JOIN users u ON u.id = i.inviter_id \
+         LEFT JOIN projects p ON p.id = s.project_id AND i.share_project = 1 \
          WHERE i.invitee_id = ? ORDER BY i.created_at DESC",
     )
     .bind(user.id)
@@ -998,12 +1229,13 @@ pub async fn list_invites(State(state): State<AppState>, user: AuthUser) -> ApiR
     .await?;
     Ok(Json(
         rows.into_iter()
-            .map(|(id, secret_name, inviter_email, message, created_at)| InviteView {
+            .map(|(id, secret_name, inviter_email, message, created_at, project)| InviteView {
                 id,
                 secret_name,
                 inviter_email,
                 message,
                 created_at,
+                project,
             })
             .collect(),
     ))
@@ -1015,21 +1247,29 @@ pub async fn accept_invite(
     Path(invite_id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     let mut tx = begin_write(&state.pool).await?;
-    let invite: Option<(i64, String)> =
-        sqlx::query_as("SELECT secret_id, wrapped_key FROM invites WHERE id = ? AND invitee_id = ?")
+    let invite: Option<(i64, String, bool)> =
+        sqlx::query_as("SELECT secret_id, wrapped_key, share_project FROM invites WHERE id = ? AND invitee_id = ?")
             .bind(invite_id)
             .bind(user.id)
             .fetch_optional(&mut *tx)
             .await?;
-    let (secret_id, wrapped_key) = invite.ok_or_else(|| ApiError::NotFound("invite not found".into()))?;
+    let (secret_id, wrapped_key, share_project) =
+        invite.ok_or_else(|| ApiError::NotFound("invite not found".into()))?;
 
-    sqlx::query("INSERT OR IGNORE INTO secret_keys (secret_id, user_id, wrapped_key, created_at) VALUES (?, ?, ?, ?)")
-        .bind(secret_id)
-        .bind(user.id)
-        .bind(wrapped_key)
-        .bind(Utc::now())
-        .execute(&mut *tx)
-        .await?;
+    // The inviter's answer travels with the invite into the membership it
+    // becomes, so what the invitee was shown before accepting is what they
+    // keep seeing afterwards.
+    sqlx::query(
+        "INSERT OR IGNORE INTO secret_keys (secret_id, user_id, wrapped_key, share_project, created_at) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(secret_id)
+    .bind(user.id)
+    .bind(wrapped_key)
+    .bind(share_project)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM invites WHERE id = ?").bind(invite_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)

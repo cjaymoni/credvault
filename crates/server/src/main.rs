@@ -4,75 +4,75 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use credvault_core::api::{check_opaque_oauth_value, NotAnOpaqueValue, MAX_OPAQUE_VALUE_LEN};
+use klavyn_core::api::{check_opaque_oauth_value, NotAnOpaqueValue, MAX_OPAQUE_VALUE_LEN};
 
 /// How much of a rejected client id the startup error quotes back. Enough
 /// to recognise the value by, short enough that a huge variable cannot be
 /// printed in full.
 const ECHOED_PREFIX_LEN: usize = 80;
-use credvault_server::analytics::Analytics;
-use credvault_server::oauth::{GoogleConfig, GoogleProvider};
-use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
+use klavyn_server::analytics::Analytics;
+use klavyn_server::oauth::{GoogleConfig, GoogleProvider};
+use klavyn_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use zeroize::Zeroizing;
 
-/// credvault sync server. Stores only ciphertext; run it anywhere you trust
+/// klavyn sync server. Stores only ciphertext; run it anywhere you trust
 /// to keep data, and put it behind HTTPS (a reverse proxy) for real use.
 // No Debug: a derived one would print the registration token.
 #[derive(Parser)]
-#[command(name = "credvault-server", version)]
+#[command(name = "klavyn-server", version)]
 struct Args {
     /// Address to listen on.
-    #[arg(long, env = "CREDVAULT_BIND", default_value = "127.0.0.1:8787")]
+    #[arg(long, env = "KLAVYN_BIND", default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
 
     /// Directory for the SQLite database.
-    #[arg(long, env = "CREDVAULT_DATA_DIR")]
+    #[arg(long, env = "KLAVYN_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
     /// Require this token to create an account (clients send it as
     /// `registration_token`). Recommended for any server reachable by others.
-    #[arg(long, env = "CREDVAULT_REGISTRATION_TOKEN", conflicts_with = "closed_registration", hide_env_values = true)]
+    #[arg(long, env = "KLAVYN_REGISTRATION_TOKEN", conflicts_with = "closed_registration", hide_env_values = true)]
     registration_token: Option<String>,
 
     /// Refuse all new registrations; existing accounts keep working.
-    #[arg(long, env = "CREDVAULT_CLOSED_REGISTRATION")]
+    #[arg(long, env = "KLAVYN_CLOSED_REGISTRATION")]
     closed_registration: bool,
 
     /// Rate-limit by the rightmost X-Forwarded-For address instead of the peer
     /// address. Only enable behind a reverse proxy that sets that header.
-    #[arg(long, env = "CREDVAULT_TRUST_FORWARDED_FOR")]
+    #[arg(long, env = "KLAVYN_TRUST_FORWARDED_FOR")]
     trust_forwarded_for: bool,
 
     /// Google OAuth client id. Setting it, with the matching secret, enables
     /// "Sign in with Google". The client must be of type "Desktop app": the
     /// app listens on a loopback port the OS picks, and only that client type
     /// accepts a redirect URI whose port is not registered in advance.
-    #[arg(long, env = "CREDVAULT_GOOGLE_CLIENT_ID", requires = "google_client_secret")]
+    #[arg(long, env = "KLAVYN_GOOGLE_CLIENT_ID", requires = "google_client_secret")]
     google_client_id: Option<String>,
 
     /// Google OAuth client secret. Kept on the server so it is never shipped
     /// inside the desktop app.
-    #[arg(long, env = "CREDVAULT_GOOGLE_CLIENT_SECRET", requires = "google_client_id", hide_env_values = true)]
+    #[arg(long, env = "KLAVYN_GOOGLE_CLIENT_SECRET", requires = "google_client_id", hide_env_values = true)]
     google_client_secret: Option<String>,
 
     /// PostHog project API key. Setting it switches on anonymous reach
     /// telemetry: one event per app that asks this server what it supports,
     /// carrying a platform, an app version, a country, and an id that stops
     /// being derivable when the day rolls over. No account, no address, and
-    /// nothing from anybody's vault -- `credvault_server::analytics` is the
+    /// nothing from anybody's vault -- `klavyn_server::analytics` is the
     /// whole of it. Unset, which is the default, means no outbound request is
     /// ever made.
     ///
     /// This is a *project* key, meant to be shipped to clients by design, not
     /// a personal API key. It is still declared hidden so an operator who
     /// pastes the wrong one does not find it in a startup log.
-    #[arg(long, env = "CREDVAULT_POSTHOG_API_KEY", hide_env_values = true)]
+    #[arg(long, env = "KLAVYN_POSTHOG_API_KEY", hide_env_values = true)]
     posthog_api_key: Option<String>,
 
     /// Where to send that telemetry. Defaults to PostHog's EU cloud; set it to
     /// `https://us.i.posthog.com` for the US region, or to your own address
     /// for a self-hosted PostHog. Ignored without a key.
-    #[arg(long, env = "CREDVAULT_POSTHOG_HOST", default_value = credvault_server::analytics::DEFAULT_HOST)]
+    #[arg(long, env = "KLAVYN_POSTHOG_HOST", default_value = klavyn_server::analytics::DEFAULT_HOST)]
     posthog_host: String,
 }
 
@@ -130,7 +130,7 @@ fn google_provider(
                         )
                     }
                 };
-                return Err(format!("CREDVAULT_GOOGLE_CLIENT_ID is {detail}").into());
+                return Err(format!("KLAVYN_GOOGLE_CLIENT_ID is {detail}").into());
             }
             // The other half never reaches a URL, so it is not held to the same
             // set — but an invisible character inside it is a copy-paste
@@ -146,7 +146,7 @@ fn google_provider(
             // space is not `Cc`. Printable ASCII covers `GOCSPX-` plus
             // base64url with nothing to reason about.
             if !secret.chars().all(|c| c.is_ascii_graphic()) {
-                return Err("CREDVAULT_GOOGLE_CLIENT_SECRET holds a character no Google client secret \
+                return Err("KLAVYN_GOOGLE_CLIENT_SECRET holds a character no Google client secret \
                             does — it is printable ASCII throughout"
                     .into());
             }
@@ -178,22 +178,22 @@ fn google_provider(
 /// and `google_provider` stays as well: this handles the parse, those handle
 /// a value that arrives with a stray newline.
 const BLANK_MEANS_UNSET: [&str; 7] = [
-    "CREDVAULT_CLOSED_REGISTRATION",
-    "CREDVAULT_TRUST_FORWARDED_FOR",
-    "CREDVAULT_REGISTRATION_TOKEN",
-    "CREDVAULT_GOOGLE_CLIENT_ID",
-    "CREDVAULT_GOOGLE_CLIENT_SECRET",
-    "CREDVAULT_POSTHOG_API_KEY",
+    "KLAVYN_CLOSED_REGISTRATION",
+    "KLAVYN_TRUST_FORWARDED_FOR",
+    "KLAVYN_REGISTRATION_TOKEN",
+    "KLAVYN_GOOGLE_CLIENT_ID",
+    "KLAVYN_GOOGLE_CLIENT_SECRET",
+    "KLAVYN_POSTHOG_API_KEY",
     // Not merely tidy: this one has a `default_value`, and an empty string
     // from compose would otherwise be a present value that overrides it --
     // the server would refuse to start over a host that is not a URL, for a
     // variable the operator never filled in.
-    "CREDVAULT_POSTHOG_HOST",
+    "KLAVYN_POSTHOG_HOST",
 ];
 
 /// The two settings clap parses as `bool`, which it accepts only as exactly
 /// `true` or `false`.
-const BOOL_FLAGS: [&str; 2] = ["CREDVAULT_CLOSED_REGISTRATION", "CREDVAULT_TRUST_FORWARDED_FOR"];
+const BOOL_FLAGS: [&str; 2] = ["KLAVYN_CLOSED_REGISTRATION", "KLAVYN_TRUST_FORWARDED_FOR"];
 
 /// Spellings an operator plausibly writes, and what each one means.
 ///
@@ -208,7 +208,7 @@ const BOOL_FLAGS: [&str; 2] = ["CREDVAULT_CLOSED_REGISTRATION", "CREDVAULT_TRUST
 /// as "registration on" -- but they resolve to *closed*, which is the
 /// restrictive direction and is noticed within minutes because sign-ups stop.
 /// A falsey misreading resolves to open to anyone, on a public vault, silently.
-/// Measured before they were removed: `CREDVAULT_CLOSED_REGISTRATION=off`
+/// Measured before they were removed: `KLAVYN_CLOSED_REGISTRATION=off`
 /// booted and logged `registration="open to anyone"`. So they stop the server
 /// instead, and the operator is asked what they meant.
 const BOOLISH: [(&str, &str); 6] =
@@ -220,7 +220,7 @@ const BOOLISH: [(&str, &str); 6] =
 /// take the whole server down. Blank means unset (see [`BLANK_MEANS_UNSET`]),
 /// and a recognised spelling of a boolean becomes the one spelling clap takes.
 ///
-/// Measured on the built binary before this existed: `CREDVAULT_CLOSED_REGISTRATION`
+/// Measured on the built binary before this existed: `KLAVYN_CLOSED_REGISTRATION`
 /// set to `TRUE`, `True`, `1`, `yes`, or `true` with a trailing space each
 /// exited 2 with "invalid value". The README tells an operator to set that
 /// variable to stop new sign-ups, so a capital letter, or a line copied with a
@@ -296,17 +296,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let data_dir = args
         .data_dir
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".credvault-server")))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".klavyn-server")))
         .ok_or("cannot determine data directory; pass --data-dir")?;
     create_private_dir(&data_dir)?;
 
     // The database file is created owner-only *before* SQLite opens it, so the
     // -wal and -shm files it spawns inherit that mode from the start.
-    let database_path = data_dir.join("credvault.db");
+    let database_path = data_dir.join("klavyn.db");
     create_private_file(&database_path)?;
-    let pool = credvault_server::connect(&database_path).await?;
+    let pool = klavyn_server::connect(&database_path).await?;
     for suffix in ["", "-wal", "-shm"] {
-        let path = data_dir.join(format!("credvault.db{suffix}"));
+        let path = data_dir.join(format!("klavyn.db{suffix}"));
         if path.exists() {
             restrict_file_permissions(&path)?;
         }
@@ -354,14 +354,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         registration,
         trust_forwarded_for: args.trust_forwarded_for,
         rate_limits: RateLimits::default(),
-        oauth: oauth.map(|provider| provider as Arc<dyn credvault_server::oauth::OAuthProvider>),
+        oauth: oauth.map(|provider| provider as Arc<dyn klavyn_server::oauth::OAuthProvider>),
         analytics,
     };
 
-    let app = credvault_server::build_router(pool, config);
+    let app = klavyn_server::build_router(pool, config);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    tracing::info!(address = %args.bind, data_dir = %data_dir.display(), "credvault-server listening");
-    axum::serve(listener, credvault_server::into_service(app)).await?;
+    tracing::info!(address = %args.bind, data_dir = %data_dir.display(), "klavyn-server listening");
+    axum::serve(listener, klavyn_server::into_service(app)).await?;
     Ok(())
 }
 
@@ -491,10 +491,10 @@ mod tests {
         for (closed, token, expected) in
             [("", "abc123", "token required"), ("", "", "open to anyone"), ("true", "", "closed")]
         {
-            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", closed);
-            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", token);
+            std::env::set_var("KLAVYN_CLOSED_REGISTRATION", closed);
+            std::env::set_var("KLAVYN_REGISTRATION_TOKEN", token);
             normalize_env();
-            let args = Args::try_parse_from(["credvault-server"]).unwrap_or_else(|e| {
+            let args = Args::try_parse_from(["klavyn-server"]).unwrap_or_else(|e| {
                 panic!("compose produces CLOSED={closed:?} TOKEN={token:?}; clap must take it: {e}")
             });
             let policy = registration_policy(args.closed_registration, args.registration_token);
@@ -505,10 +505,10 @@ mod tests {
         // Each of these used to exit 2, which under `restart: unless-stopped`
         // is a crash loop reached by capitalising a word.
         for written in ["true", "TRUE", "True", "1", "yes", "on", "true ", "true\n"] {
-            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", written);
-            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "");
+            std::env::set_var("KLAVYN_CLOSED_REGISTRATION", written);
+            std::env::set_var("KLAVYN_REGISTRATION_TOKEN", "");
             normalize_env();
-            let args = Args::try_parse_from(["credvault-server"])
+            let args = Args::try_parse_from(["klavyn-server"])
                 .unwrap_or_else(|e| panic!("CLOSED={written:?} must not stop the server: {e}"));
             let policy = registration_policy(args.closed_registration, args.registration_token);
             assert_eq!(policy.describe(), "closed", "CLOSED={written:?}");
@@ -520,10 +520,10 @@ mod tests {
         // to produce.
         for written in ["false", "FALSE", "0", "false "] {
             for (token, expected) in [("", "open to anyone"), ("abc123", "token required")] {
-                std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", written);
-                std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", token);
+                std::env::set_var("KLAVYN_CLOSED_REGISTRATION", written);
+                std::env::set_var("KLAVYN_REGISTRATION_TOKEN", token);
                 normalize_env();
-                let args = Args::try_parse_from(["credvault-server"])
+                let args = Args::try_parse_from(["klavyn-server"])
                     .unwrap_or_else(|e| panic!("CLOSED={written:?} TOKEN={token:?} must not stop the server: {e}"));
                 let policy = registration_policy(args.closed_registration, args.registration_token);
                 assert_eq!(policy.describe(), expected, "CLOSED={written:?} TOKEN={token:?}");
@@ -534,17 +534,17 @@ mod tests {
         // must stop the server rather than pick one. Getting this wrong opens a
         // vault silently; see BOOLISH.
         for ambiguous in ["off", "no", "maybe"] {
-            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", ambiguous);
-            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "");
+            std::env::set_var("KLAVYN_CLOSED_REGISTRATION", ambiguous);
+            std::env::set_var("KLAVYN_REGISTRATION_TOKEN", "");
             normalize_env();
-            assert!(Args::try_parse_from(["credvault-server"]).is_err(), "{ambiguous:?} must stop the server");
+            assert!(Args::try_parse_from(["klavyn-server"]).is_err(), "{ambiguous:?} must stop the server");
         }
 
         // Asking for both at once is still refused rather than guessed at.
-        std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", "true");
-        std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", "abc123");
+        std::env::set_var("KLAVYN_CLOSED_REGISTRATION", "true");
+        std::env::set_var("KLAVYN_REGISTRATION_TOKEN", "abc123");
         normalize_env();
-        assert!(Args::try_parse_from(["credvault-server"]).is_err(), "a token and closed together must be refused");
+        assert!(Args::try_parse_from(["klavyn-server"]).is_err(), "a token and closed together must be refused");
 
         // Everything above this point is a list of values somebody chose, and
         // four times running the defect was in a value nobody chose: `off`
@@ -568,16 +568,16 @@ mod tests {
         // the second, which is exactly what happened twice.
         // Parsed strictly. Falling back to the default on a malformed seed
         // reports a pass for a run nobody asked for, and the literal below is
-        // written in hex, so `CREDVAULT_FUZZ_SEED=0x5EED0000001` is the first
+        // written in hex, so `KLAVYN_FUZZ_SEED=0x5EED0000001` is the first
         // thing someone reproducing a failure would reach for.
-        let seed_used = match std::env::var("CREDVAULT_FUZZ_SEED") {
+        let seed_used = match std::env::var("KLAVYN_FUZZ_SEED") {
             Ok(written) => {
                 let digits = written.trim().replace('_', "");
                 let parsed = match digits.strip_prefix("0x") {
                     Some(hex) => u64::from_str_radix(hex, 16),
                     None => digits.parse(),
                 };
-                parsed.unwrap_or_else(|_| panic!("CREDVAULT_FUZZ_SEED={written:?} is not a u64"))
+                parsed.unwrap_or_else(|_| panic!("KLAVYN_FUZZ_SEED={written:?} is not a u64"))
             }
             Err(_) => 0x5EED_0000_0001_u64,
         };
@@ -593,8 +593,8 @@ mod tests {
             // the reach by two orders of magnitude.
             let token =
                 if next_number(&mut seed).is_multiple_of(2) { String::new() } else { generated_value(&mut seed) };
-            std::env::set_var("CREDVAULT_CLOSED_REGISTRATION", &closed);
-            std::env::set_var("CREDVAULT_REGISTRATION_TOKEN", &token);
+            std::env::set_var("KLAVYN_CLOSED_REGISTRATION", &closed);
+            std::env::set_var("KLAVYN_REGISTRATION_TOKEN", &token);
             normalize_env();
 
             // Spelled out here rather than read from BOOLISH on purpose. An
@@ -606,7 +606,7 @@ mod tests {
             let documented_falsey = matches!(written.as_str(), "" | "false" | "0");
             let token_written = token.trim().to_string();
 
-            let Ok(args) = Args::try_parse_from(["credvault-server"]) else {
+            let Ok(args) = Args::try_parse_from(["klavyn-server"]) else {
                 // Asking for a token and closed at once is refused on purpose.
                 assert!(
                     !((documented_truthy || documented_falsey) && token_written.is_empty()),
@@ -626,12 +626,12 @@ mod tests {
             }
         }
 
-        std::env::remove_var("CREDVAULT_CLOSED_REGISTRATION");
-        std::env::remove_var("CREDVAULT_REGISTRATION_TOKEN");
+        std::env::remove_var("KLAVYN_CLOSED_REGISTRATION");
+        std::env::remove_var("KLAVYN_REGISTRATION_TOKEN");
     }
 
     /// Which service each documented setting has to reach. Everything the
-    /// server reads belongs to `credvault`; the certificate pair is the
+    /// server reads belongs to `klavyn`; the certificate pair is the
     /// proxy's.
     ///
     /// The default is the server, so a new proxy-only setting fails this test
@@ -640,8 +640,8 @@ mod tests {
     /// before.
     fn owning_service(name: &str) -> &'static str {
         match name {
-            "CREDVAULT_DOMAIN" | "CREDVAULT_ACME_EMAIL" => "caddy",
-            _ => "credvault",
+            "KLAVYN_DOMAIN" | "KLAVYN_ACME_EMAIL" | "KLAVYN_SITE_DOMAIN" => "caddy",
+            _ => "klavyn",
         }
     }
 
@@ -677,11 +677,11 @@ mod tests {
             .join("\n")
     }
 
-    /// Every `CREDVAULT_*` setting the deploy docs tell an operator to use
+    /// Every `KLAVYN_*` setting the deploy docs tell an operator to use
     /// must actually reach the container that reads it.
     ///
     /// Written because one did not. `deploy/README.md` documented
-    /// `CREDVAULT_CLOSED_REGISTRATION=true` as the way to stop new accounts,
+    /// `KLAVYN_CLOSED_REGISTRATION=true` as the way to stop new accounts,
     /// and it was absent from the compose `environment:` block, so setting it
     /// reached compose's interpolation context and never the server. Combined
     /// with a blank token meaning "open", following the documented way to
@@ -700,31 +700,36 @@ mod tests {
             .flat_map(|file| {
                 let text = std::fs::read_to_string(deploy.join(file)).unwrap_or_else(|_| panic!("deploy/{file}"));
                 text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .filter(|word| word.starts_with("CREDVAULT_"))
+                    // The bare prefix is not a setting: the rename guide in
+                    // README.md shows `sed 's/^CREDVAULT_/KLAVYN_/'`, which
+                    // splits into exactly that word. Nothing can deliver it,
+                    // so counting it would fail the test forever. A real name
+                    // has something after the underscore.
+                    .filter(|word| word.starts_with("KLAVYN_") && word.len() > "KLAVYN_".len())
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert!(documented.contains("CREDVAULT_CLOSED_REGISTRATION"), "the close path must stay documented");
-        assert!(documented.contains("CREDVAULT_REGISTRATION_TOKEN"), "the token must stay documented");
+        assert!(documented.contains("KLAVYN_CLOSED_REGISTRATION"), "the close path must stay documented");
+        assert!(documented.contains("KLAVYN_REGISTRATION_TOKEN"), "the token must stay documented");
 
         let missing: Vec<&String> = documented
             .iter()
             .filter(|name| {
-                // By key position, so `SOMETHING_ELSE: ${CREDVAULT_X:-}` does
-                // not count as delivering CREDVAULT_X under its own name --
+                // By key position, so `SOMETHING_ELSE: ${KLAVYN_X:-}` does
+                // not count as delivering KLAVYN_X under its own name --
                 // and by the interpolated name too, so the operator's `.env`
                 // is what actually reaches the container. Both halves of the
                 // line carry the same identifier, which means a typo shows on
-                // one side only: `CREDVAULT_CLOSED_REGISTRATION:
-                // ${CREDVAULT_CLOSED_REGISTRATON:-}` passed a key-only check
+                // one side only: `KLAVYN_CLOSED_REGISTRATION:
+                // ${KLAVYN_CLOSED_REGISTRATON:-}` passed a key-only check
                 // while reproducing the original blocker -- the operator sets
                 // it and registration stays open.
                 //
                 // The interpolated name has to *end* where the name ends. A
                 // bare `contains("${NAME")` also accepts `${NAME_OLD:-}`,
                 // which delivers nothing under this name: demonstrated on
-                // CREDVAULT_CLOSED_REGISTRATION, where the test passed while
+                // KLAVYN_CLOSED_REGISTRATION, where the test passed while
                 // registration stayed open to anyone. No documented name is a
                 // prefix of another today, which is the only thing that made
                 // that latent rather than live; a rename leaving the old key
@@ -805,7 +810,7 @@ mod tests {
             let built = google_provider(Some(bad.to_string()), Some("secret".into()));
             assert!(built.is_err(), "{bad:?} must not start the server");
             let message = built.err().unwrap().to_string();
-            assert!(message.contains("CREDVAULT_GOOGLE_CLIENT_ID"), "the refusal must name the flag: {message}");
+            assert!(message.contains("KLAVYN_GOOGLE_CLIENT_ID"), "the refusal must name the flag: {message}");
         }
         // A real one, and the same one with the newline a .env file adds,
         // which is trimmed rather than refused.
@@ -822,7 +827,7 @@ mod tests {
         const SECRET: &str = "GOCSPX-wrapped\nacross-lines";
         let built = google_provider(Some("client-id".into()), Some(SECRET.to_string()));
         let message = built.err().expect("an interior newline must stop the server").to_string();
-        assert!(message.contains("CREDVAULT_GOOGLE_CLIENT_SECRET"), "the refusal must name the flag: {message}");
+        assert!(message.contains("KLAVYN_GOOGLE_CLIENT_SECRET"), "the refusal must name the flag: {message}");
         assert!(!message.contains("GOCSPX"), "the refusal must not quote the secret: {message}");
         // The characters a deny-list of whitespace and control categories
         // misses, and that `trim` leaves in place: a BOM from a Windows-saved

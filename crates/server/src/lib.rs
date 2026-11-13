@@ -1,6 +1,6 @@
-//! credvault sync server: accounts, encrypted secrets, and sharing invites.
+//! klavyn sync server: accounts, encrypted secrets, and sharing invites.
 
-pub use credvault_core::api;
+pub use klavyn_core::api;
 pub mod analytics;
 pub mod auth;
 pub mod error;
@@ -296,6 +296,10 @@ pub fn build_router(pool: SqlitePool, config: ServerConfig) -> Router {
         )
         .route("/me", get(handlers::me))
         .route("/password", post(handlers::change_password))
+        // Bounded inside the handler, on the same per-account budget as
+        // `/password`: all three passphrase checks share it so that a new
+        // route cannot widen the guessing allowance.
+        .route("/account/server-address", post(handlers::change_server_address))
         .route("/users/lookup", get(handlers::lookup_user))
         .route("/projects", get(handlers::list_projects).post(handlers::create_project))
         .route("/projects/{id}", put(handlers::rename_project).delete(handlers::delete_project))

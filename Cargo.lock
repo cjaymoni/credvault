@@ -880,77 +880,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "credvault-core"
-version = "0.3.1"
-dependencies = [
- "aes-gcm",
- "argon2",
- "base64 0.22.1",
- "chrono",
- "hkdf",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
- "url",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "credvault-desktop"
-version = "0.3.1"
-dependencies = [
- "chrono",
- "credvault-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tauri",
- "tauri-build",
- "tauri-plugin-clipboard-manager",
- "tauri-plugin-opener",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "credvault-server"
-version = "0.3.1"
-dependencies = [
- "argon2",
- "axum",
- "base64 0.22.1",
- "chrono",
- "clap",
- "credvault-core",
- "jsonwebtoken",
- "rand 0.8.8",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "subtle",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "zeroize",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2593,6 +2522,77 @@ checksum = "0fbe853b403ae61a04233030ae8a79d94975281ed9770a1f9e246732b534b28d"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
+]
+
+[[package]]
+name = "klavyn-core"
+version = "0.4.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "base64 0.22.1",
+ "chrono",
+ "hkdf",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "url",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "klavyn-desktop"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "klavyn-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-clipboard-manager",
+ "tauri-plugin-opener",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "klavyn-server"
+version = "0.4.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "jsonwebtoken",
+ "klavyn-core",
+ "rand 0.8.8",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

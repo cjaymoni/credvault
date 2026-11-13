@@ -1,9 +1,9 @@
 [package]
-name = "credvault-core"
+name = "klavyn-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Client-side cryptography shared by the credvault desktop app and server"
+description = "Client-side cryptography shared by the klavyn desktop app and server"
 
 [dependencies]
 aes-gcm.workspace = true

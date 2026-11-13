@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-use credvault_core::PublicKey;
+use klavyn_core::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// Keys pinned so far, keyed by server URL and then by email.
@@ -91,7 +91,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use credvault_core::Identity;
+    use klavyn_core::Identity;
 
     use super::*;
 

@@ -120,7 +120,7 @@ async function fetchReleases(repository, token) {
     "x-github-api-version": "2022-11-28",
     // A generic client name on purpose. GitHub asks automated callers to
     // identify themselves; it does not need to be told whose machine this is.
-    "user-agent": "credvault-release-downloads",
+    "user-agent": "klavyn-release-downloads",
   };
   if (token) {
     headers.authorization = `Bearer ${token}`;

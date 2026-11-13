@@ -1,4 +1,4 @@
-// credvault desktop UI. All cryptography lives in Rust; this file only renders
+// klavyn desktop UI. All cryptography lives in Rust; this file only renders
 // state and calls Tauri commands.
 
 const invoke = window.__TAURI__.core.invoke;
@@ -9,7 +9,7 @@ const $ = (id) => document.getElementById(id);
 // remembered, so anyone self-hosting sets theirs once. Must stay https --
 // the Rust side refuses http for anything but loopback, and it refuses it
 // after the password has been entered. Checked by ui-tests/screens.test.js.
-const DEFAULT_SERVER = "https://credvault.alphadesigns.dev";
+const DEFAULT_SERVER = "https://vault.klavyn.com";
 const REVEAL_HIDE_AFTER_MS = 30_000;
 const TOAST_MS = 2200;
 const MASKED = "••••••••••••";
@@ -1732,7 +1732,7 @@ function renderRevokeConfirm(id, userId, members) {
   box.innerHTML = `
     <div class="card" style="margin-top:14px" role="region" aria-label="Confirm who keeps access">
       <h3 class="card-title">${icon("key")} Confirm who keeps access</h3>
-      <p class="card-lead">Revoking re-encrypts this secret for everyone who keeps access, and this device has not confirmed these keys yet. Ask each person to read the <strong>Your key</strong> fingerprint from their credvault account settings and continue only if every one matches.</p>
+      <p class="card-lead">Revoking re-encrypts this secret for everyone who keeps access, and this device has not confirmed these keys yet. Ask each person to read the <strong>Your key</strong> fingerprint from their klavyn account settings and continue only if every one matches.</p>
       ${changed ? `<div class="notice danger">${icon("alert")}<div>A key marked <strong>Changed</strong> differs from one you confirmed before. Either they re-created their account, or the server is lying. Do not continue unless they read the new fingerprint to you directly.</div></div>` : ""}
       <ul class="people">${rows}</ul>
       ${changedKeyChallenge(members)}

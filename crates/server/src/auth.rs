@@ -46,7 +46,7 @@ pub fn verify_credential(auth_hash: &str, stored: &str) -> bool {
 pub fn dummy_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
-        let random: [u8; 32] = credvault_core::aead::random_bytes();
+        let random: [u8; 32] = klavyn_core::aead::random_bytes();
         hash_credential_blocking(&base64::engine::general_purpose::STANDARD.encode(random))
             .expect("hashing a random credential cannot fail")
     })

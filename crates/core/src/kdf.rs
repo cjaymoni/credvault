@@ -86,7 +86,7 @@ pub fn validate_auth_hash(text: &str) -> Result<()> {
     encoding::decode_array::<AUTH_HASH_LEN>(text, "auth hash").map(|_| ())
 }
 
-/// The address of one credvault server, in the single canonical form the auth
+/// The address of one klavyn server, in the single canonical form the auth
 /// hash is derived from.
 ///
 /// Parsing is the only way to make one, so the same server typed two ways

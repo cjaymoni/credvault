@@ -1,15 +1,15 @@
 //! End-to-end tests driving the server the way the desktop client does,
-//! including real client-side encryption from credvault-core.
+//! including real client-side encryption from klavyn-core.
 
 use std::net::SocketAddr;
 
 use chrono::Utc;
-use credvault_core::api::MAX_BLOB_BYTES;
-use credvault_core::kdf::ServerAddress;
-use credvault_core::secret::CustomField;
-use credvault_core::{Identity, MasterKey, PublicKey, Sealed, SecretKey, SecretPayload, WrappedKey};
-use credvault_server::api::*;
-use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
+use klavyn_core::api::MAX_BLOB_BYTES;
+use klavyn_core::kdf::ServerAddress;
+use klavyn_core::secret::CustomField;
+use klavyn_core::{Identity, MasterKey, PublicKey, Sealed, SecretKey, SecretPayload, WrappedKey};
+use klavyn_server::api::*;
+use klavyn_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -32,8 +32,8 @@ async fn spawn() -> TestServer {
 
 async fn spawn_with(config: ServerConfig) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
-    let pool = credvault_server::connect(&dir.path().join("test.db")).await.unwrap();
-    let app = credvault_server::build_router(pool.clone(), config);
+    let pool = klavyn_server::connect(&dir.path().join("test.db")).await.unwrap();
+    let app = klavyn_server::build_router(pool.clone(), config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -471,7 +471,7 @@ async fn malformed_json_and_oversized_bodies_get_clear_errors() {
     let alice = register(&server, "alice@example.com", "alice-password").await;
     // Sized from the limit rather than from a number, so raising the limit
     // cannot quietly turn this into a test of something else.
-    let over_the_limit = "A".repeat(credvault_server::MAX_REQUEST_BYTES + 1024);
+    let over_the_limit = "A".repeat(klavyn_server::MAX_REQUEST_BYTES + 1024);
     let huge = json!({"name": "x", "payload": {"v": 1, "nonce": "AAAAAAAAAAAAAAAA", "ciphertext": over_the_limit}});
     let response = server.req(Method::POST, "/secrets", &alice).json(&huge).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -824,7 +824,7 @@ async fn secret_lifecycle_for_owner() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let oversized =
-        Sealed { v: credvault_core::aead::SEALED_FORMAT, nonce: vec![0; 12], ciphertext: vec![0; MAX_BLOB_BYTES + 1] };
+        Sealed { v: klavyn_core::aead::SEALED_FORMAT, nonce: vec![0; 12], ciphertext: vec![0; MAX_BLOB_BYTES + 1] };
     let response = server
         .req(Method::PUT, &format!("/secrets/{id}"), &alice)
         .json(&UpdateSecretRequest {
@@ -2160,7 +2160,7 @@ impl FakePosthog {
 fn reporting_to(posthog: &FakePosthog) -> ServerConfig {
     ServerConfig {
         trust_forwarded_for: true,
-        analytics: Some(credvault_server::analytics::Analytics::start("phc_test".into(), &posthog.base).unwrap()),
+        analytics: Some(klavyn_server::analytics::Analytics::start("phc_test".into(), &posthog.base).unwrap()),
         ..ServerConfig::default()
     }
 }
@@ -2183,7 +2183,7 @@ async fn asking_what_a_server_supports_reports_the_build_and_the_country() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let event = posthog.first_event().await;
-    assert_eq!(event["event"], credvault_server::analytics::APP_REACHED_SERVER);
+    assert_eq!(event["event"], klavyn_server::analytics::APP_REACHED_SERVER);
     assert_eq!(event["properties"]["platform"], "macos");
     assert_eq!(event["properties"]["app_version"], "0.1.3");
     assert_eq!(event["properties"]["country"], "GH");
@@ -2232,7 +2232,7 @@ async fn an_event_carries_nothing_that_identifies_anyone() {
 async fn a_client_cannot_put_itself_in_a_country_it_chooses() {
     let posthog = FakePosthog::spawn().await;
     let config = ServerConfig {
-        analytics: Some(credvault_server::analytics::Analytics::start("phc_test".into(), &posthog.base).unwrap()),
+        analytics: Some(klavyn_server::analytics::Analytics::start("phc_test".into(), &posthog.base).unwrap()),
         ..ServerConfig::default()
     };
     let server = spawn_with(config).await;
@@ -2290,7 +2290,7 @@ async fn nothing_but_the_capabilities_route_reports_anything() {
     // made by a client that sends no `credvault/...` User-Agent, so a leak
     // from one of them reports an unknown version and this does not.
     let arrived = posthog.first_event().await;
-    assert_eq!(arrived["event"], credvault_server::analytics::APP_REACHED_SERVER);
+    assert_eq!(arrived["event"], klavyn_server::analytics::APP_REACHED_SERVER);
     assert_eq!(arrived["properties"]["app_version"], "0.2.0", "waited for the wrong event: {arrived:?}");
 
     assert_eq!(posthog.events().len(), 1, "registering and reading a vault must count nothing: {:?}", posthog.events());
@@ -2312,4 +2312,97 @@ async fn a_server_without_a_key_answers_the_same_and_sends_nothing() {
     let capabilities: Capabilities = response.json().await.unwrap();
     assert!(capabilities.password_sign_in);
     assert!(!capabilities.google_sign_in);
+}
+
+// ----- moving a server to a new address -------------------------------------
+
+/// The whole point of the rebind: an account survives the server changing
+/// hostname, and the move is a credential swap rather than anything touching
+/// the vault.
+#[tokio::test]
+async fn an_account_follows_the_server_to_a_new_address() {
+    let server = spawn().await;
+    let account = register(&server, "mover@example.com", "correct horse battery staple").await;
+    let master = MasterKey::derive("correct horse battery staple", "mover@example.com").unwrap();
+
+    let moved = ServerAddress::parse("https://vault.elsewhere.example").unwrap();
+    assert_ne!(*master.auth_hash(&moved), *master.auth_hash(&server.address), "a new address is a new credential");
+
+    let response = server
+        .req(Method::POST, "/account/server-address", &account)
+        .json(&ChangeServerAddressRequest {
+            current_auth_hash: master.auth_hash(&server.address),
+            new_auth_hash: master.auth_hash(&moved),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // The credential bound to the new address now works, and the old one no
+    // longer does. Both halves matter: the first is the feature, the second
+    // is what stops the retired hostname remaining a way in.
+    assert_eq!(login(&server, &account.email, master.auth_hash(&moved)).await.status(), StatusCode::OK);
+    assert_eq!(
+        login(&server, &account.email, master.auth_hash(&server.address)).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A session is not enough. This decides which address can sign into the
+/// account, so a stolen token must not be able to move it.
+#[tokio::test]
+async fn moving_the_address_needs_the_passphrase_not_just_a_session() {
+    let server = spawn().await;
+    let account = register(&server, "guard@example.com", "correct horse battery staple").await;
+    let master = MasterKey::derive("correct horse battery staple", "guard@example.com").unwrap();
+    let wrong = MasterKey::derive("not the passphrase", "guard@example.com").unwrap();
+    let moved = ServerAddress::parse("https://vault.elsewhere.example").unwrap();
+
+    let response = server
+        .req(Method::POST, "/account/server-address", &account)
+        .json(&ChangeServerAddressRequest {
+            current_auth_hash: wrong.auth_hash(&server.address),
+            new_auth_hash: wrong.auth_hash(&moved),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // And nothing moved: the original credential still signs in.
+    assert_eq!(login(&server, &account.email, master.auth_hash(&server.address)).await.status(), StatusCode::OK);
+}
+
+/// Secrets are not re-encrypted by a move, because the encryption keys are
+/// not bound to the address in the first place. If this ever fails, the
+/// rebind has started touching key material and is no longer the narrow
+/// operation it is documented to be.
+#[tokio::test]
+async fn moving_the_address_leaves_the_vault_untouched() {
+    let server = spawn().await;
+    let account = register(&server, "vault@example.com", "correct horse battery staple").await;
+    let master = MasterKey::derive("correct horse battery staple", "vault@example.com").unwrap();
+    let secret = payload();
+    let (id, key) = server.create_secret(&account, "GitHub", &secret).await;
+
+    let before = server.list(&account).await;
+    let moved = ServerAddress::parse("https://vault.elsewhere.example").unwrap();
+    let response = server
+        .req(Method::POST, "/account/server-address", &account)
+        .json(&ChangeServerAddressRequest {
+            current_auth_hash: master.auth_hash(&server.address),
+            new_auth_hash: master.auth_hash(&moved),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let after = server.list(&account).await;
+    assert_eq!(before.len(), after.len(), "a move must not add or remove secrets");
+    let stored = after.iter().find(|view| view.id == id).expect("the secret is still there");
+    // Decrypts with the key derived before the move, under the same name.
+    let opened = key.decrypt("GitHub", &stored.payload).unwrap();
+    assert_eq!(opened.username, secret.username);
 }

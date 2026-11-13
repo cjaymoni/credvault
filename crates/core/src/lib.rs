@@ -1,4 +1,4 @@
-//! Client-side cryptography for credvault.
+//! Client-side cryptography for klavyn.
 //!
 //! The server only ever sees ciphertext. The scheme:
 //!
@@ -53,13 +53,13 @@ pub enum CryptoError {
     /// Stored data written by a newer build than this one. Refused rather than
     /// partially read: a client that dropped what it did not understand and
     /// then saved the record back would destroy data it never showed the user.
-    #[error("this {what} was saved by a newer version of credvault (format {found}); update the app to open it")]
+    #[error("this {what} was saved by a newer version of klavyn (format {found}); update the app to open it")]
     NewerFormat { what: &'static str, found: u32 },
     /// Stored data in a format this build does not implement. Distinct from
     /// [`CryptoError::Decrypt`] on purpose: a wrong passphrase and a scheme
     /// this build cannot run are different problems with different answers,
     /// and an AEAD that simply fails to open cannot tell them apart.
-    #[error("this {what} is in format {found}, which this version of credvault cannot read")]
+    #[error("this {what} is in format {found}, which this version of klavyn cannot read")]
     UnknownFormat { what: &'static str, found: u32 },
     #[error("invalid input: {0}")]
     InvalidInput(String),

@@ -1,0 +1,480 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		07F71E3ECD951A53FFF715A8 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 2C3704DD63232AF2F8B9AA4E /* LaunchScreen.storyboard */; };
+		09B9264560B8292C4C89E5B6 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FC7064598888A999D0B58EB0 /* UIKit.framework */; };
+		28DBE3BE4F6B3EFCED81FE75 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2A6A80FA2759E7A34275252F /* WebKit.framework */; };
+		37C6E8B8C120E11DAD3C0CE1 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8F356679B6737C2FF80A789D /* QuartzCore.framework */; };
+		3C1BA2745F43A3FAD9B61994 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B03C56612CEC159A68A17AAE /* CoreGraphics.framework */; };
+		4D1AB1FC387AF869E956A4B7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 49C239CEBB3640A890712F6F /* Assets.xcassets */; };
+		728C8AF10F8A2A7346C9B423 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 666A4718A73F3DA70671C874 /* Metal.framework */; };
+		81ABAF4711C7B053F94AD9B7 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2678F560FFD4C8DB17054B09 /* Security.framework */; };
+		BFBD24925B87871C64A31DAE /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 12FD4936FE183F6D23C752D8 /* main.mm */; };
+		C2EFE8255BF88CD7A0C75AF1 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 88460DC24A83F8234CC14FA7 /* libapp.a */; };
+		C51CB41C6BA8D5B14363FFD8 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 4846BFE367F9386EE1DF350F /* assets */; };
+		FBF9F2EDC0E73B3139DE195E /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FADE33E3F2FB7DB29C77D2A7 /* MetalKit.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		0B11335C13E4F749480A4CDA /* oauth_listener.rs */ = {isa = PBXFileReference; path = oauth_listener.rs; sourceTree = "<group>"; };
+		12FD4936FE183F6D23C752D8 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		2678F560FFD4C8DB17054B09 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		2A6A80FA2759E7A34275252F /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		2C3704DD63232AF2F8B9AA4E /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		33FDDC1C72273B482CB85CB2 /* klavyn-desktop_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "klavyn-desktop_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		36CD2498155C5423BC901B57 /* known_keys.rs */ = {isa = PBXFileReference; path = known_keys.rs; sourceTree = "<group>"; };
+		4846BFE367F9386EE1DF350F /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		49C239CEBB3640A890712F6F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		59DBFC1D3C441A044E8FE9F8 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		666A4718A73F3DA70671C874 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		88460DC24A83F8234CC14FA7 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		8F356679B6737C2FF80A789D /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		9599B5A22B75EAF198598132 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		9831D81A9D57AD12C9B3B1B3 /* klavyn-desktop_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "klavyn-desktop_iOS.entitlements"; sourceTree = "<group>"; };
+		B03C56612CEC159A68A17AAE /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		C2FF498C7FC85C163430B2A7 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		D4C9D36345433FC951DD6515 /* client.rs */ = {isa = PBXFileReference; path = client.rs; sourceTree = "<group>"; };
+		F8BD3A2EB6719267312B6CF9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		FADE33E3F2FB7DB29C77D2A7 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		FC7064598888A999D0B58EB0 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		8A7B1A66417DE04EAA5BC035 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C2EFE8255BF88CD7A0C75AF1 /* libapp.a in Frameworks */,
+				3C1BA2745F43A3FAD9B61994 /* CoreGraphics.framework in Frameworks */,
+				728C8AF10F8A2A7346C9B423 /* Metal.framework in Frameworks */,
+				FBF9F2EDC0E73B3139DE195E /* MetalKit.framework in Frameworks */,
+				37C6E8B8C120E11DAD3C0CE1 /* QuartzCore.framework in Frameworks */,
+				81ABAF4711C7B053F94AD9B7 /* Security.framework in Frameworks */,
+				09B9264560B8292C4C89E5B6 /* UIKit.framework in Frameworks */,
+				28DBE3BE4F6B3EFCED81FE75 /* WebKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		15B981AA48CA970E3BA61F7B /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				B03C56612CEC159A68A17AAE /* CoreGraphics.framework */,
+				88460DC24A83F8234CC14FA7 /* libapp.a */,
+				666A4718A73F3DA70671C874 /* Metal.framework */,
+				FADE33E3F2FB7DB29C77D2A7 /* MetalKit.framework */,
+				8F356679B6737C2FF80A789D /* QuartzCore.framework */,
+				2678F560FFD4C8DB17054B09 /* Security.framework */,
+				FC7064598888A999D0B58EB0 /* UIKit.framework */,
+				2A6A80FA2759E7A34275252F /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		341FD241684342DDA7E9A8A7 /* klavyn-desktop_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				F8BD3A2EB6719267312B6CF9 /* Info.plist */,
+				9831D81A9D57AD12C9B3B1B3 /* klavyn-desktop_iOS.entitlements */,
+			);
+			path = "klavyn-desktop_iOS";
+			sourceTree = "<group>";
+		};
+		34D300965C35B954FE9D61AD /* klavyn-desktop */ = {
+			isa = PBXGroup;
+			children = (
+				12FD4936FE183F6D23C752D8 /* main.mm */,
+				69CE0D929DDF69D0F67E205C /* bindings */,
+			);
+			path = "klavyn-desktop";
+			sourceTree = "<group>";
+		};
+		69CE0D929DDF69D0F67E205C /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				C2FF498C7FC85C163430B2A7 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		6BA5928CDCFCB180A76D5DF0 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				D4C9D36345433FC951DD6515 /* client.rs */,
+				36CD2498155C5423BC901B57 /* known_keys.rs */,
+				9599B5A22B75EAF198598132 /* lib.rs */,
+				59DBFC1D3C441A044E8FE9F8 /* main.rs */,
+				0B11335C13E4F749480A4CDA /* oauth_listener.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		830B619B2D5156F26EDFEC82 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				34D300965C35B954FE9D61AD /* klavyn-desktop */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		947654B1BE9AF62E8F1E70A5 /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		BECE8DAE3A507352129DA6E4 = {
+			isa = PBXGroup;
+			children = (
+				4846BFE367F9386EE1DF350F /* assets */,
+				49C239CEBB3640A890712F6F /* Assets.xcassets */,
+				2C3704DD63232AF2F8B9AA4E /* LaunchScreen.storyboard */,
+				947654B1BE9AF62E8F1E70A5 /* Externals */,
+				341FD241684342DDA7E9A8A7 /* klavyn-desktop_iOS */,
+				830B619B2D5156F26EDFEC82 /* Sources */,
+				6BA5928CDCFCB180A76D5DF0 /* src */,
+				15B981AA48CA970E3BA61F7B /* Frameworks */,
+				EE969D075F11FF003417BB03 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		EE969D075F11FF003417BB03 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				33FDDC1C72273B482CB85CB2 /* klavyn-desktop_iOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		"TEMP_8D7C0BC3-E0FC-4845-9A67-381A11874CE4" /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = arm64;
+			sourceTree = "<group>";
+		};
+		"TEMP_93912F2D-C365-4259-A518-3950F1D5503D" /* x86_64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = x86_64;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		03A3D47BAD589F20AF0C1093 /* klavyn-desktop_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FE93EAE3D2ACF16CC48B03A1 /* Build configuration list for PBXNativeTarget "klavyn-desktop_iOS" */;
+			buildPhases = (
+				0F4D8B2BB41BC650DE357EFD /* Build Rust Code */,
+				1F9AF33256B1F037FE654905 /* Sources */,
+				35E201420969092607453540 /* Resources */,
+				8A7B1A66417DE04EAA5BC035 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "klavyn-desktop_iOS";
+			packageProductDependencies = (
+			);
+			productName = "klavyn-desktop_iOS";
+			productReference = 33FDDC1C72273B482CB85CB2 /* klavyn-desktop_iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E3C057BEEA6172792DBE51E9 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = DD28E069326964CF14AB4299 /* Build configuration list for PBXProject "klavyn-desktop" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = BECE8DAE3A507352129DA6E4;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = EE969D075F11FF003417BB03 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				03A3D47BAD589F20AF0C1093 /* klavyn-desktop_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		35E201420969092607453540 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4D1AB1FC387AF869E956A4B7 /* Assets.xcassets in Resources */,
+				07F71E3ECD951A53FFF715A8 /* LaunchScreen.storyboard in Resources */,
+				C51CB41C6BA8D5B14363FFD8 /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0F4D8B2BB41BC650DE357EFD /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "cargo tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1F9AF33256B1F037FE654905 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BFBD24925B87871C64A31DAE /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		14426BB76EB09E741441B5A5 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		5B750FCB8645F9A282DBA237 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		9A877A22473EA759230C222A /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "klavyn-desktop_iOS/klavyn-desktop_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "klavyn-desktop_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.klavyn.desktop;
+				PRODUCT_NAME = klavyn;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
+		B13D8A482B44050971C63970 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "klavyn-desktop_iOS/klavyn-desktop_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "klavyn-desktop_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.klavyn.desktop;
+				PRODUCT_NAME = klavyn;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		DD28E069326964CF14AB4299 /* Build configuration list for PBXProject "klavyn-desktop" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5B750FCB8645F9A282DBA237 /* debug */,
+				14426BB76EB09E741441B5A5 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		FE93EAE3D2ACF16CC48B03A1 /* Build configuration list for PBXNativeTarget "klavyn-desktop_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B13D8A482B44050971C63970 /* debug */,
+				9A877A22473EA759230C222A /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = E3C057BEEA6172792DBE51E9 /* Project object */;
+}

@@ -1,6 +1,6 @@
 # Terms of Service
 
-**credvault test service — credvault.alphadesigns.dev**
+**klavyn test service — vault.klavyn.com**
 
 Last updated: 12 November 2026
 
@@ -12,12 +12,12 @@ Status: **test service.** Section 2 explains what that means for you.
 
 These terms are an agreement between you and `[OPERATOR NAME]`
 (`[LEGAL ENTITY, IF ANY]`), referred to below as "we" or "us". They cover your
-use of the credvault app and the server at `credvault.alphadesigns.dev`.
+use of the klavyn app and the server at `vault.klavyn.com`.
 
 By creating an account you accept these terms. If you do not accept them, do
 not create an account.
 
-The credvault software itself is open source and separately licensed. These
+The klavyn software itself is open source and separately licensed. These
 terms govern the *service* we run, not your right to use the source code.
 
 ## 2. This is a test service

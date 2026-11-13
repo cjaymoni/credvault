@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use credvault_core::api::OAuthPurpose;
-use credvault_core::kdf::normalize_email;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use klavyn_core::api::OAuthPurpose;
+use klavyn_core::kdf::normalize_email;
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -211,7 +211,7 @@ pub fn verify_identity_claims(claims: &IdTokenClaims, expected_nonce: &str) -> A
     let email = claims.email.as_deref().unwrap_or_default();
     if !claims.email_verified || email.is_empty() {
         return Err(ApiError::Forbidden(
-            "this Google account has no verified email address, which credvault requires".into(),
+            "this Google account has no verified email address, which klavyn requires".into(),
         ));
     }
     Ok(VerifiedIdentity { subject: claims.sub.clone(), email: normalize_email(email) })
@@ -411,7 +411,7 @@ pub fn purpose_from_storage(text: &str) -> ApiResult<OAuthPurpose> {
 
 #[cfg(test)]
 mod tests {
-    use credvault_core::api::check_opaque_oauth_value;
+    use klavyn_core::api::check_opaque_oauth_value;
 
     use super::*;
 

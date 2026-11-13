@@ -1,4 +1,4 @@
-# credvault
+# klavyn
 
 A password manager you host yourself, with end-to-end encryption and the
 ability to share a single secret with another person.
@@ -20,13 +20,13 @@ ability to share a single secret with another person.
 ## Install
 
 Installers for macOS, Windows and Linux are attached to each
-[release](https://github.com/cjaymoni/credvault/releases); the release notes
+[release](https://github.com/cjaymoni/klavyn/releases); the release notes
 say how to get past the warning each platform shows for an unsigned build.
 Building from source instead is under [Build](#build) below.
 
 You also need somewhere to connect to. Running a server is
 [deploy/README.md](deploy/README.md); for a look around on your own machine,
-`cargo run -p credvault-server` and `http://127.0.0.1:8787` typed into the
+`cargo run -p klavyn-server` and `http://127.0.0.1:8787` typed into the
 app's Server URL field are enough.
 
 During pre-release that field is pre-filled with the maintainer's test
@@ -93,8 +93,8 @@ address nobody has registered all give the same answer.
 
 ### Sign in with Google (optional)
 
-Off unless the operator sets `CREDVAULT_GOOGLE_CLIENT_ID` and
-`CREDVAULT_GOOGLE_CLIENT_SECRET`; clients ask the server what it offers and
+Off unless the operator sets `KLAVYN_GOOGLE_CLIENT_ID` and
+`KLAVYN_GOOGLE_CLIENT_SECRET`; clients ask the server what it offers and
 only show the button where it works.
 
 Google establishes *who you are*. It cannot produce key material, so it
@@ -164,8 +164,8 @@ against the convenience before enabling it.
 2. Put the client id and secret in the server's environment:
 
    ```sh
-   CREDVAULT_GOOGLE_CLIENT_ID=....apps.googleusercontent.com
-   CREDVAULT_GOOGLE_CLIENT_SECRET=...
+   KLAVYN_GOOGLE_CLIENT_ID=....apps.googleusercontent.com
+   KLAVYN_GOOGLE_CLIENT_SECRET=...
    ```
 
 3. Restart the server. `GET /api/capabilities` reports `google_sign_in: true`
@@ -314,29 +314,29 @@ Requires Rust (https://rustup.rs). On Linux, Tauri also needs
 cargo test --workspace            # core + server + desktop tests
 node --test apps/desktop/ui-tests/   # the editor logic in apps/desktop/ui/fields.js
 node scripts/build-legal.js         # regenerate ui/legal.js after editing docs/*.md
-cargo build --release -p credvault-server
+cargo build --release -p klavyn-server
 cargo install tauri-cli --version "^2" --locked
 cd apps/desktop && cargo tauri build     # produces an installer in target/release/bundle
 ```
 
 ## Run
 
-Start the server (defaults to 127.0.0.1:8787 and `~/.credvault-server`):
+Start the server (defaults to 127.0.0.1:8787 and `~/.klavyn-server`):
 
 ```sh
-./target/release/credvault-server
-./target/release/credvault-server --bind 0.0.0.0:8787 --data-dir /srv/credvault
+./target/release/klavyn-server
+./target/release/klavyn-server --bind 0.0.0.0:8787 --data-dir /srv/klavyn
 ```
 
 Options (each also settable as an environment variable):
 
 | Flag | Env | Effect |
 |---|---|---|
-| `--registration-token TOKEN` | `CREDVAULT_REGISTRATION_TOKEN` | Only people who enter this token can create an account. Recommended for any server others can reach. |
-| `--closed-registration` | `CREDVAULT_CLOSED_REGISTRATION` | No new accounts at all. |
-| `--trust-forwarded-for` | `CREDVAULT_TRUST_FORWARDED_FOR` | Rate-limit by the rightmost `X-Forwarded-For` address. Only behind a reverse proxy that sets that header. |
-| `--posthog-api-key KEY` | `CREDVAULT_POSTHOG_API_KEY` | Switch on anonymous reach telemetry. Off unless set, which is the state of every server nobody has deliberately turned it on for. See below. |
-| `--posthog-host URL` | `CREDVAULT_POSTHOG_HOST` | Where that telemetry goes. Defaults to PostHog's EU cloud; set it to `https://us.i.posthog.com`, or to your own PostHog. Ignored without a key. |
+| `--registration-token TOKEN` | `KLAVYN_REGISTRATION_TOKEN` | Only people who enter this token can create an account. Recommended for any server others can reach. |
+| `--closed-registration` | `KLAVYN_CLOSED_REGISTRATION` | No new accounts at all. |
+| `--trust-forwarded-for` | `KLAVYN_TRUST_FORWARDED_FOR` | Rate-limit by the rightmost `X-Forwarded-For` address. Only behind a reverse proxy that sets that header. |
+| `--posthog-api-key KEY` | `KLAVYN_POSTHOG_API_KEY` | Switch on anonymous reach telemetry. Off unless set, which is the state of every server nobody has deliberately turned it on for. See below. |
+| `--posthog-host URL` | `KLAVYN_POSTHOG_HOST` | Where that telemetry goes. Defaults to PostHog's EU cloud; set it to `https://us.i.posthog.com`, or to your own PostHog. Ignored without a key. |
 
 Login and registration are rate limited per client address (10 logins then
 one every 6 s; 5 registrations then one per minute). The data directory is
@@ -422,11 +422,11 @@ terminal; the Xcode build script needs the CLI's options server:
 
 ```sh
 cd apps/desktop
-xcodebuild -project gen/apple/credvault-desktop.xcodeproj -scheme credvault-desktop_iOS \
+xcodebuild -project gen/apple/klavyn-desktop.xcodeproj -scheme klavyn-desktop_iOS \
   -configuration debug -destination 'platform=iOS Simulator,name=iPhone 17' \
-  -derivedDataPath /tmp/credvault-ios CODE_SIGNING_ALLOWED=NO build
-xcrun simctl install booted /tmp/credvault-ios/Build/Products/debug-iphonesimulator/credvault.app
-xcrun simctl launch booted com.credvault.desktop
+  -derivedDataPath /tmp/klavyn-ios CODE_SIGNING_ALLOWED=NO build
+xcrun simctl install booted /tmp/klavyn-ios/Build/Products/debug-iphonesimulator/klavyn.app
+xcrun simctl launch booted com.klavyn.desktop
 ```
 
 The simulator shares the Mac's network, so `http://127.0.0.1:8787` reaches a
@@ -472,7 +472,7 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$B/aarch64-linux-android24-clan
 ## Development
 
 ```sh
-cargo run -p credvault-server                  # terminal 1
+cargo run -p klavyn-server                  # terminal 1
 cd apps/desktop && cargo tauri dev             # terminal 2
 cargo fmt --all && cargo clippy --workspace --all-targets
 ```

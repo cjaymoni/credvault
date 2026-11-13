@@ -276,10 +276,10 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) -> io::Result
 
 // Built once at first use rather than formatted per request.
 static DONE_PAGE: &str = "\
-<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Signed in</title><style>body{font:16px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e7e9ee}main{text-align:center;padding:2rem}h1{font-size:1.25rem;margin:0 0 .5rem}p{margin:0;opacity:.75}</style></head><body><main><h1>Signed in</h1><p>You can close this tab and go back to credvault.</p></main></body></html>";
+<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Signed in</title><style>body{font:16px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e7e9ee}main{text-align:center;padding:2rem}h1{font-size:1.25rem;margin:0 0 .5rem}p{margin:0;opacity:.75}</style></head><body><main><h1>Signed in</h1><p>You can close this tab and go back to klavyn.</p></main></body></html>";
 
 static FAILED_PAGE: &str = "\
-<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Sign-in failed</title><style>body{font:16px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e7e9ee}main{text-align:center;padding:2rem}h1{font-size:1.25rem;margin:0 0 .5rem}p{margin:0;opacity:.75}</style></head><body><main><h1>Sign-in failed</h1><p>Close this tab and try again from credvault.</p></main></body></html>";
+<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Sign-in failed</title><style>body{font:16px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e7e9ee}main{text-align:center;padding:2rem}h1{font-size:1.25rem;margin:0 0 .5rem}p{margin:0;opacity:.75}</style></head><body><main><h1>Sign-in failed</h1><p>Close this tab and try again from klavyn.</p></main></body></html>";
 
 static NOT_FOUND_PAGE: &str = "<!doctype html><title>Not found</title><p>Not found.";
 
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(stray.status(), reqwest::StatusCode::NOT_FOUND);
 
         let done = http.get(format!("{redirect}?code=the-code&state=st")).send().await.unwrap();
-        assert!(done.text().await.unwrap().contains("go back to credvault"));
+        assert!(done.text().await.unwrap().contains("go back to klavyn"));
         assert_eq!(*waiting.await.unwrap().unwrap(), "the-code");
     }
 
@@ -392,7 +392,7 @@ mod tests {
 
         // The real redirect still lands.
         let done = http.get(format!("{redirect}?code=survived&state=st")).send().await.unwrap();
-        assert!(done.text().await.unwrap().contains("go back to credvault"));
+        assert!(done.text().await.unwrap().contains("go back to klavyn"));
         assert_eq!(*waiting.await.unwrap().unwrap(), "survived");
     }
 
@@ -520,7 +520,7 @@ mod tests {
 
         // The real one still lands.
         let done = reqwest::get(format!("{redirect}?code=mine&state=expected")).await.unwrap();
-        assert!(done.text().await.unwrap().contains("go back to credvault"));
+        assert!(done.text().await.unwrap().contains("go back to klavyn"));
         assert_eq!(*waiting.await.unwrap().unwrap(), "mine");
     }
 

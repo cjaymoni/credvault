@@ -9,12 +9,12 @@
 //! The generator is seeded, so a failure here reproduces exactly: the panic
 //! message names the iteration, and re-running reaches the same input.
 
-use credvault_core::aead::{self, Sealed, KEY_LEN};
-use credvault_core::api::*;
-use credvault_core::identity::{normalize_fingerprint, SealedBox};
-use credvault_core::kdf::{normalize_email, validate_auth_hash, ServerAddress};
-use credvault_core::secret::{validate_label, validate_name, CustomField};
-use credvault_core::{PublicKey, SecretKey, SecretPayload, WrappedKey};
+use klavyn_core::aead::{self, Sealed, KEY_LEN};
+use klavyn_core::api::*;
+use klavyn_core::identity::{normalize_fingerprint, SealedBox};
+use klavyn_core::kdf::{normalize_email, validate_auth_hash, ServerAddress};
+use klavyn_core::secret::{validate_label, validate_name, CustomField};
+use klavyn_core::{PublicKey, SecretKey, SecretPayload, WrappedKey};
 
 /// xorshift64*, so the sweep is reproducible without a dependency.
 struct Rng(u64);

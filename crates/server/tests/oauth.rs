@@ -1,7 +1,7 @@
 //! End-to-end tests for sign in with Google.
 //!
 //! A stub provider stands in for Google: the protocol work it would do is
-//! unit-tested in `credvault_server::oauth`, and what matters here is what the
+//! unit-tested in `klavyn_server::oauth`, and what matters here is what the
 //! server does with an identity once it has one. Nothing in this file touches
 //! the network.
 
@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use credvault_core::kdf::ServerAddress;
-use credvault_core::{Identity, MasterKey};
-use credvault_server::api::*;
-use credvault_server::error::ApiError;
-use credvault_server::oauth::{BoxFuture, ExchangeRequest, OAuthProvider, VerifiedIdentity};
-use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
+use klavyn_core::kdf::ServerAddress;
+use klavyn_core::{Identity, MasterKey};
+use klavyn_server::api::*;
+use klavyn_server::error::ApiError;
+use klavyn_server::oauth::{BoxFuture, ExchangeRequest, OAuthProvider, VerifiedIdentity};
+use klavyn_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use reqwest::{Client, StatusCode};
 use sqlx::SqlitePool;
 
@@ -119,8 +119,8 @@ struct TestServer {
 /// handful of lines of setup.
 async fn spawn_with(config: ServerConfig) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
-    let pool = credvault_server::connect(&dir.path().join("test.db")).await.unwrap();
-    let app = credvault_server::build_router(pool.clone(), config);
+    let pool = klavyn_server::connect(&dir.path().join("test.db")).await.unwrap();
+    let app = klavyn_server::build_router(pool.clone(), config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1231,4 +1231,31 @@ async fn a_google_only_account_cannot_remove_its_only_way_in() {
     let started = server.start("sign_in").await;
     let response = server.callback(&started, "code-1").await;
     assert!(matches!(response.json::<OAuthCallbackResponse>().await.unwrap(), OAuthCallbackResponse::SignedIn(_)));
+}
+
+/// A Google account's stored hash is random bytes, so there is no
+/// passphrase-derived credential bound to this server's address and nothing
+/// for a move to carry. Refusing in those words beats a generic rejection the
+/// person would read as a wrong passphrase.
+#[tokio::test]
+async fn a_google_account_has_no_address_binding_to_move() {
+    let stub = StubProvider::with_code("code-1", "sub", "kat@example.com");
+    let server = spawn(Arc::clone(&stub)).await;
+    let (session, email) = sign_up(&server, "code-1", "first-passphrase-here", None).await;
+
+    let master = MasterKey::derive("first-passphrase-here", &email).unwrap();
+    let moved = ServerAddress::parse("https://vault.elsewhere.example").unwrap();
+    let response = server
+        .client
+        .post(format!("{}/account/server-address", server.base))
+        .bearer_auth(&session.token)
+        .json(&ChangeServerAddressRequest {
+            current_auth_hash: master.auth_hash(&server.address),
+            new_auth_hash: master.auth_hash(&moved),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("Google"), "the refusal should name why");
 }

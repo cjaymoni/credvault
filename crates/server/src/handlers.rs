@@ -10,9 +10,9 @@ use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use credvault_core::identity::normalize_fingerprint;
-use credvault_core::kdf::{normalize_email, validate_auth_hash};
-use credvault_core::{secret, PublicKey, Sealed, WrappedKey};
+use klavyn_core::identity::normalize_fingerprint;
+use klavyn_core::kdf::{normalize_email, validate_auth_hash};
+use klavyn_core::{secret, PublicKey, Sealed, WrappedKey};
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteExecutor, SqlitePool, Transaction};
 use subtle::ConstantTimeEq;
@@ -25,7 +25,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::extract::ApiJson;
 use crate::ratelimit::RateLimiter;
 use crate::{oauth, AppState, RegistrationPolicy};
-use credvault_core::api::*;
+use klavyn_core::api::*;
 
 type Tx = Transaction<'static, sqlx::Sqlite>;
 
@@ -367,7 +367,7 @@ const ABSENT_PUBLIC_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 fn absent_fingerprint() -> String {
     PublicKey::from_base64(ABSENT_PUBLIC_KEY)
         .map(|key| key.fingerprint())
-        .unwrap_or_else(|_| "0".repeat(credvault_core::identity::FINGERPRINT_HEX_LEN))
+        .unwrap_or_else(|_| "0".repeat(klavyn_core::identity::FINGERPRINT_HEX_LEN))
 }
 
 /// One answer for every way a lookup can fail. It must never say which, or it
@@ -599,6 +599,71 @@ async fn verify_and_rehash(
         return Err(ApiError::Unauthorized);
     }
     auth::hash_credential(new.clone()).await
+}
+
+/// Rebind this account's credential to a different server address.
+///
+/// For a server that has moved hostname. The auth hash is derived from the
+/// address as well as the passphrase, so after a move every account holds a
+/// credential for a name this server no longer answers to; this is how one is
+/// exchanged for the other while the old name still works.
+///
+/// Deliberately narrow. It touches one column. No key material is involved —
+/// the encryption keys are not address-bound, so nothing is re-encrypted —
+/// and sessions are left alone, because the passphrase behind them has not
+/// changed.
+///
+/// The server is told the new credential, never the new address. It could not
+/// check an address it was told anyway, and a server that got to *choose* one
+/// could have a client mint a credential for a different server's hostname
+/// and then replay it there. Which address this is for is the person's
+/// decision, made in the client.
+///
+/// # Errors
+///
+/// [`ApiError::Unauthorized`] if the current passphrase does not verify;
+/// [`ApiError::BadRequest`] if either hash is malformed, or if the account
+/// signs in with Google and so has no passphrase-derived credential to move;
+/// [`ApiError::TooManyRequests`] when this account has spent its budget.
+pub async fn change_server_address(
+    State(state): State<AppState>,
+    user: AuthUser,
+    ApiJson(body): ApiJson<ChangeServerAddressRequest>,
+) -> ApiResult<StatusCode> {
+    // One Argon2 verification and one hash, so this is bounded before either.
+    // It shares `password_limiter` with the password change and the Google
+    // link, because all three are passphrase guesses and a third door into
+    // the same budget would widen it.
+    spend_account_budget(&state.password_limiter, user.id, "server address change")?;
+    validate_auth_hash(&body.current_auth_hash)?;
+    validate_auth_hash(&body.new_auth_hash)?;
+
+    let (stored_credential, password_login) = load_credential(&state.pool, user.id).await?;
+    if !password_login {
+        // A Google account's stored hash is random bytes, so there is nothing
+        // here to move and nothing the address binding gates. Saying so beats
+        // a generic rejection the person would read as a wrong passphrase.
+        return Err(ApiError::BadRequest(
+            "this account signs in with Google, so no passphrase is bound to this server's address".into(),
+        ));
+    }
+
+    let presented = body.current_auth_hash.clone();
+    let verified = tokio::task::spawn_blocking(move || auth::verify_credential(&presented, &stored_credential))
+        .await
+        .map_err(ApiError::internal)?;
+    if !verified {
+        return Err(ApiError::Unauthorized);
+    }
+
+    let replacement = auth::hash_credential(body.new_auth_hash.clone()).await?;
+    sqlx::query("UPDATE users SET auth_hash = ? WHERE id = ?")
+        .bind(&replacement)
+        .bind(user.id)
+        .execute(&state.pool)
+        .await?;
+    tracing::info!(user_id = user.id, "server address rebound");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ----- secrets --------------------------------------------------------------
@@ -1303,7 +1368,7 @@ pub async fn decline_invite(
 /// ordinary code path, with the ordinary timing, because the credential simply
 /// does not match — there is no special case to get wrong.
 async fn unusable_credential() -> ApiResult<String> {
-    let random: [u8; 32] = credvault_core::aead::random_bytes();
+    let random: [u8; 32] = klavyn_core::aead::random_bytes();
     auth::hash_credential(Zeroizing::new(BASE64.encode(random))).await
 }
 
@@ -1725,7 +1790,7 @@ pub async fn oauth_link(
         // now sign in. A link nobody can see is a link nobody can revoke.
         Ok(_) => Ok(Json(load_profile(&state.pool, user.id).await?)),
         Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
-            Err(ApiError::Conflict("that Google account, or this credvault account, is already linked".into()))
+            Err(ApiError::Conflict("that Google account, or this klavyn account, is already linked".into()))
         }
         Err(other) => Err(other.into()),
     }

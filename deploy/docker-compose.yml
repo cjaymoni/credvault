@@ -1,27 +1,31 @@
-# Project name is fixed so volume names are predictable (credvault_data,
-# credvault_caddy_data) regardless of the directory this is run from.
-name: credvault
+# Project name is fixed so volume names are predictable (klavyn_data,
+# klavyn_caddy_data) regardless of the directory this is run from.
+#
+# Renaming this project renames its volumes, so a host that ran the credvault
+# stack keeps its data in credvault_data and this one starts empty. Moving it
+# across is a one-time step; see "Renaming from credvault" in README.md.
+name: klavyn
 
-# credvault on a single VPS: Caddy terminates TLS, credvault is reachable only
+# klavyn on a single VPS: Caddy terminates TLS, klavyn is reachable only
 # on the internal network. Nothing but 80/443 is published to the host.
 services:
-  credvault:
+  klavyn:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: credvault-server:local
+    image: klavyn-server:local
     restart: unless-stopped
     environment:
       # Listen on all interfaces *inside the container*; the container itself
       # publishes no ports, so this is not exposed to the internet.
-      CREDVAULT_BIND: 0.0.0.0:8787
-      CREDVAULT_DATA_DIR: /data
+      KLAVYN_BIND: 0.0.0.0:8787
+      KLAVYN_DATA_DIR: /data
       # Rate limits are keyed on the rightmost X-Forwarded-For address, which
       # is the one Caddy appends. Only correct behind the proxy below.
-      CREDVAULT_TRUST_FORWARDED_FOR: "true"
+      KLAVYN_TRUST_FORWARDED_FOR: "true"
       # Who may create an account. Three states, and exactly one of them is
       # what this file ships: a token means holders of it, blank means anyone
-      # who can reach the server, and CREDVAULT_CLOSED_REGISTRATION=true means
+      # who can reach the server, and KLAVYN_CLOSED_REGISTRATION=true means
       # nobody. The server prints which one it is on every start.
       #
       # Both are passed through, because the way to close registration is to
@@ -30,20 +34,20 @@ services:
       # which is the *open* state: the documented way to shut the door would
       # have opened it. Clap refuses both at once, so a stray pair stops the
       # server rather than guessing.
-      CREDVAULT_REGISTRATION_TOKEN: ${CREDVAULT_REGISTRATION_TOKEN:-}
-      CREDVAULT_CLOSED_REGISTRATION: ${CREDVAULT_CLOSED_REGISTRATION:-}
+      KLAVYN_REGISTRATION_TOKEN: ${KLAVYN_REGISTRATION_TOKEN:-}
+      KLAVYN_CLOSED_REGISTRATION: ${KLAVYN_CLOSED_REGISTRATION:-}
       # Optional; both blank keeps the server password-only. Clap requires
       # them together, so a lone value stops the server rather than quietly
       # running without the button.
-      CREDVAULT_GOOGLE_CLIENT_ID: ${CREDVAULT_GOOGLE_CLIENT_ID:-}
-      CREDVAULT_GOOGLE_CLIENT_SECRET: ${CREDVAULT_GOOGLE_CLIENT_SECRET:-}
+      KLAVYN_GOOGLE_CLIENT_ID: ${KLAVYN_GOOGLE_CLIENT_ID:-}
+      KLAVYN_GOOGLE_CLIENT_SECRET: ${KLAVYN_GOOGLE_CLIENT_SECRET:-}
       # Optional, and off when blank: counting how many installations reach
       # this server, on what platform, from what country. Nothing is tied to
       # an account and no address is stored -- see "Counting installations"
       # in the top-level README, and analytics.rs for the whole of it. Setting
       # a key here is a change to what the privacy policy must say.
-      CREDVAULT_POSTHOG_API_KEY: ${CREDVAULT_POSTHOG_API_KEY:-}
-      CREDVAULT_POSTHOG_HOST: ${CREDVAULT_POSTHOG_HOST:-}
+      KLAVYN_POSTHOG_API_KEY: ${KLAVYN_POSTHOG_API_KEY:-}
+      KLAVYN_POSTHOG_HOST: ${KLAVYN_POSTHOG_HOST:-}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - data:/data
@@ -56,13 +60,21 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      CREDVAULT_DOMAIN: ${CREDVAULT_DOMAIN:?set this in .env}
-      CREDVAULT_ACME_EMAIL: ${CREDVAULT_ACME_EMAIL:?set this in .env}
+      KLAVYN_DOMAIN: ${KLAVYN_DOMAIN:?set this in .env}
+      # The marketing site's apex name. Caddy also answers on www and
+      # redirects it here. Required: a blank site address is not valid Caddy
+      # config, so the proxy would refuse to start rather than quietly serve
+      # nothing.
+      KLAVYN_SITE_DOMAIN: ${KLAVYN_SITE_DOMAIN:?set this in .env}
+      KLAVYN_ACME_EMAIL: ${KLAVYN_ACME_EMAIL:?set this in .env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The built static site. Read-only: nothing Caddy serves should be
+      # writable by the process serving it.
+      - ./site:/srv/site:ro
       - caddy_data:/data
       - caddy_config:/config
-    depends_on: [credvault]
+    depends_on: [klavyn]
     networks: [internal]
 
 networks:

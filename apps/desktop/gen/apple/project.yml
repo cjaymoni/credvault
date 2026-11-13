@@ -1,6 +1,6 @@
-name: credvault-desktop
+name: klavyn-desktop
 options:
-  bundleIdPrefix: com.credvault.desktop
+  bundleIdPrefix: com.klavyn.desktop
   deploymentTarget:
     iOS: 15.0
 fileGroups: [../../src]
@@ -10,8 +10,8 @@ configs:
 settingGroups:
   app:
     base:
-      PRODUCT_NAME: credvault
-      PRODUCT_BUNDLE_IDENTIFIER: com.credvault.desktop
+      PRODUCT_NAME: klavyn
+      PRODUCT_BUNDLE_IDENTIFIER: com.klavyn.desktop
 targetTemplates:
   app:
     type: application
@@ -24,7 +24,7 @@ targetTemplates:
     settings:
       groups: [app]
 targets:
-  credvault-desktop_iOS:
+  klavyn-desktop_iOS:
     type: application
     platform: iOS
     sources:
@@ -36,13 +36,13 @@ targets:
       # via LIBRARY_SEARCH_PATHS, never bundled as resources.
       - path: Externals
         excludes: ["**/*.a"]
-      - path: credvault-desktop_iOS
+      - path: klavyn-desktop_iOS
       - path: assets
         buildPhase: resources
         type: folder
       - path: LaunchScreen.storyboard
     info:
-      path: credvault-desktop_iOS/Info.plist
+      path: klavyn-desktop_iOS/Info.plist
       properties:
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
@@ -56,10 +56,10 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.3.1
-        CFBundleVersion: "0.3.1"
+        CFBundleShortVersionString: 0.4.0
+        CFBundleVersion: "0.4.0"
     entitlements:
-      path: credvault-desktop_iOS/credvault-desktop_iOS.entitlements
+      path: klavyn-desktop_iOS/klavyn-desktop_iOS.entitlements
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

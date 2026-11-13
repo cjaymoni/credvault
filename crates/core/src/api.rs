@@ -75,6 +75,14 @@ const REDACTED: &str = "<redacted>";
 /// speaking it can be running somewhere. That is the condition the paragraph
 /// under 2 set for the next change being a 3 rather than an edit to 2.
 ///
+/// 5: `POST /account/server-address` is new. It replaces the stored
+/// credential with one bound to a different server address, for a server
+/// that has moved to a new hostname — see [`crate::kdf::MasterKey::auth_hash`]
+/// for why a move invalidates the old one. Nothing else changed, and older
+/// clients simply do not call it, so `MIN_CLIENT_PROTOCOL` does not move.
+/// `MIN_SERVER_PROTOCOL` does not move either: a client works perfectly
+/// against a protocol-4 server, it just cannot offer the move there.
+///
 /// 4: projects. `/projects` is new — list, create, rename, delete — a
 /// secret says which project it is filed under, and `PUT
 /// /secrets/{id}/project` moves one between projects without touching its
@@ -99,7 +107,7 @@ const REDACTED: &str = "<redacted>";
 /// have minted; `DELETE /sessions` answers with a fresh session too, and now
 /// spares the caller's rather than ending it, so the request that evicts
 /// someone can be followed immediately by the one that locks them out.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The oldest server protocol a client built from this source will talk to.
 ///
@@ -191,9 +199,7 @@ impl Health {
 /// Why this build and a particular server cannot understand each other.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolMismatch {
-    #[error(
-        "this server needs a newer credvault: it serves protocol {required} and later, and this app speaks {speaks}"
-    )]
+    #[error("this server needs a newer klavyn: it serves protocol {required} and later, and this app speaks {speaks}")]
     ClientTooOld { required: u32, speaks: u32 },
     #[error(
         "this server is too old for this app: it speaks protocol {speaks}, and this app needs {required} or later"
@@ -847,6 +853,42 @@ impl fmt::Debug for OAuthRegisterRequest {
 /// proportional to how many secrets are owned rather than to their size. For
 /// the same reason the X25519 identity is untouched: secrets shared *with*
 /// this account, and invites addressed to it, keep working.
+/// Rebind this account's credential to a different server address.
+///
+/// The auth hash is derived from the server's canonical address as well as
+/// the passphrase, so that a credential captured by one server cannot be
+/// replayed against another — see [`crate::kdf::MasterKey::auth_hash`]. The
+/// cost of that is this request: when a server moves to a new hostname, every
+/// account on it holds a credential bound to the name it no longer answers to.
+///
+/// This is deliberately *not* a password change. The passphrase does not
+/// change, and the encryption keys are not bound to the address in the first
+/// place, so no secret is re-encrypted, no key is re-wrapped, and nothing a
+/// client holds becomes stale. Only the stored verifier moves.
+///
+/// Sessions are left alone for the same reason. A password change ends them
+/// because the credential that made them is gone; here the passphrase behind
+/// them is unchanged, so none of them is more suspect afterwards than before.
+///
+/// The caller must prove the current passphrase. A session alone is not
+/// enough: this decides which server address can sign into the account, and a
+/// stolen session must not be able to move it.
+#[derive(Serialize, Deserialize)]
+pub struct ChangeServerAddressRequest {
+    /// Proof of the passphrase, as bound to the address the client is
+    /// *currently* reaching this server at.
+    pub current_auth_hash: Zeroizing<String>,
+    /// The credential to store, as bound to the address the account should
+    /// use from now on.
+    ///
+    /// The client derives this for an address the person confirmed. The
+    /// server never names that address and never asks the client to derive
+    /// for one: a server that could choose it could have a credential minted
+    /// for someone else's hostname and replay it there, which is the single
+    /// thing the address binding exists to prevent.
+    pub new_auth_hash: Zeroizing<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ChangePasswordRequest {
     /// Proof of the current passphrase, for an account that signs in with a
@@ -957,7 +999,7 @@ mod tests {
             Health { protocol: PROTOCOL_VERSION + 5, min_client_protocol: PROTOCOL_VERSION + 1, ..Health::current() };
         let error = check_protocol(&health).unwrap_err();
         assert!(matches!(error, ProtocolMismatch::ClientTooOld { .. }), "{error:?}");
-        assert!(error.to_string().contains("newer credvault"), "{error}");
+        assert!(error.to_string().contains("newer klavyn"), "{error}");
     }
 
     #[test]
@@ -977,7 +1019,7 @@ mod tests {
     /// two-line edit rather than something to remember.
     #[test]
     fn the_protocol_numbers_are_what_this_source_documents() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(MIN_SERVER_PROTOCOL, 4);
         assert_eq!(MIN_CLIENT_PROTOCOL, 1);
     }

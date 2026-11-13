@@ -351,6 +351,22 @@ impl SecretKey {
 mod tests {
     use super::*;
 
+    /// Tripwire for the domain strings in this module. If this fails, a
+    /// derivation or an authenticated label moved, and every blob already
+    /// written under the old one has become unreadable -- by anyone, since
+    /// the server holds only ciphertext and there is no password recovery.
+    ///
+    /// Do NOT update the expected values. These are format identifiers, not
+    /// branding: they are never shown to anyone, and a rename of the product
+    /// must leave them exactly as they are. The WARNING at the top of
+    /// [`crate::kdf`] gives the only supported way to change one, which is a
+    /// versioned migration rather than an edit.
+    #[test]
+    fn domain_strings_are_frozen() {
+        assert_eq!(SELF_WRAP.domain(), b"credvault/aead/self-wrap");
+        assert_eq!(SECRET_PAYLOAD.domain(), b"credvault/aead/secret-payload");
+    }
+
     const NAME: &str = "GitHub";
 
     fn payload() -> SecretPayload {

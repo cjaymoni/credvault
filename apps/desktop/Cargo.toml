@@ -1,19 +1,19 @@
 [package]
-name = "credvault-desktop"
+name = "klavyn-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "credvault desktop app (macOS, Windows, Linux)"
+description = "klavyn desktop app (macOS, Windows, Linux)"
 
 [lib]
-name = "credvault_desktop_lib"
+name = "klavyn_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-credvault-core.workspace = true
+klavyn-core.workspace = true
 tauri = { version = "2", features = [] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"

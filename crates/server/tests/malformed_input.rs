@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use credvault_server::{RateLimits, ServerConfig};
+use klavyn_server::{RateLimits, ServerConfig};
 use reqwest::{Client, Method, StatusCode};
 
 struct TestServer {
@@ -24,7 +24,7 @@ struct TestServer {
 
 async fn spawn() -> TestServer {
     let dir = tempfile::tempdir().unwrap();
-    let pool = credvault_server::connect(&dir.path().join("test.db")).await.unwrap();
+    let pool = klavyn_server::connect(&dir.path().join("test.db")).await.unwrap();
     let config = ServerConfig {
         // High enough that the sweep exercises handlers, not the limiter.
         rate_limits: RateLimits {
@@ -43,7 +43,7 @@ async fn spawn() -> TestServer {
         },
         ..ServerConfig::default()
     };
-    let app = credvault_server::build_router(pool, config);
+    let app = klavyn_server::build_router(pool, config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

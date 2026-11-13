@@ -10,18 +10,18 @@ COPY . .
 # manifest must be present for resolution, but -p keeps it from being compiled.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p credvault-server \
-    && cp /app/target/release/credvault-server /usr/local/bin/credvault-server
+    cargo build --release --locked -p klavyn-server \
+    && cp /app/target/release/klavyn-server /usr/local/bin/klavyn-server
 
 FROM debian:bookworm-slim
 # A fixed uid so the data volume's ownership survives image rebuilds.
-RUN useradd --system --uid 10001 --create-home credvault \
+RUN useradd --system --uid 10001 --create-home klavyn \
     && mkdir -p /data \
-    && chown credvault:credvault /data \
+    && chown klavyn:klavyn /data \
     && chmod 700 /data
-COPY --from=build /usr/local/bin/credvault-server /usr/local/bin/credvault-server
-USER credvault
-ENV CREDVAULT_DATA_DIR=/data
+COPY --from=build /usr/local/bin/klavyn-server /usr/local/bin/klavyn-server
+USER klavyn
+ENV KLAVYN_DATA_DIR=/data
 VOLUME ["/data"]
 EXPOSE 8787
-ENTRYPOINT ["/usr/local/bin/credvault-server"]
+ENTRYPOINT ["/usr/local/bin/klavyn-server"]

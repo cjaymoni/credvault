@@ -1,4 +1,4 @@
-package com.credvault.desktop
+package com.klavyn.desktop
 
 import android.os.Bundle
 import androidx.activity.enableEdgeToEdge

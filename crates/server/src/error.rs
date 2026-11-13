@@ -77,8 +77,8 @@ impl From<serde_json::Error> for ApiError {
 }
 
 /// Crypto errors only arise from validating client-supplied values.
-impl From<credvault_core::CryptoError> for ApiError {
-    fn from(error: credvault_core::CryptoError) -> Self {
+impl From<klavyn_core::CryptoError> for ApiError {
+    fn from(error: klavyn_core::CryptoError) -> Self {
         Self::BadRequest(error.to_string())
     }
 }

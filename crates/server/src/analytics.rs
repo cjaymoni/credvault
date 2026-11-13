@@ -96,6 +96,16 @@ const MAX_USER_AGENT_LEN: usize = 256;
 /// Longest version string accepted out of a `User-Agent`.
 const MAX_VERSION_LEN: usize = 32;
 
+/// How the app may name itself in a `User-Agent`, current spelling first.
+///
+/// The product was renamed from credvault to klavyn. Both are read, because a
+/// server is upgraded before the apps that talk to it are: an app from before
+/// the rename is a real installation, and dropping its spelling would report
+/// every one of them as the unknown build rather than as what it is. Drop
+/// `credvault/` once no build older than the rename is still in use -- the
+/// version in each event is what tells you when that is.
+const CLIENT_NAME_PREFIXES: [&str; 2] = ["klavyn/", "credvault/"];
+
 /// Hex characters of the digest used as a distinct id. 128 bits: far past
 /// collision trouble at this volume, and shorter than a full digest so that
 /// nothing about the id invites being treated as a key.
@@ -166,7 +176,8 @@ impl Default for ClientBuild {
     }
 }
 
-/// Read `credvault/<version> (<platform>)` out of a `User-Agent`.
+/// Read `<name>/<version> (<platform>)` out of a `User-Agent`, for any
+/// name in [`CLIENT_NAME_PREFIXES`].
 ///
 /// Deliberately strict and total: every path returns a [`ClientBuild`] built
 /// from constants and from a version that has been checked character by
@@ -178,7 +189,7 @@ pub fn parse_client_build(user_agent: Option<&str>) -> ClientBuild {
     let Some(user_agent) = user_agent.filter(|value| value.len() <= MAX_USER_AGENT_LEN) else {
         return ClientBuild::default();
     };
-    let Some(rest) = user_agent.strip_prefix("credvault/") else {
+    let Some(rest) = CLIENT_NAME_PREFIXES.iter().find_map(|prefix| user_agent.strip_prefix(prefix)) else {
         return ClientBuild::default();
     };
     let (version, platform) = match rest.split_once(' ') {
@@ -648,9 +659,30 @@ mod tests {
 
     #[test]
     fn a_build_is_read_out_of_the_apps_user_agent() {
-        let build = parse_client_build(Some("credvault/0.1.3 (macos)"));
+        let build = parse_client_build(Some("klavyn/0.1.3 (macos)"));
         assert_eq!(build.platform, "macos");
         assert_eq!(build.version, "0.1.3");
+    }
+
+    /// An app from before the rename still counts as the installation it is.
+    /// If this ever fails, every pre-rename build is silently reported as the
+    /// unknown build -- a cliff in the chart that looks like people leaving.
+    #[test]
+    fn a_build_from_before_the_rename_reads_the_same() {
+        let old = parse_client_build(Some("credvault/0.3.1 (linux)"));
+        let new = parse_client_build(Some("klavyn/0.3.1 (linux)"));
+        assert_eq!(old, new);
+        assert_eq!(old.platform, "linux");
+        assert_eq!(old.version, "0.3.1");
+    }
+
+    /// The prefix has to be the start of the header, not merely present in
+    /// it, under either spelling.
+    #[test]
+    fn a_name_that_only_contains_ours_is_not_ours() {
+        for user_agent in ["notklavyn/1.0.0 (linux)", "evil credvault/1.0.0 (linux)", "x-klavyn/1.0.0 (linux)"] {
+            assert_eq!(parse_client_build(Some(user_agent)), ClientBuild::default(), "{user_agent:?} is not this app");
+        }
     }
 
     #[test]
@@ -671,6 +703,7 @@ mod tests {
             Some("curl/8.4.0"),
             Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"),
             Some("credvault/"),
+            Some("klavyn/"),
         ] {
             assert_eq!(
                 parse_client_build(user_agent),

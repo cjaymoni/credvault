@@ -1,8 +1,10 @@
 {
-	email {$CREDVAULT_ACME_EMAIL}
+	email {$KLAVYN_ACME_EMAIL}
 }
 
-{$CREDVAULT_DOMAIN} {
+# The API. Nothing but /api and /health belongs here, so everything else is
+# refused at the proxy rather than reaching the application.
+{$KLAVYN_DOMAIN} {
 	encode zstd gzip
 
 	header {
@@ -12,15 +14,37 @@
 		-Server
 	}
 
-	# The server exposes /health at the root and everything else under /api.
-	# Anything outside those two is not part of the API; refuse it here rather
-	# than letting it reach the application.
 	@api path /api /api/* /health
 	handle @api {
-		reverse_proxy credvault:8787
+		reverse_proxy klavyn:8787
 	}
 
 	handle {
 		respond "not found" 404
 	}
+}
+
+# The marketing site: static files from ./site, mounted read-only into this
+# container. Separate names rather than paths under the API domain, so adding
+# a page here can never collide with an API route.
+#
+# No Referrer-Policy: unlike the API, this is a public site where referrers
+# are wanted. HSTS still applies -- note includeSubDomains on the apex covers
+# the API subdomain too, which is intended, both are HTTPS-only.
+{$KLAVYN_SITE_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+	}
+
+	root * /srv/site
+	file_server
+}
+
+# One canonical name for the site. www exists because people type it; it is a
+# permanent redirect rather than a second copy of the site.
+www.{$KLAVYN_SITE_DOMAIN} {
+	redir https://{$KLAVYN_SITE_DOMAIN}{uri} permanent
 }

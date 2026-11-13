@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**credvault test service — credvault.alphadesigns.dev**
+**klavyn test service — vault.klavyn.com**
 
 Last updated: 13 November 2026
 
@@ -13,8 +13,8 @@ Status: **test service.** Read "What this test service is" below before you put 
 This service is run by `[OPERATOR NAME]` (`[LEGAL ENTITY, IF ANY]`), referred to
 below as "we" or "us". You can reach us at `[CONTACT EMAIL]`.
 
-The credvault software is open source. Anyone can run their own server. This
-policy covers only the server at `credvault.alphadesigns.dev`, which the test
+The klavyn software is open source. Anyone can run their own server. This
+policy covers only the server at `vault.klavyn.com`, which the test
 builds of the app connect to by default. If you point the app at a different
 server, that server's operator decides what happens to your data, not us.
 

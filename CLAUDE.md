@@ -1,4 +1,4 @@
-# credvault — working notes for Claude
+# klavyn — working notes for Claude
 
 ## Cutting a release
 
@@ -13,6 +13,20 @@ v0.3.0 each carry only a `.dmg` and an `.apk`, both built by hand. Do not push
 a `vX.Y.Z` tag with `git push` unless the user asks for the full pipeline —
 see "What does and does not trigger CI" below.
 
+### 0. If the server side moved, deploy it before publishing anything
+
+Not every release needs this. One that raises `PROTOCOL_VERSION`, renames a
+setting, or moves anything in `deploy/` does: the artifacts are what testers
+install, and the moment they are published people start running them against
+whatever server is live. Migrate and verify the server first — a real sign-in,
+not just `/health`, which answers perfectly well from an empty database — and
+publish only once it is serving.
+
+The 0.4.0 rename is the worst case of this and the reason the step exists.
+Its settings are all renamed, so a server redeployed without its `.env`
+rewritten starts with no registration token, and no token means *open to
+anyone*.
+
 ### 1. Everything is merged to `main` first
 
 Build from `main` after the feature has merged, never from the feature branch.
@@ -22,19 +36,20 @@ Build from `main` after the feature has merged, never from the feature branch.
 
 Six files, and nothing else. Any `0.x` version string elsewhere in the tree is
 a test fixture and must stay frozen (`crates/server/tests/api.rs` sends a
-deliberately fixed `credvault/0.2.0 (linux)` User-Agent; `analytics.rs` has a
-version-parser case).
+deliberately fixed `credvault/0.2.0 (linux)` User-Agent -- which since the
+rename also keeps the pre-rename spelling exercised, so leave the name alone
+as well as the number; `analytics.rs` has a version-parser case).
 
 - `Cargo.toml` — workspace `version`; the crates inherit it with
   `version.workspace = true`, so they cannot drift
 - `apps/desktop/tauri.conf.json`
-- `apps/desktop/gen/apple/credvault-desktop_iOS/Info.plist`
+- `apps/desktop/gen/apple/klavyn-desktop_iOS/Info.plist`
 - `apps/desktop/gen/apple/project.yml`
 - `Cargo.lock` — via `cargo update -w`, never by hand
 - `.github/release-notes.md` — see below
 
 Pick the number honestly. A patch is for a fix. New collection, new public API
-in `credvault-server`, or a new public field on a `pub` struct that is not
+in `klavyn-server`, or a new public field on a `pub` struct that is not
 `#[non_exhaustive]` all require a minor under cargo's 0.x rules — that last one
 is a breaking change for anything constructing the struct by literal from
 outside the crate. 0.3.0 was a minor for exactly those three reasons.
@@ -67,8 +82,8 @@ cd apps/desktop
 cargo tauri build --target universal-apple-darwin --bundles dmg -- --locked
 ```
 
-Produces `target/universal-apple-darwin/release/bundle/dmg/credvault_<version>_universal.dmg`.
-Confirm it really is universal — `lipo -info target/universal-apple-darwin/release/credvault-desktop`
+Produces `target/universal-apple-darwin/release/bundle/dmg/klavyn_<version>_universal.dmg`.
+Confirm it really is universal — `lipo -info target/universal-apple-darwin/release/klavyn-desktop`
 must print `x86_64 arm64`.
 
 **If it fails at `bundle_dmg.sh` with `couldn't unmount "diskN" - Resource busy`:**
@@ -92,7 +107,7 @@ cargo tauri android build --target aarch64 --apk
 
 The output is named `app-universal-release-unsigned.apk` but contains only
 `arm64-v8a` — check with `unzip -l <apk> | grep lib/`. Name the artifact
-`credvault_<version>_arm64.apk`, which is what the notes promise.
+`klavyn_<version>_arm64.apk`, which is what the notes promise.
 
 There is **no signing config** in the Android project, so that APK will not
 install. Align and sign it with the debug keystore — this is what the notes
@@ -103,8 +118,8 @@ Z=$HOME/Library/Android/sdk/build-tools/37.0.0
 "$Z/zipalign" -p -f 4 <unsigned.apk> aligned.apk
 "$Z/apksigner" sign --ks ~/.android/debug.keystore --ks-pass pass:android \
   --ks-key-alias androiddebugkey --key-pass pass:android \
-  --out credvault_<version>_arm64.apk aligned.apk
-"$Z/apksigner" verify --print-certs credvault_<version>_arm64.apk
+  --out klavyn_<version>_arm64.apk aligned.apk
+"$Z/apksigner" verify --print-certs klavyn_<version>_arm64.apk
 ```
 
 Verify prints `CN=Android Debug`. Build the **release** APK and sign it, not a
@@ -142,6 +157,60 @@ then add the Android APK by hand — CI cannot build it.
 `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, and `node --test apps/desktop/ui-tests/`. A commit
 hook also requires a code review pass before pushing.
+
+## Names that must never be renamed
+
+The product is moving from credvault to klavyn. Nine byte strings are staying
+as they are, permanently, and they are not an oversight:
+
+- `SALT_DOMAIN`, `AUTH_INFO`, `ENC_INFO`, `SELF_WRAP_INFO` — `crates/core/src/kdf.rs`
+- `SEALED_BOX_KDF_INFO`, `SEALED_BOX`, `PRIVATE_KEY` — `crates/core/src/identity.rs`
+- `SELF_WRAP`, `SECRET_PAYLOAD` — `crates/core/src/secret.rs`
+
+They all read `b"credvault/kdf/..."` or `b"credvault/aead/..."`, so a
+`s/credvault/klavyn/` over the tree rewrites every one of them. They are HKDF
+info strings and AES-GCM associated data — inputs to the key derivation
+itself. Changing one changes every existing user's keys, and because the
+server holds only ciphertext and there is no password reset, every vault
+written under the old value becomes unreadable by anyone, for good. Backups do
+not help: they hold the same ciphertext.
+
+These are format identifiers, not branding. Nobody ever sees them. An old name
+in a wire format is normal and costs nothing.
+
+Two tripwires guard them: `derivation_is_pinned_to_known_answers` in `kdf.rs`
+covers the first four, and `domain_strings_are_frozen` in `identity.rs` and
+`secret.rs` covers the other five. **A failure there is never fixed by pasting
+in the new value.** Put the constant back, or follow the versioned migration
+path in the WARNING at the top of `kdf.rs` — bump `aead::SEALED_FORMAT` for
+anything that feeds a blob, or `api::PROTOCOL_VERSION` and
+`api::MIN_CLIENT_PROTOCOL` for `AUTH_INFO` — which is a format migration where
+every client re-encrypts, not a rename.
+
+Two more strings were frozen for weaker reasons, and moved with a planned
+rollout rather than never:
+
+- The User-Agent. The app now sends `klavyn/<version> (<platform>)`, and the
+  server reads both spellings — `CLIENT_NAME_PREFIXES` in
+  `crates/server/src/analytics.rs`. The order matters on the way out: a server
+  that reads both must be deployed before any app sending the new one reaches
+  it, or every one of those installs is counted as the unknown build. Drop
+  `credvault/` from that list only once no pre-rename build is still in use;
+  the version on each event is what tells you when that is.
+- The server hostname. `auth_hash` mixes the canonical server address into
+  each user's credential, so moving the app to a new address would lock
+  existing accounts out. `PREVIOUS_DEFAULT_SERVERS` in
+  `apps/desktop/src/lib.rs` is what carries them across: a sign-in that the
+  current binding is refused for retries each superseded default once, and on
+  success exchanges it through `POST /account/server-address`.
+
+  Two rules about that list. It is only ever reached for `DEFAULT_SERVER`
+  itself -- these are credentials for other hostnames, and sending one to
+  whatever address a person typed would hand it exactly the replay the
+  binding exists to prevent. And the addresses in it are this app's own past
+  defaults, shipped in the binary; a server must never get to name one, or it
+  could have a credential minted for someone else's hostname. Empty the list
+  once no account can still be on an old binding.
 
 ## Claims about privacy are load-bearing
 

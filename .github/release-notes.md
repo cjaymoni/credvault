@@ -17,20 +17,38 @@ and are coming from 0.1.x, **upgrade the server first, then the app**.
 
 ## What is new in __TAG__
 
-**The app says which version it is.** Open the account menu — the button
-carrying your own account, which is your address and key fingerprint at the
-foot of the sidebar on macOS, your initial on Windows and Android, and a menu
-icon on Linux — and its last line gives the version the build was cut as.
-There was no way to tell before without going back to the file you installed
-from, which is awkward at exactly the moment it matters: reporting something
-that went wrong.
+**credvault is now klavyn.** Same app, same vault, same people behind it — the
+name changed and nothing else did. The window says klavyn, the installers are
+named `klavyn_*` instead of `credvault_*`, and the maintainer's test server
+has moved to `vault.klavyn.com`.
 
-It is the same number the app sends the server on every request, so what you
-read off your own screen and what the server recorded for you cannot disagree.
+**If you are testing against the maintainer's server, there is nothing to do.**
+Sign in exactly as before, with the same address and the same passphrase. Your
+sign-in credential is tied to the server's name — that is deliberate, so a
+credential given to one server is useless at another — which means the move
+would normally have locked you out. The app carries the account across on your
+next sign-in, by itself, and you will not see it happen. Your secrets are not
+re-encrypted and nothing about them changes: the keys that open your vault
+were never tied to the server's name in the first place.
 
-That is the whole of this release. No storage formats changed, the protocol
-did not move, and the server side is untouched — if you run your own server,
-it needs nothing done to it for this one.
+On macOS this arrives as a separate app rather than an update, because the
+name is part of how the system identifies it. Install it and drag the old one
+to the bin; nothing of yours lives in it. On Android you will have to uninstall
+the old one first, for the same reason.
+
+**If you run your own server, this upgrade has steps.** Every setting is
+renamed from `CREDVAULT_*` to `KLAVYN_*`, the database file and the Docker
+volumes are renamed with it, and a server started without its settings will
+not find them. Read **Renaming from credvault** in
+[deploy/README.md](https://github.com/cjaymoni/klavyn/blob/__TAG__/deploy/README.md)
+before you upgrade, and take a backup first. Nothing is lost if you follow it;
+the names simply have to be carried across deliberately. Your own server's
+address has not changed, so your users are unaffected by the part above.
+
+The protocol moved for one new route, which exists so an account can follow a
+server that changes address. This release does not raise the minimum server
+version — see the warning at the top — so an app from this release still
+works against an older server; it just cannot do that one thing there.
 
 **Two things carried over, because they are easy to miss and neither is new
 enough to announce again.** The app tells whatever server you point it at
@@ -53,15 +71,15 @@ The installers are not code-signed, so each system will question them once.
 
 - **macOS** — open the `.dmg` and drag the app to Applications. The first
   launch is refused. Go to **System Settings → Privacy & Security**, scroll to
-  the message naming credvault, and click **Open Anyway**; the app then starts
+  the message naming klavyn, and click **Open Anyway**; the app then starts
   after one more confirmation and opens normally from then on. (The old
   right-click → **Open** shortcut no longer works for unsigned apps.) If
   macOS says the app "is damaged and can't be opened", that is the quarantine
   flag rather than a bad download — clear it with
-  `xattr -dr com.apple.quarantine /Applications/credvault.app` and try again.
+  `xattr -dr com.apple.quarantine /Applications/klavyn.app` and try again.
 - **Windows** — SmartScreen shows "Windows protected your PC" on the installer.
   Choose **More info**, then **Run anyway**.
-- **Linux** — install the `.deb` with `sudo apt install ./credvault_*.deb`, or
+- **Linux** — install the `.deb` with `sudo apt install ./klavyn_*.deb`, or
   make the `.AppImage` executable (`chmod +x`) and run it.
 - **Android** — download the `.apk` and open it. Android will ask you to allow
   installing from this source; the build is signed with a test key, not a
@@ -95,7 +113,7 @@ still blank.
 
 The address is only a default: whatever you type replaces it and is
 remembered. Running your own server is described in
-[deploy/README.md](https://github.com/cjaymoni/credvault/blob/__TAG__/deploy/README.md),
+[deploy/README.md](https://github.com/cjaymoni/klavyn/blob/__TAG__/deploy/README.md),
 and a server you run has to be 0.2.0 or newer.
 
 To share a secret with someone, both of you need accounts on the same server.

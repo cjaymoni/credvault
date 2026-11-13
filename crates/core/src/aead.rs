@@ -66,6 +66,17 @@ impl<'a> Context<'a> {
         self.what
     }
 
+    /// The purpose string this context authenticates.
+    ///
+    /// Exposed so each module can pin its own domains against an accidental
+    /// rename; see the tripwire tests in `identity` and `secret`, and the
+    /// WARNING at the top of `kdf`. Nothing else should need it: a domain is
+    /// an input to encryption, not information about a blob.
+    #[cfg(test)]
+    pub(crate) const fn domain(&self) -> &'static [u8] {
+        self.domain
+    }
+
     /// The bytes AES-GCM authenticates: the scheme version, the purpose, then
     /// whatever else the blob is bound to.
     ///

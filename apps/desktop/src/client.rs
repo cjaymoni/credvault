@@ -1,6 +1,6 @@
-//! Thin typed HTTP client for the credvault server API.
+//! Thin typed HTTP client for the klavyn server API.
 
-use credvault_core::api::*;
+use klavyn_core::api::*;
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -21,6 +21,12 @@ pub enum ClientError {
     Conflict(String),
     #[error("your session has expired; please log in again")]
     Unauthorized,
+    /// 401 on a request that carried no session: the credential itself was
+    /// refused. Distinct from [`ClientError::Server`] because a caller can act
+    /// on it -- signing in knows to try an older binding -- where a 500 means
+    /// only that this attempt is over.
+    #[error("{0}")]
+    Rejected(String),
     /// 429: throttled by the server, which rejects in middleware before the
     /// handler runs. A caller can therefore be certain nothing happened, which
     /// is the whole reason this is not folded into [`ClientError::Server`].
@@ -48,7 +54,7 @@ pub const PASSWORD_CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// being in the background -- measured on a Galaxy S22 at 5.5 seconds after
 /// the system browser came to the front, logged by the platform as
 /// `Destroyed live tcp sockets for uids={10363}` followed by
-/// `freeze com.credvault.desktop`. Writing to one of those fails at the
+/// `freeze com.klavyn.desktop`. Writing to one of those fails at the
 /// transport, and neither hyper nor this client may retry it, because
 /// `/oauth/callback` and `/register` are not safe to send twice. The user sees
 /// "cannot reach the server" from a server that is answering fine.
@@ -153,7 +159,7 @@ struct ErrorBody {
 
 /// What this app calls itself when it talks to a server.
 ///
-/// `credvault/<version> (<platform>)`, and nothing else. Two things are being
+/// `klavyn/<version> (<platform>)`, and nothing else. Two things are being
 /// traded here, so both are worth writing down.
 ///
 /// What it costs: every server this app is pointed at, and anything in front
@@ -171,8 +177,13 @@ struct ErrorBody {
 ///
 /// The spelling of the platform is `std::env::consts::OS`, which the server's
 /// parser holds to an allow-list of exactly these values.
+///
+/// The name here was `credvault/` before the rename. A server must already
+/// read both spellings before a build sending this one reaches it, or it
+/// counts as the unknown build; `CLIENT_NAME_PREFIXES` in the server's
+/// `analytics` module is the other half of that.
 fn user_agent() -> String {
-    format!("credvault/{} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
+    format!("klavyn/{} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
 }
 
 impl ApiClient {
@@ -317,6 +328,9 @@ impl ApiClient {
         if status == StatusCode::NOT_FOUND {
             return Err(ClientError::NotFound(message));
         }
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(ClientError::Rejected(message));
+        }
         Err(ClientError::Server(message))
     }
 
@@ -368,7 +382,7 @@ impl ApiClient {
     /// The server's protocol numbers. Outside `/api`, so this is the same
     /// document an operator curls.
     ///
-    /// A 200 that is not this document means the far end is not a credvault
+    /// A 200 that is not this document means the far end is not a klavyn
     /// server this build can talk to, so it is reported as an incompatibility
     /// rather than as a malformed response.
     pub async fn health(&self) -> Result<Health, ClientError> {
@@ -397,7 +411,7 @@ impl ApiClient {
     /// reaches a server for the first time can afford to do it.
     pub async fn check_protocol(&self) -> Result<(), ClientError> {
         let health = self.health().await?;
-        credvault_core::api::check_protocol(&health).map_err(|mismatch| ClientError::Incompatible(mismatch.to_string()))
+        klavyn_core::api::check_protocol(&health).map_err(|mismatch| ClientError::Incompatible(mismatch.to_string()))
     }
 
     pub async fn register(&self, body: &RegisterRequest) -> Result<SessionResponse, ClientError> {
@@ -419,6 +433,14 @@ impl ApiClient {
     /// request must not produce.
     pub async fn change_password(&self, body: &ChangePasswordRequest) -> Result<SessionResponse, ClientError> {
         self.send_within(Method::POST, "/password", Some(body), Some(PASSWORD_CHANGE_TIMEOUT)).await
+    }
+
+    /// Rebind this account's credential to a different server address.
+    ///
+    /// No key material moves and no secret is re-encrypted, so unlike a
+    /// password change this is an ordinary small request.
+    pub async fn change_server_address(&self, body: &ChangeServerAddressRequest) -> Result<(), ClientError> {
+        self.send(Method::POST, "/account/server-address", Some(body)).await
     }
 
     pub async fn logout(&self) -> Result<(), ClientError> {

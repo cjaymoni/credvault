@@ -8,7 +8,7 @@
     <application
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:theme="@style/Theme.credvault_desktop"
+        android:theme="@style/Theme.klavyn_desktop"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="${usesCleartextTraffic}">

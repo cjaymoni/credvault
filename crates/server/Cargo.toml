@@ -1,16 +1,16 @@
 [package]
-name = "credvault-server"
+name = "klavyn-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Sync and sharing server for credvault; stores only ciphertext"
+description = "Sync and sharing server for klavyn; stores only ciphertext"
 
 [[bin]]
-name = "credvault-server"
+name = "klavyn-server"
 path = "src/main.rs"
 
 [dependencies]
-credvault-core.workspace = true
+klavyn-core.workspace = true
 axum = "0.8"
 tokio.workspace = true
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }

@@ -1,4 +1,4 @@
-//! credvault app: a Tauri shell around credvault-core, built as a library so the
+//! klavyn app: a Tauri shell around klavyn-core, built as a library so the
 //! desktop binary and the iOS/Android shells share one entry point. All encryption and
 //! decryption happens here; the server only ever receives ciphertext.
 
@@ -13,12 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use credvault_core::aead::KEY_LEN;
-use credvault_core::api::*;
-use credvault_core::identity::{normalize_fingerprint, FINGERPRINT_HEX_LEN};
-use credvault_core::kdf::ServerAddress;
-use credvault_core::secret::CustomField;
-use credvault_core::{kdf, password, secret, Identity, MasterKey, PublicKey, SecretKey, SecretPayload, WrappedKey};
+use klavyn_core::aead::KEY_LEN;
+use klavyn_core::api::*;
+use klavyn_core::identity::{normalize_fingerprint, FINGERPRINT_HEX_LEN};
+use klavyn_core::kdf::ServerAddress;
+use klavyn_core::secret::CustomField;
+use klavyn_core::{kdf, password, secret, Identity, MasterKey, PublicKey, SecretKey, SecretPayload, WrappedKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -452,6 +452,9 @@ impl From<ClientError> for CommandError {
             ClientError::NotFound(_) => "not_found",
             ClientError::Conflict(_) => "conflict",
             ClientError::Unauthorized => "unauthorized",
+            // Same code an older build produced for this, so nothing in the
+            // UI has to learn a new one to keep reporting a bad passphrase.
+            ClientError::Rejected(_) => "server",
             // Handled above, where the wait travels with the code.
             ClientError::TooManyRequests { .. } => "throttled",
             ClientError::InvalidUrl(_) => "invalid_url",
@@ -463,7 +466,7 @@ impl From<ClientError> for CommandError {
 
 type CommandResult<T> = Result<T, CommandError>;
 
-fn user_facing(error: credvault_core::CryptoError) -> CommandError {
+fn user_facing(error: klavyn_core::CryptoError) -> CommandError {
     CommandError::new("crypto", error.to_string())
 }
 
@@ -476,8 +479,8 @@ fn user_facing(error: credvault_core::CryptoError) -> CommandError {
 /// collapsing both into "your data may be corrupted" is worse still. The
 /// format tags carried by every stored blob are what make the two tellable
 /// apart, so this is where that distinction has to be spent.
-fn unlock_failure(error: credvault_core::CryptoError, wrong_passphrase: &str) -> CommandError {
-    use credvault_core::CryptoError;
+fn unlock_failure(error: klavyn_core::CryptoError, wrong_passphrase: &str) -> CommandError {
+    use klavyn_core::CryptoError;
     match error {
         CryptoError::Decrypt => CommandError::new("locked", wrong_passphrase),
         CryptoError::NewerFormat { .. } | CryptoError::UnknownFormat { .. } => user_facing(error),
@@ -603,6 +606,71 @@ async fn register(
     )
 }
 
+/// Where this app points when nobody has chosen a server.
+///
+/// `apps/desktop/ui/app.js` holds the same string for the sign-in form's
+/// placeholder, and `the_default_server_matches_the_one_the_ui_offers` keeps
+/// the two from drifting.
+const DEFAULT_SERVER: &str = "https://vault.klavyn.com";
+
+/// Addresses this app shipped as [`DEFAULT_SERVER`] before the current one.
+///
+/// The auth hash is bound to the server address, so an account created while
+/// the app defaulted to one of these holds a credential for a name the app no
+/// longer uses. Signing in would fail with a wrong-passphrase error for
+/// something that is not the passphrase.
+///
+/// So a sign-in that the current binding is refused for tries each of these
+/// once, and on success exchanges it for the current one. After that the
+/// account is bound to [`DEFAULT_SERVER`] and this list is never reached
+/// again. Empty it once no account can still be on an old binding.
+///
+/// **Only ever reached for [`DEFAULT_SERVER`] itself.** These are credentials
+/// for other hostnames, and the binding exists so that one server cannot use
+/// a credential meant for another. Sending them anywhere the person typed
+/// would hand exactly that to whatever they typed. The addresses here are
+/// this app's own past defaults -- shipped in the binary, by whoever shipped
+/// the binary -- which is why the app may act on them and a server may not.
+const PREVIOUS_DEFAULT_SERVERS: [&str; 1] = ["https://credvault.alphadesigns.dev"];
+
+/// Sign in, carrying an account across a change of server address if needed.
+///
+/// Returns the session, and whether it was reached with a superseded binding
+/// that should now be exchanged.
+async fn login_across_a_move(
+    api: &ApiClient,
+    server_url: &ServerAddress,
+    email: &str,
+    master: &MasterKey,
+) -> Result<(SessionResponse, Option<Zeroizing<String>>), ClientError> {
+    let refused =
+        match api.login(&LoginRequest { email: email.to_string(), auth_hash: master.auth_hash(server_url) }).await {
+            Ok(session) => return Ok((session, None)),
+            Err(error) => error,
+        };
+
+    // Only a refused credential is worth a second attempt: a network failure
+    // or a throttle says nothing about which binding is stored, and retrying
+    // under one would spend another of the account's login attempts.
+    if !matches!(refused, ClientError::Rejected(_)) || server_url.as_str() != DEFAULT_SERVER {
+        return Err(refused);
+    }
+
+    for previous in PREVIOUS_DEFAULT_SERVERS {
+        let Ok(previous) = ServerAddress::parse(previous) else { continue };
+        let legacy = master.auth_hash(&previous);
+        match api.login(&LoginRequest { email: email.to_string(), auth_hash: legacy.clone() }).await {
+            Ok(session) => return Ok((session, Some(legacy))),
+            // Keep the first refusal: it is the one about the current
+            // binding, and it is what the person should be told if no older
+            // one works either.
+            Err(ClientError::Rejected(_)) => continue,
+            Err(other) => return Err(other),
+        }
+    }
+    Err(refused)
+}
+
 #[tauri::command]
 async fn login(
     state: State<'_, AppState>,
@@ -613,17 +681,28 @@ async fn login(
     let server_url = normalize_server_url(&server_url)?;
     let api = connect(&server_url).await?;
     let master = derive_master(password, email.clone()).await?;
-    let session = api.login(&LoginRequest { email, auth_hash: master.auth_hash(&server_url) }).await?;
+    let (session, superseded) = login_across_a_move(&api, &server_url, &email, &master).await?;
+    let api = api.with_token(&session.token);
+
+    // Signed in on an old binding: exchange it now, while the passphrase that
+    // proves it is still in hand. Best-effort on purpose -- the person is
+    // already in, and a server too old to have the route, or one that throttles
+    // this, must not turn a successful sign-in into a failed one. The next
+    // sign-in tries again.
+    if let Some(current_auth_hash) = superseded {
+        let request = ChangeServerAddressRequest { current_auth_hash, new_auth_hash: master.auth_hash(&server_url) };
+        match api.change_server_address(&request).await {
+            Ok(()) => tracing::info!(server = %server_url.as_str(), "account rebound to the current server address"),
+            Err(error) => tracing::warn!(%error, "could not rebind the account to the current server address"),
+        }
+    }
+
     let identity =
         Identity::decrypt_private_key(&master.private_key_encryption_key(), &session.user.encrypted_private_key)
             .map_err(|error| unlock_failure(error, "that password does not unlock this vault"))?;
-    install_session(
-        &state,
-        api.with_token(&session.token),
-        AccountFacts::of(&session.user),
-        identity,
-        master.self_wrap_key(),
-    )
+    // Already carries the token: installed above, so the rebind could be sent
+    // on it.
+    install_session(&state, api, AccountFacts::of(&session.user), identity, master.self_wrap_key())
 }
 
 fn summary_of(session: &Session) -> UserSummary {
@@ -1257,7 +1336,7 @@ async fn google_create_account(
     )
 }
 
-/// Bind a Google account to the credvault account already signed in, so it can
+/// Bind a Google account to the klavyn account already signed in, so it can
 /// use the button next time.
 ///
 /// The account email is left as it is: it is the salt the vault key comes
@@ -1354,6 +1433,13 @@ struct PassphraseProof {
     /// deriving a second hash cannot bind it to a different server than the
     /// first — which would rebind the account's credential to an address the
     /// user never signs in at.
+    ///
+    /// [`change_server_address`] is the one deliberate exception, and binds
+    /// its second hash to an address the person typed. What makes that safe
+    /// is not this field but where the other address comes from: a person
+    /// who decided to move, never a server that asked to be moved to. A
+    /// server that could name it could have a credential minted for someone
+    /// else's hostname and replay it there.
     server: ServerAddress,
     /// The account address, which is the key-derivation salt. On the proof
     /// for the same reason as `server`: a caller deriving a second key must
@@ -1493,6 +1579,61 @@ fn app_version() -> String {
 /// `locked` if the current passphrase is wrong, `conflict` if the vault
 /// changed while re-wrapping (refresh and try again), `crypto` if the new
 /// passphrase fails the length floor.
+/// Move this account to a server that has changed address.
+///
+/// The auth hash binds to the server's address, so when a server moves
+/// hostname every account on it holds a credential for a name it no longer
+/// answers to. Run while still signed in at the old address, this exchanges
+/// one for the other.
+///
+/// `new_server_url` is the person's assertion, not the server's. Nothing here
+/// reads an address out of a response, and nothing should: the binding exists
+/// so that a credential given to one server is useless at another, and a
+/// server that could choose the address would be choosing whose credential it
+/// gets to mint. The UI shows the address this will bind to before asking.
+///
+/// Nothing in the vault changes — the encryption keys are not address-bound —
+/// so there is nothing to re-wrap and no conflict to lose a race against.
+///
+/// The session stays open against the old address, which still works until
+/// the operator retires it. The account signs in at the new address from now
+/// on, so the caller should point the app there next.
+///
+/// # Errors
+/// `locked` if the passphrase is not this session's, `crypto` if
+/// `new_server_url` is not a usable address, `invalid` if it is the address
+/// already in use or the account signs in with Google.
+#[tauri::command]
+async fn change_server_address(
+    state: State<'_, AppState>,
+    current: Zeroizing<String>,
+    new_server_url: String,
+) -> CommandResult<()> {
+    let new_server = normalize_server_url(&new_server_url)?;
+
+    let PassphraseProof { api, server, password_login, auth_hash: current_auth_hash, master, .. } =
+        prove_current_passphrase(&state, current).await?;
+
+    if !password_login {
+        return Err(CommandError::new(
+            "invalid",
+            "this account signs in with Google, so no passphrase is bound to this server's address",
+        ));
+    }
+    if new_server == server {
+        return Err(CommandError::new("invalid", "this account already signs in at that address"));
+    }
+
+    // Both hashes come off the one proof, so they share a passphrase and a
+    // salt; only the address differs, which is the whole point here.
+    api.change_server_address(&ChangeServerAddressRequest {
+        current_auth_hash,
+        new_auth_hash: master.auth_hash(&new_server),
+    })
+    .await?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn change_password(
     state: State<'_, AppState>,
@@ -2143,7 +2284,7 @@ async fn lookup_invitee(
         None => pinned_fingerprint(&state, api.base_url(), &email)?.ok_or_else(|| {
             CommandError::new(
                 "fingerprint_required",
-                "ask them to read the \"Your key\" fingerprint from the top of their credvault window, and enter it \
+                "ask them to read the \"Your key\" fingerprint from the top of their klavyn window, and enter it \
                  here. You only need to do this the first time you share with someone.",
             )
         })?,
@@ -2428,6 +2569,7 @@ pub fn run() {
             google_link,
             google_unlink,
             change_password,
+            change_server_address,
             refresh_account,
             session_info,
             startup_warnings,
@@ -2459,11 +2601,59 @@ pub fn run() {
             decline_invite,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running credvault");
+        .expect("error while running klavyn");
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The sign-in form offers a default, and so does this file. Two copies of
+    /// one address drift, and the way they drift here is silent: the UI sends
+    /// people to one server while [`PREVIOUS_DEFAULT_SERVERS`] guards the
+    /// other, so the migration never fires and every pre-move account reports
+    /// a wrong passphrase.
+    #[test]
+    fn the_default_server_matches_the_one_the_ui_offers() {
+        let ui = include_str!("../ui/app.js");
+        let line = ui
+            .lines()
+            .find(|line| line.starts_with("const DEFAULT_SERVER"))
+            .expect("ui/app.js declares a DEFAULT_SERVER");
+        assert!(
+            line.contains(&format!("\"{DEFAULT_SERVER}\"")),
+            "ui/app.js offers {line:?}, this file offers {DEFAULT_SERVER:?}"
+        );
+    }
+
+    /// A superseded address must not also be the current one. If it were, a
+    /// refused sign-in would retry the identical credential and the second
+    /// refusal would spend another of the account's login attempts for
+    /// nothing.
+    #[test]
+    fn no_previous_address_is_the_current_one() {
+        let current = ServerAddress::parse(DEFAULT_SERVER).expect("the default is a usable address");
+        for previous in PREVIOUS_DEFAULT_SERVERS {
+            let previous = ServerAddress::parse(previous).expect("every previous default is a usable address");
+            assert_ne!(previous, current, "{previous:?} is still the current default");
+        }
+    }
+
+    /// Each superseded address really does produce a different credential.
+    /// If one canonicalised to the same string as the current default, the
+    /// migration would be exchanging a credential for itself.
+    #[test]
+    fn every_previous_address_is_a_different_credential() {
+        let master = MasterKey::derive("correct horse battery staple", "kat@example.com").unwrap();
+        let current = ServerAddress::parse(DEFAULT_SERVER).unwrap();
+        for previous in PREVIOUS_DEFAULT_SERVERS {
+            let previous = ServerAddress::parse(previous).unwrap();
+            assert_ne!(
+                *master.auth_hash(&previous),
+                *master.auth_hash(&current),
+                "{previous:?} derives the same credential as the current default"
+            );
+        }
+    }
     use super::*;
 
     /// The value a plist gives `key`, read as text.
@@ -2512,7 +2702,7 @@ mod tests {
             serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json is not valid JSON");
         assert_eq!(bundled["version"].as_str(), Some(crate_version.as_str()), "tauri.conf.json");
 
-        let plist = include_str!("../gen/apple/credvault-desktop_iOS/Info.plist");
+        let plist = include_str!("../gen/apple/klavyn-desktop_iOS/Info.plist");
         let project = include_str!("../gen/apple/project.yml");
         for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
             assert_eq!(plist_string(plist, key), crate_version, "Info.plist {key}");
@@ -2631,7 +2821,7 @@ mod tests {
     /// run.
     #[test]
     fn a_vault_from_another_scheme_is_not_reported_as_a_bad_passphrase() {
-        use credvault_core::CryptoError;
+        use klavyn_core::CryptoError;
 
         let wrong_key = unlock_failure(CryptoError::Decrypt, "that password does not unlock this vault");
         assert_eq!(wrong_key.code, "locked");
@@ -2686,7 +2876,7 @@ mod tests {
             user_id: 1,
             email: "me@example.com".into(),
             identity,
-            self_wrap_key: Zeroizing::new(credvault_core::aead::random_bytes()),
+            self_wrap_key: Zeroizing::new(klavyn_core::aead::random_bytes()),
             keys: HashMap::new(),
             password_login: true,
             google_email: None,

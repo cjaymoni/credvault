@@ -1,4 +1,4 @@
-/* credvault: one look per platform (the v2 design board).
+/* klavyn: one look per platform (the v2 design board).
 
    boot.js sets data-platform on <html> before the first frame: macos,
    windows, linux (GNOME), ios or android. This file loads after styles.css

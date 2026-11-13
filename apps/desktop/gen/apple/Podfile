@@ -1,13 +1,13 @@
 # Uncomment the next line to define a global platform for your project
 
-target 'credvault-desktop_iOS' do
+target 'klavyn-desktop_iOS' do
 platform :ios, '15.0'
-  # Pods for credvault-desktop_iOS
+  # Pods for klavyn-desktop_iOS
 end
 
-target 'credvault-desktop_macOS' do
+target 'klavyn-desktop_macOS' do
 platform :osx, '11.0'
-  # Pods for credvault-desktop_macOS
+  # Pods for klavyn-desktop_macOS
 end
 
 # Delete the deployment target for iOS and macOS, causing it to be inherited from the Podfile

@@ -56,6 +56,18 @@ test("the most specific extension decides, not the shortest", () => {
   assert.equal(platformOf("credvault.app.tar.gz"), "macos");
 });
 
+// The product was renamed, so releases carry `klavyn_*` where the fixtures
+// above carry `credvault_*`. Those older names are kept deliberately: they
+// are what is actually attached to the releases this script still counts.
+// This says the rename changed nothing, because the rule is the suffix and
+// never the name in front of it.
+test("the product name in an asset is not what decides its platform", () => {
+  assert.equal(platformOf("klavyn_0.4.0_universal.dmg"), platformOf("credvault_0.1.3_aarch64.dmg"));
+  assert.equal(platformOf("klavyn_0.4.0_arm64.apk"), "android");
+  assert.equal(platformOf("klavyn.app.tar.gz"), "macos");
+  assert.equal(platformOf("klavyn_0.4.0_amd64.deb"), "linux");
+});
+
 test("an asset nobody anticipated is not given an invented platform", () => {
   for (const asset of ["latest.json", "credvault-0.1.3.sha256", "SOURCE.tar.gz", "", "credvault"]) {
     assert.equal(platformOf(asset), "other", JSON.stringify(asset));
@@ -259,7 +271,7 @@ test("nothing to send makes no request at all", async (t) => {
 // is less dangerous than a half-delivered send. It is still the other place
 // this script branches, and the page-walking is easy to get subtly wrong.
 
-const A_REPO = "cjaymoni/credvault";
+const A_REPO = "cjaymoni/klavyn";
 
 /// `RELEASES_PER_PAGE` is not exported; the script's page size is 100, and a
 /// short page is what tells it to stop.

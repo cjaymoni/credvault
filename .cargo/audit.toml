@@ -41,7 +41,7 @@ ignore = [
     # 0600 (crates/server/src/main.rs; both are #[cfg(unix)], which covers
     # every platform this is deployed on -- the image is debian:bookworm-slim).
     # No request can introduce a database file, name one, or influence which
-    # one is opened: the path is `--data-dir`, or `$HOME/.credvault-server`
+    # one is opened: the path is `--data-dir`, or `$HOME/.klavyn-server`
     # when the flag is absent, and either way it comes from whoever starts the
     # process rather than from anything sent to it. The only person who can
     # put a foreign database there is whoever runs the server, restoring their

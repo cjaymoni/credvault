@@ -17,63 +17,35 @@ and are coming from 0.1.x, **upgrade the server first, then the app**.
 
 ## What is new in __TAG__
 
-**Counting how many builds reach the server.** The app has always asked the
-server which sign-in methods it offers, before the sign-in screen is drawn.
-It now says which version of the app is asking and which operating system it
-is on, the way a web browser does, and the test server counts those requests.
+**The app says which version it is.** Open the account menu — the button
+carrying your own account, which is your address and key fingerprint at the
+foot of the sidebar on macOS, your initial on Windows and Android, and a menu
+icon on Linux — and its last line gives the version the build was cut as.
+There was no way to tell before without going back to the file you installed
+from, which is awkward at exactly the moment it matters: reporting something
+that went wrong.
 
-The point of it is dull and practical: installers were being downloaded and
-nothing said whether anybody ran them, on what, or whether old builds were
-still in use.
+It is the same number the app sends the server on every request, so what you
+read off your own screen and what the server recorded for you cannot disagree.
 
-**It is a trend, not a headcount.** Everyone in one office behind a single
-internet connection counts as one. A laptop that moves between home, a train
-and an office counts as several. Updating the app reads as a new
-installation. It tells us which platforms and which versions are in use; it
-does not tell us how many people there are, and we are not going to pretend
-otherwise.
+That is the whole of this release. No storage formats changed, the protocol
+did not move, and the server side is untouched — if you run your own server,
+it needs nothing done to it for this one.
 
-What each count holds: the operating system, the app version, the country the
-request came from, the time, and a scrambled reference number. The scrambling
-uses a random value the server makes up, keeps only in memory and replaces
-every midnight UTC, so two requests from you on the same day look like one
-installation and the same two a day apart cannot be recognised as related, by
-us or by anyone we send them to. Your IP address is used to produce that
-number and is then discarded — it is not part of the count. The ordinary web
-server logs still record it for 14 days, as they always have; the privacy
-policy covers that, and this changes nothing about it.
-
-What is **not** counted: anything to do with your account or your vault.
-Signing in, creating a secret, reading one, sharing one — none of it is
-counted anywhere. The counting happens before you have signed in, so there is
-no account for it to be attached to, and vault contents were never readable
-by the server in the first place.
-
-**The version and platform go to whatever server you point the app at**, on
-every request, not only the one described above. That is one line of ordinary
-HTTP and no more than a web browser sends, but it is new, and a server you do
-not run will see it.
-
-Separately, how many times each installer has been downloaded from the
-releases page is now recorded too. GitHub has always counted that and the
-count has always been public; it says nothing about who downloaded anything.
-
-The privacy policy in the app describes all of this. It previously said the
-service used no analytics at all, which was true when it was written and is
-not any more, so it was rewritten rather than left standing.
-
-A server you run yourself counts nothing unless you switch it on and point it
-at your own analytics project. It is off by default and makes no outbound
-analytics request at all.
-
-**A reminder carried over from 0.2.0, because projects still ship and this is
-easy to miss:** a project's name is stored unencrypted, the same way a
-secret's name already is, because the server has to be able to send back a
-heading it can draw. So whoever runs the server can see that you keep a
-project called Perspectiv and which of your secrets are filed under it. The
-secrets themselves are unchanged: still encrypted on your device, still
-unreadable to the server. If a grouping is itself sensitive, do not put it in
-a project name. This is now in the privacy policy as well, where it belongs.
+**Two things carried over, because they are easy to miss and neither is new
+enough to announce again.** The app tells whatever server you point it at
+which version and which operating system it is, on every request, and the
+maintainer's test server counts those requests as a rough trend — never
+anything about your account or your vault. A server you run yourself counts
+nothing at all unless you switch it on and point it at your own analytics
+project: it is off by default and makes no outbound analytics request. And a
+project's name is stored unencrypted, the same way a secret's name already is,
+so whoever runs the server can see that you keep a project called Perspectiv
+and which of your secrets are filed under it; the secrets themselves stay
+encrypted on your device. If a grouping is itself sensitive, do not put it in
+a project name. The count and the project names are described in full in the
+privacy policy, which the app shows you before you sign up and again from
+**Terms and privacy** in the account menu.
 
 ## Installing
 

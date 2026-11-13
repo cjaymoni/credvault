@@ -1,0 +1,60 @@
+# Sends GitHub's per-asset download totals to PostHog, once a day.
+#
+# GitHub reports a running total per release asset and nothing more -- no
+# country, no referrer, nothing about who downloaded what -- so this is a
+# count of files fetched and not a count of people. The matching count of
+# installations that then ran and reached a server comes from the server
+# itself; see crates/server/src/analytics.rs for what that does and does not
+# collect.
+#
+# Does nothing until POSTHOG_API_KEY is set as a repository secret, so a fork
+# runs this workflow to a clean no-op rather than to someone else's project.
+name: Release downloads
+
+on:
+  schedule:
+    # Daily, well off the hour. GitHub's counts are cumulative and this sends
+    # the total as it stands, so a missed run loses nothing but a data point.
+    - cron: "37 4 * * *"
+  # For checking a change to the script without waiting for the schedule.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-downloads
+  cancel-in-progress: false
+
+jobs:
+  send:
+    name: Send download totals to PostHog
+    runs-on: ubuntu-22.04
+    # A scheduled workflow keeps running on the default branch of every fork
+    # that enables Actions. Without this, a fork with its own secret would be
+    # reporting this repository's releases into its own project, and a fork
+    # without one would fail nightly for no reason.
+    if: github.repository_owner == 'cjaymoni'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: "26"
+
+      - name: Send download totals
+        env:
+          # A PostHog *project* key, which is meant to be public, not a
+          # personal API key. It is a secret here so that a fork does not
+          # inherit it and so that it is not in the log.
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_HOST: ${{ vars.POSTHOG_HOST }}
+          # Only to raise the API rate limit; the releases endpoint is public
+          # and this works without it.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "${POSTHOG_API_KEY}" ]; then
+            echo "POSTHOG_API_KEY is not set; nothing to send."
+            exit 0
+          fi
+          node scripts/release-downloads.js

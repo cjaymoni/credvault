@@ -10,6 +10,7 @@ use credvault_core::api::{check_opaque_oauth_value, NotAnOpaqueValue, MAX_OPAQUE
 /// to recognise the value by, short enough that a huge variable cannot be
 /// printed in full.
 const ECHOED_PREFIX_LEN: usize = 80;
+use credvault_server::analytics::Analytics;
 use credvault_server::oauth::{GoogleConfig, GoogleProvider};
 use credvault_server::{RateLimits, RegistrationPolicy, ServerConfig};
 use zeroize::Zeroizing;
@@ -53,6 +54,26 @@ struct Args {
     /// inside the desktop app.
     #[arg(long, env = "CREDVAULT_GOOGLE_CLIENT_SECRET", requires = "google_client_id", hide_env_values = true)]
     google_client_secret: Option<String>,
+
+    /// PostHog project API key. Setting it switches on anonymous reach
+    /// telemetry: one event per app that asks this server what it supports,
+    /// carrying a platform, an app version, a country, and an id that stops
+    /// being derivable when the day rolls over. No account, no address, and
+    /// nothing from anybody's vault -- `credvault_server::analytics` is the
+    /// whole of it. Unset, which is the default, means no outbound request is
+    /// ever made.
+    ///
+    /// This is a *project* key, meant to be shipped to clients by design, not
+    /// a personal API key. It is still declared hidden so an operator who
+    /// pastes the wrong one does not find it in a startup log.
+    #[arg(long, env = "CREDVAULT_POSTHOG_API_KEY", hide_env_values = true)]
+    posthog_api_key: Option<String>,
+
+    /// Where to send that telemetry. Defaults to PostHog's EU cloud; set it to
+    /// `https://us.i.posthog.com` for the US region, or to your own address
+    /// for a self-hosted PostHog. Ignored without a key.
+    #[arg(long, env = "CREDVAULT_POSTHOG_HOST", default_value = credvault_server::analytics::DEFAULT_HOST)]
+    posthog_host: String,
 }
 
 /// Build the Google provider when both halves of the credential are present.
@@ -156,12 +177,18 @@ fn google_provider(
 /// the compose file interpolates. The trimming inside `registration_policy`
 /// and `google_provider` stays as well: this handles the parse, those handle
 /// a value that arrives with a stray newline.
-const BLANK_MEANS_UNSET: [&str; 5] = [
+const BLANK_MEANS_UNSET: [&str; 7] = [
     "CREDVAULT_CLOSED_REGISTRATION",
     "CREDVAULT_TRUST_FORWARDED_FOR",
     "CREDVAULT_REGISTRATION_TOKEN",
     "CREDVAULT_GOOGLE_CLIENT_ID",
     "CREDVAULT_GOOGLE_CLIENT_SECRET",
+    "CREDVAULT_POSTHOG_API_KEY",
+    // Not merely tidy: this one has a `default_value`, and an empty string
+    // from compose would otherwise be a present value that overrides it --
+    // the server would refuse to start over a host that is not a URL, for a
+    // variable the operator never filled in.
+    "CREDVAULT_POSTHOG_HOST",
 ];
 
 /// The two settings clap parses as `bool`, which it accepts only as exactly
@@ -296,11 +323,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let oauth = google_provider(args.google_client_id, args.google_client_secret)?;
     tracing::info!(google_sign_in = oauth.is_some(), "authentication methods");
+
+    // Said at info on every start, in both states, for the same reason the
+    // registration policy is: whether a server is reporting anything is a
+    // question an operator must be able to answer by reading a log line,
+    // not by failing to find one.
+    let analytics = match args.posthog_api_key.map(|key| key.trim().to_string()).filter(|key| !key.is_empty()) {
+        Some(key) => {
+            let started = Analytics::start(key, &args.posthog_host)?;
+            tracing::info!(host = %args.posthog_host, "anonymous reach telemetry is on");
+            if !args.trust_forwarded_for {
+                // Country comes from a header only a proxy may be believed
+                // about. Without --trust-forwarded-for the events still go,
+                // and every one of them has no country -- which looks like
+                // PostHog being broken rather than like a setting being off.
+                tracing::warn!(
+                    "telemetry is on without --trust-forwarded-for, so no event will carry a country; \
+                     set that flag if a reverse proxy sets CF-IPCountry"
+                );
+            }
+            Some(started)
+        }
+        None => {
+            tracing::info!("anonymous reach telemetry is off");
+            None
+        }
+    };
+
     let config = ServerConfig {
         registration,
         trust_forwarded_for: args.trust_forwarded_for,
         rate_limits: RateLimits::default(),
         oauth: oauth.map(|provider| provider as Arc<dyn credvault_server::oauth::OAuthProvider>),
+        analytics,
     };
 
     let app = credvault_server::build_router(pool, config);

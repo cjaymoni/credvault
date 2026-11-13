@@ -181,12 +181,29 @@ fn warn_once_about_direct_request(peer: IpAddr) {
     }
 }
 
+/// Whether the headers a proxy writes may be believed on this request.
+///
+/// Both halves of the question: the operator said a proxy is in front, *and*
+/// this request actually arrived from one. Either alone is not enough, and
+/// the second is what stops a direct client forging whatever the first would
+/// make us trust.
+///
+/// Public because it governs more than the address now. Anything read out of
+/// a proxy-written header -- `X-Forwarded-For` here, `CF-IPCountry` in
+/// [`crate::analytics`] -- has to ask this same question, and asking it in one
+/// place is what stops the two drifting apart. They did drift: the country
+/// was once gated on the flag alone, so a direct client could put itself in
+/// any country it liked on a route that is not rate limited.
+pub fn forwarded_headers_are_trusted(peer: SocketAddr, trust_forwarded_for: bool) -> bool {
+    trust_forwarded_for && is_trusted_proxy(peer.ip())
+}
+
 /// Resolve the address a request should be limited by.
 pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trust_forwarded_for: bool) -> IpAddr {
     if !trust_forwarded_for {
         return peer.ip();
     }
-    if !is_trusted_proxy(peer.ip()) {
+    if !forwarded_headers_are_trusted(peer, trust_forwarded_for) {
         warn_once_about_direct_request(peer.ip());
         return peer.ip();
     }
@@ -346,6 +363,22 @@ mod tests {
             );
         }
         assert_eq!(limiter.tracked(), 1, "every request shared one bucket");
+    }
+
+    /// The gate every proxy-written header now goes through. The country in
+    /// an analytics event used to be read on the flag alone, which meant a
+    /// client connecting directly could claim any country it liked on a route
+    /// with no rate limit in front of it. Both callers ask this one function
+    /// so the two cannot drift apart again.
+    #[test]
+    fn a_forwarded_header_is_trusted_only_from_a_proxy_the_operator_vouched_for() {
+        let proxy: SocketAddr = "10.0.0.4:52000".parse().unwrap();
+        let direct: SocketAddr = "198.51.100.7:52000".parse().unwrap();
+
+        assert!(forwarded_headers_are_trusted(proxy, true), "a private peer with the flag set is the proxy");
+        assert!(!forwarded_headers_are_trusted(direct, true), "a public peer is not a proxy whatever it sends");
+        assert!(!forwarded_headers_are_trusted(proxy, false), "without the flag nothing forwarded is believed");
+        assert!(!forwarded_headers_are_trusted(direct, false));
     }
 
     /// The same header from a proxy on the private network is still believed,

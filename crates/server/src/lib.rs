@@ -1,6 +1,7 @@
 //! credvault sync server: accounts, encrypted secrets, and sharing invites.
 
 pub use credvault_core::api;
+pub mod analytics;
 pub mod auth;
 pub mod error;
 mod extract;
@@ -20,6 +21,7 @@ use sqlx::SqlitePool;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+use analytics::Analytics;
 use oauth::OAuthProvider;
 use ratelimit::{AuthLimit, RateLimiter};
 
@@ -152,6 +154,12 @@ pub struct ServerConfig {
     /// secret. `None` leaves the OAuth endpoints answering 404 and the
     /// capabilities endpoint reporting that the button should not be shown.
     pub oauth: Option<Arc<dyn OAuthProvider>>,
+    /// Anonymous reach telemetry, when the operator has configured a PostHog
+    /// key. `None` -- the default, and so the state of every server nobody has
+    /// deliberately switched this on for -- means no outbound request is ever
+    /// made and nothing is counted. See [`analytics`] for what is and is not
+    /// collected when it is set.
+    pub analytics: Option<Arc<Analytics>>,
 }
 
 impl ServerConfig {

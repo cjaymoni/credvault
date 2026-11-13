@@ -335,10 +335,50 @@ Options (each also settable as an environment variable):
 | `--registration-token TOKEN` | `CREDVAULT_REGISTRATION_TOKEN` | Only people who enter this token can create an account. Recommended for any server others can reach. |
 | `--closed-registration` | `CREDVAULT_CLOSED_REGISTRATION` | No new accounts at all. |
 | `--trust-forwarded-for` | `CREDVAULT_TRUST_FORWARDED_FOR` | Rate-limit by the rightmost `X-Forwarded-For` address. Only behind a reverse proxy that sets that header. |
+| `--posthog-api-key KEY` | `CREDVAULT_POSTHOG_API_KEY` | Switch on anonymous reach telemetry. Off unless set, which is the state of every server nobody has deliberately turned it on for. See below. |
+| `--posthog-host URL` | `CREDVAULT_POSTHOG_HOST` | Where that telemetry goes. Defaults to PostHog's EU cloud; set it to `https://us.i.posthog.com`, or to your own PostHog. Ignored without a key. |
 
 Login and registration are rate limited per client address (10 logins then
 one every 6 s; 5 registrations then one per minute). The data directory is
 created with owner-only permissions.
+
+### Counting installations
+
+With `--posthog-api-key` set, the server counts one event each time an app
+asks it what it supports — which the app does on startup, before the sign-in
+screen and so before there is any account to attribute it to. Each event
+carries the operating system, the app version, the country the request came
+from, and an opaque id derived from the client address, the app build, the
+day, and a random salt. The address itself is used to compute that id and is
+then dropped; it is never stored or sent.
+
+The salt is held only in memory and is overwritten with fresh bytes at
+midnight UTC. A timer does that, not the next request to arrive: rotating
+lazily would leave a quiet server holding last week's salt all week, which is
+the opposite of what the policy promises. A restart also starts a fresh one.
+So two requests are recognisable as one installation within a single day, and
+once the day has passed nobody can recompute yesterday's ids — not PostHog,
+and not whoever holds this machine, because the only copy the process keeps
+has been overwritten.
+That is enough to count installations and not enough to follow one. No
+authenticated route reports anything, PostHog is told not to keep a profile
+and not to geolocate, and there is no third-party script anywhere in the app.
+
+What the number actually counts, since it will be read as an install base and
+is not one: distinct (address, build) pairs per day, with IPv6 folded to a
+/64 the way the rate limiter folds it. Twenty people behind one office NAT
+count as one; a laptop moved between home, a train and an office counts as
+three. A usable trend and a poor absolute.
+
+Country comes from `CF-IPCountry`, which is only believed when
+`--trust-forwarded-for` says a proxy is in front; without it every event is
+sent with no country, and the server says so at startup.
+
+`crates/server/src/analytics.rs` is the whole of it, and
+`scripts/release-downloads.js` is the separate, nightly job that copies
+GitHub's per-asset download totals into the same PostHog project. Those two
+numbers answer different questions and must not be added together: one counts
+files fetched, the other counts installations that ran and found a server.
 
 Open the desktop app, enter the server URL, your email, and a password of at
 least 12 characters, then click **Create account** (enter the registration

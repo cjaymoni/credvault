@@ -251,6 +251,95 @@ fn normalize_env() {
     }
 }
 
+/// The settings prefix this server read before the product was renamed, and
+/// the one it reads now.
+const SUPERSEDED_PREFIX: &str = "CREDVAULT_";
+const SETTINGS_PREFIX: &str = "KLAVYN_";
+
+/// Settings an operator is still supplying under their pre-rename names while
+/// the current name is unset, returned as `(old, new)` sorted by old name.
+///
+/// Nothing reads `CREDVAULT_*` any more, so such a variable is not a setting
+/// with an old spelling: it is a setting that is not in force, while the
+/// operator's `.env` and their memory both say it is. That direction is the
+/// dangerous one. `KLAVYN_REGISTRATION_TOKEN` absent means [`RegistrationPolicy::Open`]
+/// -- a public vault anyone may create an account on -- and `KLAVYN_BIND`
+/// absent means loopback, so the same `.env` that closed registration before
+/// the rename opens it after, and the server logs nothing unusual while doing
+/// it. This is the case `deploy/README.md`'s "Renaming from credvault"
+/// section exists to prevent, and before this check the only thing standing
+/// between an operator and that outcome was remembering to read it.
+///
+/// Both names set means the migration happened and the old line was left
+/// behind. That is untidy, not dangerous -- the current name is what clap
+/// reads -- so it is not reported. Blank counts as unset on both sides, for
+/// the reason given on [`BLANK_MEANS_UNSET`]: `docker compose` writes an
+/// empty string for every variable it interpolates and the operator has not
+/// filled in.
+///
+/// Takes `OsString`-ish pairs so the caller can pass [`std::env::vars_os`]:
+/// `std::env::vars` panics on an environment holding one non-UTF-8 variable,
+/// which need not be one of ours, and a panic here points at nothing.
+fn superseded_settings<I, K, V>(env: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let present: std::collections::BTreeMap<String, String> = env
+        .into_iter()
+        .map(|(key, value)| {
+            (key.as_ref().to_string_lossy().into_owned(), value.as_ref().to_string_lossy().into_owned())
+        })
+        .filter(|(_, value)| !value.trim().is_empty())
+        .collect();
+    present
+        .keys()
+        .filter_map(|old| {
+            let name = old.strip_prefix(SUPERSEDED_PREFIX)?;
+            // The bare prefix is not a setting. `deploy/README.md` shows
+            // `sed 's/^CREDVAULT_/KLAVYN_/'`, and a variable called exactly
+            // `CREDVAULT_` could not have configured anything to begin with.
+            if name.is_empty() {
+                return None;
+            }
+            let new = format!("{SETTINGS_PREFIX}{name}");
+            (!present.contains_key(&new)).then_some((old.clone(), new))
+        })
+        .collect()
+}
+
+/// The startup refusal for [`superseded_settings`], or `None` when there is
+/// nothing to refuse.
+///
+/// Stopping rather than warning, which is the same trade the boolean
+/// spellings make above and for the same reason: the failure this catches is
+/// silent and points at "open to anyone", and a warning in a container's log
+/// is read after the incident rather than before it. An operator who has
+/// genuinely finished with a variable can delete it, which is one line and
+/// says what they meant.
+fn superseded_settings_refusal(superseded: &[(String, String)]) -> Option<String> {
+    if superseded.is_empty() {
+        return None;
+    }
+    let mut message = String::from(
+        "this server reads KLAVYN_* settings; these are still spelled the way they were before \
+         the product was renamed, so nothing is reading them:\n",
+    );
+    for (old, new) in superseded {
+        message.push_str(&format!("  {old}  ->  {new}\n"));
+    }
+    message.push_str(
+        "Rename them and start again -- in deploy/.env:\n  \
+         sed -i 's/^CREDVAULT_/KLAVYN_/' .env\n\
+         Refusing to start rather than run with these ignored: an unset \
+         KLAVYN_REGISTRATION_TOKEN means registration is open to anyone, so a server that \
+         started here would be accepting public sign-ups while the .env beside it says it is \
+         closed. See \"Renaming from credvault\" in deploy/README.md.",
+    );
+    Some(message)
+}
+
 /// Which registrations the server accepts, from the two flags that decide it.
 ///
 /// A blank token counts as no token, the same way a blank Google credential
@@ -284,6 +373,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // body runs. Nothing read the environment from those threads in practice,
     // but it costs nothing to do this where it is actually defined.
     normalize_env();
+    // After normalize_env, so a blank variable is already gone and cannot be
+    // reported as a setting the operator is relying on.
+    if let Some(refusal) = superseded_settings_refusal(&superseded_settings(std::env::vars_os())) {
+        // Printed and exited rather than returned. `main`'s error reporting
+        // renders through `Debug`, which for a boxed String quotes it and
+        // escapes every newline -- so this message, which is a line per
+        // variable and a copy-pasteable sed, arrives as one unreadable line.
+        // The entire value of refusing rather than warning is that the
+        // operator reads it. 2 rather than 1 matches what clap uses for a
+        // configuration refusal in this same binary.
+        eprintln!("{refusal}");
+        std::process::exit(2);
+    }
     run()
 }
 
@@ -412,6 +514,144 @@ fn restrict_file_permissions(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Anything `.gitignore` keeps out of the repository for secrecy is also
+    /// kept out of the Docker build context.
+    ///
+    /// The build context is the repo root and `deploy/Dockerfile` does
+    /// `COPY . .`, so a gitignored secret still reaches the builder and is
+    /// baked into the build stage's layer -- which survives in the builder
+    /// cache on the host even though the final image copies only the binary.
+    ///
+    /// Measured when this was written: `.env.local` (a real Google client
+    /// secret and a PostHog key), `.history/` (the editor's local history,
+    /// holding five further copies of that same file) and
+    /// `docs/security-audit.md` were all in `.gitignore` and none was in
+    /// `.dockerignore`. Each had been added to `.gitignore` *after*
+    /// `.dockerignore` was written, which is the failure this pins: the two
+    /// files have to agree and nothing made them.
+    #[test]
+    fn secrets_kept_out_of_the_repository_stay_out_of_the_build_context() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap_or_else(|_| panic!("{name}"));
+        // `**/` is stripped so a .dockerignore written for any depth still
+        // matches the .gitignore entry it covers; Docker needs the prefix,
+        // git does not have it.
+        let entries = |text: &str| -> std::collections::BTreeSet<String> {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(|line| line.trim_start_matches("**/").trim_end_matches('/').to_string())
+                .collect()
+        };
+
+        let docker = entries(&read(".dockerignore"));
+
+        // An allow-list, not a deny-list. The first version matched entries
+        // containing "secret"/"credential"/".env"/".history" and so covered
+        // three of .gitignore's five secrets: `docs/security-audit.md` does
+        // not contain "secret", and `.impeccable/` matches nothing at all.
+        // Deleting either from .dockerignore left this test green. A
+        // deny-list has to predict the next word somebody chooses; an
+        // allow-list only has to know what is *not* a secret, which is a
+        // short and slow-moving list, and anything new is treated as one
+        // until someone says otherwise here.
+        const IGNORED_FOR_TIDINESS: [&str; 6] =
+            ["target", "dist", "*.db", "*.db-*", ".DS_Store", "apps/desktop/gen/schemas"];
+
+        let secret_in_git: Vec<String> = entries(&read(".gitignore"))
+            .into_iter()
+            .filter(|entry| !IGNORED_FOR_TIDINESS.contains(&entry.as_str()))
+            .collect();
+        assert!(
+            secret_in_git.len() >= 5,
+            "expected .gitignore to list at least the five known secrets, found {secret_in_git:?}; \
+             if an entry moved to IGNORED_FOR_TIDINESS, say why in a comment"
+        );
+
+        let missing: Vec<&String> = secret_in_git
+            .iter()
+            .filter(|entry| {
+                // `deploy/.env` is covered by the whole `deploy/` directory
+                // being excluded, so an exact match is not the only way.
+                !docker.contains(*entry) && !docker.iter().any(|ignored| entry.starts_with(&format!("{ignored}/")))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these are gitignored as secrets but still reach the Docker build context: {missing:?}\n\
+             Add them to .dockerignore -- deploy/Dockerfile copies the whole repo root."
+        );
+    }
+
+    /// A pre-rename `.env` is refused rather than silently ignored.
+    ///
+    /// The scenario this defends is the one `CLAUDE.md` step 0 describes: the
+    /// operator redeploys 0.4.0 with the `.env` they already had, every
+    /// setting in it reaches nothing, and `KLAVYN_REGISTRATION_TOKEN` being
+    /// unset means the vault is open to anyone. Nothing in the server said so
+    /// before this.
+    #[test]
+    fn settings_kept_under_their_pre_rename_names_stop_the_server() {
+        let old_env = [
+            ("CREDVAULT_REGISTRATION_TOKEN", "a-real-token"),
+            ("CREDVAULT_BIND", "0.0.0.0:8787"),
+            ("PATH", "/usr/bin"),
+        ];
+        let superseded = superseded_settings(old_env);
+        assert_eq!(
+            superseded,
+            vec![
+                ("CREDVAULT_BIND".to_string(), "KLAVYN_BIND".to_string()),
+                ("CREDVAULT_REGISTRATION_TOKEN".to_string(), "KLAVYN_REGISTRATION_TOKEN".to_string()),
+            ],
+            "every superseded setting is reported, and nothing else is"
+        );
+
+        let refusal = superseded_settings_refusal(&superseded).expect("a pre-rename .env must be refused");
+        assert!(refusal.contains("CREDVAULT_REGISTRATION_TOKEN  ->  KLAVYN_REGISTRATION_TOKEN"));
+        assert!(
+            refusal.contains("open to anyone"),
+            "the message has to say what happens if the server starts anyway, not just that a name changed"
+        );
+        // The token's value is the one thing that must not reach a log or a
+        // terminal: this message is printed by a container that may be
+        // shipping its output somewhere.
+        assert!(!refusal.contains("a-real-token"), "the refusal must not echo a secret back");
+    }
+
+    /// A migrated deployment starts, including one that left the old line in
+    /// place. The current name is what clap reads, so both-set is untidy
+    /// rather than dangerous, and refusing it would stop a server that is
+    /// configured correctly.
+    #[test]
+    fn a_migrated_env_starts_even_with_the_old_line_left_behind() {
+        for env in [
+            vec![("KLAVYN_REGISTRATION_TOKEN", "a-real-token"), ("KLAVYN_BIND", "0.0.0.0:8787")],
+            vec![("CREDVAULT_REGISTRATION_TOKEN", "stale"), ("KLAVYN_REGISTRATION_TOKEN", "a-real-token")],
+            vec![],
+        ] {
+            let superseded = superseded_settings(env.clone());
+            assert!(superseded.is_empty(), "{env:?} is configured under the current names");
+            assert!(superseded_settings_refusal(&superseded).is_none());
+        }
+    }
+
+    /// Blank is unset on both sides, matching `BLANK_MEANS_UNSET`: compose
+    /// writes an empty string for every variable it interpolates and the
+    /// operator has not filled in, so a blank `CREDVAULT_*` is debris from
+    /// the old compose file rather than a setting anyone is relying on.
+    /// Stopping the server over it would be a crash loop for nothing.
+    #[test]
+    fn a_blank_pre_rename_variable_is_not_a_setting() {
+        for value in ["", "   ", "\n"] {
+            let superseded = superseded_settings([("CREDVAULT_REGISTRATION_TOKEN", value)]);
+            assert!(superseded.is_empty(), "blank {value:?} is not a setting in force");
+        }
+        // The bare prefix cannot have configured anything; the rename guide in
+        // README.md contains it as the text of a sed expression.
+        assert!(superseded_settings([("CREDVAULT_", "x")]).is_empty());
+    }
 
     /// One deterministic pseudo-random number, so a failure is reproducible
     /// from the seed rather than only on the run that found it.

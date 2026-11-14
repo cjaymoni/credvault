@@ -633,6 +633,36 @@ const DEFAULT_SERVER: &str = "https://vault.klavyn.com";
 /// the binary -- which is why the app may act on them and a server may not.
 const PREVIOUS_DEFAULT_SERVERS: [&str; 1] = ["https://credvault.alphadesigns.dev"];
 
+/// Which superseded bindings a refused sign-in may be retried with.
+///
+/// Empty unless the refusal was the credential itself *and* the address is
+/// this app's own current default. Both halves are load-bearing and neither
+/// is obvious from the call site, which is why this is a function with its
+/// own tests rather than a condition inside [`login_across_a_move`]:
+///
+/// - **Rejected only.** A network failure or a throttle says nothing about
+///   which binding is stored, and retrying under one spends another of the
+///   account's login attempts for no information.
+/// - **[`DEFAULT_SERVER`] only.** The entries are credentials for other
+///   hostnames. Offering one to an address the person typed hands that host a
+///   credential minted for a different server -- precisely the replay the
+///   address binding exists to prevent. See [`PREVIOUS_DEFAULT_SERVERS`].
+///
+/// Compared parsed-to-parsed: `server_url` has been through
+/// [`ServerAddress::parse`] and `DEFAULT_SERVER` is a hand-written literal,
+/// so comparing the two raw would start failing silently -- and fail *closed*,
+/// leaving every pre-move account told its passphrase is wrong -- if
+/// canonicalisation ever changed.
+fn superseded_bindings_for(refused: &ClientError, server_url: &ServerAddress) -> &'static [&'static str] {
+    let is_this_apps_default =
+        ServerAddress::parse(DEFAULT_SERVER).is_ok_and(|default| default.as_str() == server_url.as_str());
+    if matches!(refused, ClientError::Rejected(_)) && is_this_apps_default {
+        &PREVIOUS_DEFAULT_SERVERS
+    } else {
+        &[]
+    }
+}
+
 /// Sign in, carrying an account across a change of server address if needed.
 ///
 /// Returns the session, and whether it was reached with a superseded binding
@@ -649,14 +679,12 @@ async fn login_across_a_move(
             Err(error) => error,
         };
 
-    // Only a refused credential is worth a second attempt: a network failure
-    // or a throttle says nothing about which binding is stored, and retrying
-    // under one would spend another of the account's login attempts.
-    if !matches!(refused, ClientError::Rejected(_)) || server_url.as_str() != DEFAULT_SERVER {
+    let candidates = superseded_bindings_for(&refused, server_url);
+    if candidates.is_empty() {
         return Err(refused);
     }
 
-    for previous in PREVIOUS_DEFAULT_SERVERS {
+    for previous in candidates {
         let Ok(previous) = ServerAddress::parse(previous) else { continue };
         let legacy = master.auth_hash(&previous);
         match api.login(&LoginRequest { email: email.to_string(), auth_hash: legacy.clone() }).await {
@@ -2635,6 +2663,92 @@ mod tests {
         for previous in PREVIOUS_DEFAULT_SERVERS {
             let previous = ServerAddress::parse(previous).expect("every previous default is a usable address");
             assert_ne!(previous, current, "{previous:?} is still the current default");
+        }
+    }
+
+    /// The one that matters: a credential minted for a past default is never
+    /// offered to an address the person typed.
+    ///
+    /// These entries are credentials for other hostnames. Sending one to
+    /// whatever someone wrote in the sign-in box -- a self-hosted server, a
+    /// typo'd domain, a host an attacker controls -- hands that host a
+    /// reusable login for the old default, which is exactly the replay the
+    /// address binding exists to prevent. The whole guard is one condition,
+    /// so it is tested directly rather than through a live sign-in.
+    #[test]
+    fn a_superseded_credential_is_never_offered_to_an_address_the_person_typed() {
+        let rejected = ClientError::Rejected("wrong passphrase".into());
+        for typed in [
+            "https://vault.example.com",
+            "https://credvault.alphadesigns.dev.evil.test",
+            "http://127.0.0.1:8787",
+            // A past default itself: already superseded, so there is nothing
+            // further back to try, and the list must not be replayed to it.
+            PREVIOUS_DEFAULT_SERVERS[0],
+        ] {
+            let address = ServerAddress::parse(typed).expect("a usable address");
+            assert!(
+                superseded_bindings_for(&rejected, &address).is_empty(),
+                "{typed} is not this app's current default, so no superseded credential may be sent to it"
+            );
+        }
+    }
+
+    /// The default address counts however it was spelled.
+    ///
+    /// The gate compares parsed-to-parsed, so `ServerAddress::parse`'s
+    /// canonicalisation -- lower-casing the host, dropping a default port and
+    /// a trailing slash -- decides which spellings open it. That is wider
+    /// than the raw string comparison it replaced, and deliberately: these
+    /// are all the same host, so no credential crosses an origin. Pinned here
+    /// because a later change to `parse` would otherwise narrow or widen it
+    /// silently, and narrowing means every pre-move account is told its
+    /// passphrase is wrong.
+    #[test]
+    fn the_default_address_counts_however_it_was_written() {
+        let rejected = ClientError::Rejected("wrong passphrase".into());
+        let default = ServerAddress::parse(DEFAULT_SERVER).expect("the default is a usable address");
+        for spelling in [
+            DEFAULT_SERVER.to_string(),
+            format!("{DEFAULT_SERVER}/"),
+            DEFAULT_SERVER.replace("vault.", "VAULT."),
+            format!("{DEFAULT_SERVER}:443"),
+        ] {
+            let Ok(address) = ServerAddress::parse(&spelling) else {
+                panic!("{spelling} should parse");
+            };
+            assert_eq!(address.as_str(), default.as_str(), "{spelling} canonicalises to the default");
+            assert_eq!(
+                superseded_bindings_for(&rejected, &address),
+                PREVIOUS_DEFAULT_SERVERS,
+                "{spelling} is this app's own default, so the migration must be reachable from it"
+            );
+        }
+    }
+
+    /// Only a refused credential is retried. A network failure or a throttle
+    /// says nothing about which binding is stored, and retrying under one
+    /// spends another of the account's login attempts for no information.
+    #[test]
+    fn only_a_refused_credential_is_retried_against_an_older_binding() {
+        let default = ServerAddress::parse(DEFAULT_SERVER).expect("the default is a usable address");
+
+        assert_eq!(
+            superseded_bindings_for(&ClientError::Rejected("wrong passphrase".into()), &default),
+            PREVIOUS_DEFAULT_SERVERS,
+            "a refused credential on this app's own default is the one case the migration exists for"
+        );
+
+        for other in [
+            ClientError::Network("connection reset".into()),
+            ClientError::TooManyRequests { message: "too many attempts".into(), retry_after_secs: Some(30) },
+            ClientError::Server("internal error".into()),
+            ClientError::Unauthorized,
+        ] {
+            assert!(
+                superseded_bindings_for(&other, &default).is_empty(),
+                "{other:?} says nothing about which binding is stored, so it must not spend a login attempt"
+            );
         }
     }
 

@@ -169,6 +169,11 @@ async fn check_quota(tx: &mut Tx, label: &str, sql: &str, user_id: i64, limit: i
     Ok(())
 }
 
+/// Returned when a compare-and-swap on the account credential finds it
+/// already changed. Both routes that write `auth_hash` use it: the
+/// passphrase change, where the person really was typing, and the server
+/// rebind, which runs in the background during sign-in.
+const ACCOUNT_CHANGED_MESSAGE: &str = "this account changed while this request was in flight; try again";
 const STALE_KEY_MESSAGE: &str = "the secret's key was rotated since you loaded it; refresh and try again";
 const MEMBERSHIP_CHANGED_MESSAGE: &str = "the secret's membership changed since you loaded it; refresh and try again";
 
@@ -521,7 +526,7 @@ pub async fn change_password(
             .await?
             .rows_affected();
     if changed == 0 {
-        return Err(ApiError::Conflict("this account changed while you were typing; try again".into()));
+        return Err(ApiError::Conflict(ACCOUNT_CHANGED_MESSAGE.into()));
     }
 
     let owned: Vec<(i64, i64)> = sqlx::query_as("SELECT id, key_version FROM secrets WHERE owner_id = ?")
@@ -624,7 +629,9 @@ async fn verify_and_rehash(
 /// [`ApiError::Unauthorized`] if the current passphrase does not verify;
 /// [`ApiError::BadRequest`] if either hash is malformed, or if the account
 /// signs in with Google and so has no passphrase-derived credential to move;
-/// [`ApiError::TooManyRequests`] when this account has spent its budget.
+/// [`ApiError::TooManyRequests`] when this account has spent its budget;
+/// [`ApiError::Conflict`] if the account's credential changed while this
+/// request was in flight, which means a passphrase change raced it.
 pub async fn change_server_address(
     State(state): State<AppState>,
     user: AuthUser,
@@ -649,7 +656,8 @@ pub async fn change_server_address(
     }
 
     let presented = body.current_auth_hash.clone();
-    let verified = tokio::task::spawn_blocking(move || auth::verify_credential(&presented, &stored_credential))
+    let verifying_against = stored_credential.clone();
+    let verified = tokio::task::spawn_blocking(move || auth::verify_credential(&presented, &verifying_against))
         .await
         .map_err(ApiError::internal)?;
     if !verified {
@@ -657,11 +665,31 @@ pub async fn change_server_address(
     }
 
     let replacement = auth::hash_credential(body.new_auth_hash.clone()).await?;
-    sqlx::query("UPDATE users SET auth_hash = ? WHERE id = ?")
+    // Compare-and-swap on the stored credential, for the reason `change_password`
+    // gives above -- and the loss here is worse than the one described there.
+    // Both routes share `password_limiter`, which rations them but does not
+    // serialise them, and `hash_credential` holds the blocking pool for the
+    // best part of a second. A passphrase change committing inside that window
+    // writes a new `auth_hash` *and* an `encrypted_private_key` sealed under
+    // the new passphrase; a last-writer-wins rebind then puts the old
+    // passphrase's credential back beside the new private key. Sign-in would
+    // succeed and unwrapping would fail, with no way back: `/password` is the
+    // repair and it needs the private key to produce the re-wrapped keys it
+    // demands. There is no password reset and the server holds only
+    // ciphertext, so the vault would be gone, backups included.
+    //
+    // Not in a transaction: this is one statement against one row, and the
+    // predicate is what makes it atomic.
+    let changed = sqlx::query("UPDATE users SET auth_hash = ? WHERE id = ? AND auth_hash = ?")
         .bind(&replacement)
         .bind(user.id)
+        .bind(&stored_credential)
         .execute(&state.pool)
-        .await?;
+        .await?
+        .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::Conflict(ACCOUNT_CHANGED_MESSAGE.into()));
+    }
     tracing::info!(user_id = user.id, "server address rebound");
     Ok(StatusCode::NO_CONTENT)
 }

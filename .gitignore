@@ -24,3 +24,6 @@ deploy/.env
 # written down here is a map of where to look. Keep them local, or in a
 # private tracker, until they are closed.
 docs/security-audit.md
+
+# Python bytecode from apps/desktop/scripts.
+__pycache__/

@@ -319,6 +319,24 @@ cargo install tauri-cli --version "^2" --locked
 cd apps/desktop && cargo tauri build     # produces an installer in target/release/bundle
 ```
 
+### App icons
+
+Every icon comes from `apps/desktop/icons/logo.svg`. After changing it, run:
+
+```sh
+python3 apps/desktop/scripts/make-icons.py
+```
+
+It needs macOS and Google Chrome (set `CHROME_PATH` if Chrome is elsewhere).
+Don't use `cargo tauri icon`: it scales one PNG to every size, so iOS icons
+gain transparent corners and the Android launcher crops the castle. The script
+draws each platform's shape instead. It rewrites only icons that already
+exist; to add a size, create the file once and run it again.
+
+```sh
+python3 -m unittest discover -s apps/desktop/scripts -p "test_*.py"   # its tests
+```
+
 ## Run
 
 Start the server (defaults to 127.0.0.1:8787 and `~/.klavyn-server`):

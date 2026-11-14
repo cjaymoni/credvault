@@ -11,7 +11,7 @@
 # merely unprotected.
 #
 # The container listens on 127.0.0.1:8787 only; see
-# /opt/credvault/deploy/docker-compose.override.yml for why.
+# /opt/klavyn/deploy/docker-compose.override.yml for why.
 
 server {
   listen 80;
@@ -32,6 +32,26 @@ server {
   # Encrypted secrets travel as JSON bodies; the app refuses oversized ones
   # itself, so this only needs to be larger than any legitimate payload.
   client_max_body_size 10m;
+
+  # The same headers the Caddyfile sets on the API site. nginx does not
+  # inherit add_header into a block that declares its own, so each server
+  # block here repeats the set it needs rather than relying on a parent.
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer" always;
+
+  # The Caddyfile strips Server entirely; nginx can only shorten it to
+  # "nginx" without a third-party module. Set here rather than in http{}
+  # because that file is shared with the other sites on this box -- move it
+  # up if you want it everywhere, which you probably do.
+  server_tokens off;
+
+  # Real-IP restoration, scoped to this block. klavyn-proxy.conf forwards
+  # $remote_addr as X-Forwarded-For, and until this has run $remote_addr is
+  # the Cloudflare edge rather than the caller. Included here rather than
+  # dropped in conf.d/ so it cannot rewrite $remote_addr for the other sites
+  # on this box.
+  include /etc/nginx/snippets/cloudflare-realip.conf;
 
   # The server mounts /health at the root and everything else under /api
   # (see the router in crates/server/src/lib.rs). Nothing outside those two
@@ -54,6 +74,9 @@ server {
   root /var/www/klavyn;
   index index.html;
 
+  # No Referrer-Policy here, matching the Caddyfile: unlike the API this is a
+  # public site where referrers are wanted. HSTS still applies.
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
   add_header X-Content-Type-Options "nosniff" always;
 
   location / { try_files $uri $uri/ =404; }
@@ -67,6 +90,8 @@ server {
 
   ssl_certificate     /etc/ssl/cloudflare/example.com.pem;
   ssl_certificate_key /etc/ssl/cloudflare/example.com.key;
+
+  add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
   return 301 https://example.com$request_uri;
 }

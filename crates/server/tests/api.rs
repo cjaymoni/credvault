@@ -2374,6 +2374,99 @@ async fn moving_the_address_needs_the_passphrase_not_just_a_session() {
     assert_eq!(login(&server, &account.email, master.auth_hash(&server.address)).await.status(), StatusCode::OK);
 }
 
+/// Two rebinds in flight at once: one wins, the other is told to try again
+/// rather than overwriting it.
+///
+/// This is the compare-and-swap in `change_server_address`, and the loss it
+/// prevents is unrecoverable. Both requests verify against the same stored
+/// credential and then spend the best part of a second in Argon2; without the
+/// predicate on the `UPDATE`, the slower one writes last and wins. Racing a
+/// passphrase change instead of a second rebind is the same shape and the
+/// worse outcome -- `/password` commits a new credential *and* a private key
+/// sealed under the new passphrase, so a last-writer-wins rebind puts the old
+/// credential back beside the new key, sign-in succeeds, unwrapping fails,
+/// and there is no way back. Two rebinds reproduce the race deterministically
+/// because the Argon2 pass holds both requests in the window at once.
+#[tokio::test]
+async fn two_rebinds_at_once_cannot_overwrite_each_other() {
+    let server = spawn().await;
+    let account = register(&server, "race@example.com", "correct horse battery staple").await;
+    let master = MasterKey::derive("correct horse battery staple", "race@example.com").unwrap();
+    let current = master.auth_hash(&server.address);
+
+    let first = ServerAddress::parse("https://vault.first.example").unwrap();
+    let second = ServerAddress::parse("https://vault.second.example").unwrap();
+
+    let rebind = |to: &ServerAddress| {
+        server
+            .req(Method::POST, "/account/server-address", &account)
+            .json(&ChangeServerAddressRequest {
+                current_auth_hash: current.clone(),
+                new_auth_hash: master.auth_hash(to),
+            })
+            .send()
+    };
+    let (a, b) = tokio::join!(rebind(&first), rebind(&second));
+    let mut codes = [a.unwrap().status(), b.unwrap().status()];
+    codes.sort_by_key(|status| status.as_u16());
+
+    // One lands. The loser is 409 when it verified before the winner
+    // committed -- the window is the best part of a second of Argon2, so that
+    // is what happens in practice -- or 401 if it verified after, against the
+    // credential the winner had just written. Both are refusals; the bug is
+    // two successes, which is what this returns without the compare-and-swap.
+    assert_eq!(codes[0], StatusCode::NO_CONTENT, "exactly one rebind must land, got {codes:?}");
+    assert!(
+        codes[1] == StatusCode::CONFLICT || codes[1] == StatusCode::UNAUTHORIZED,
+        "the second rebind must be refused rather than silently overwriting the first, got {codes:?}"
+    );
+
+    // Precisely one of the two new addresses works, and the original no
+    // longer does. The failure this guards against is both having *appeared*
+    // to succeed while only one credential survives.
+    let mut works = 0;
+    for address in [&first, &second] {
+        if login(&server, &account.email, master.auth_hash(address)).await.status() == StatusCode::OK {
+            works += 1;
+        }
+    }
+    assert_eq!(works, 1, "the account must end up bound to exactly one address");
+    assert_eq!(login(&server, &account.email, current).await.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The rebind spends the same per-account budget as the passphrase change.
+///
+/// It runs an Argon2 verify and an Argon2 hash, so an unthrottled route here
+/// would be a way to spend a lot of the server's CPU, and a passphrase guess
+/// besides. `passphrase_changes_are_throttled_per_account` drives `/password`
+/// only, so before this test nothing exercised the limiter on this route.
+#[tokio::test]
+async fn moving_the_address_is_throttled_per_account() {
+    let limits = RateLimits { password_burst: 2, password_refill: Duration::from_secs(600), ..Default::default() };
+    let server = spawn_with(ServerConfig { rate_limits: limits, ..Default::default() }).await;
+    let account = register(&server, "budget@example.com", "correct horse battery staple").await;
+    let wrong = MasterKey::derive("not the passphrase", "budget@example.com").unwrap();
+    let moved = ServerAddress::parse("https://vault.elsewhere.example").unwrap();
+
+    let attempt = || {
+        server
+            .req(Method::POST, "/account/server-address", &account)
+            .json(&ChangeServerAddressRequest {
+                current_auth_hash: wrong.auth_hash(&server.address),
+                new_auth_hash: wrong.auth_hash(&moved),
+            })
+            .send()
+    };
+    for _ in 0..2 {
+        assert_eq!(attempt().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        attempt().await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the third attempt must be refused before Argon2 runs"
+    );
+}
+
 /// Secrets are not re-encrypted by a move, because the encryption keys are
 /// not bound to the address in the first place. If this ever fails, the
 /// rebind has started touching key material and is no longer the narrow

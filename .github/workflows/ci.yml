@@ -59,6 +59,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: node --test apps/desktop/ui-tests/
+      # The firewall script's string handling decides whether the origin is
+      # reachable, and three review passes in a row found a parsing bug in it.
+      # Too important to depend on someone remembering the manual step.
+      - run: bash deploy/tests/cloudflare-origin.test.sh
 
       # .cargo/audit.toml carries one exemption whose argument depends on the
       # MySQL driver staying unselected, and a note to re-check it on any

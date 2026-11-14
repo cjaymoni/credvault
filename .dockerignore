@@ -6,3 +6,34 @@ deploy/
 *.db
 *.db-*
 .DS_Store
+
+# Everything .gitignore keeps out of the repository for secrecy, kept out of
+# the build context for the same reason. The build context is the repo root
+# (`context: ..` in deploy/docker-compose.yml) and deploy/Dockerfile does
+# `COPY . .`, so anything here that is merely gitignored still reaches the
+# builder and is baked into the build stage's layer. The final image copies
+# only the binary, but that layer survives in the builder cache on the host
+# and in any push or `docker save` of an intermediate.
+#
+# This list is not judgement, it is a copy: `secrets_kept_out_of_the_repository_
+# stay_out_of_the_build_context` in crates/server/src/main.rs fails if
+# .gitignore grows a secret this file does not have. The three entries that
+# were missing when this was written -- .env.local, .history/ and
+# docs/security-audit.md -- were all added to .gitignore after .dockerignore,
+# which is the whole failure mode.
+# `**/` because Docker's matching is not git's: a bare `*.pem` here matches
+# only at the context root, while the same line in .gitignore matches at any
+# depth. The test below asserts name presence, so without these it would
+# report a nested `certs/*.pem` as covered when it is not.
+**/.env
+**/.env.local
+**/.env*.local
+**/.history/
+**/.impeccable/
+docs/security-audit.md
+dist/
+**/*.key
+**/*.keystore
+**/*.jks
+**/*.p12
+**/*.pem

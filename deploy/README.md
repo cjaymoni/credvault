@@ -151,16 +151,63 @@ That header is an ordinary header to anyone connecting directly, so it is
 only worth believing while nothing but Cloudflare can reach the host:
 
 ```sh
-./cloudflare-origin.sh --dry-run    # read the ranges first
+./cloudflare-origin.sh --dry-run    # read the ranges first; changes nothing
 sudo ./cloudflare-origin.sh
 ufw status                          # confirm SSH is still allowed
 ```
 
-**Skip this if nginx is already in front with real-IP restoration**
-(`set_real_ip_from` for Cloudflare's ranges). nginx resolves the caller
-itself and the firewall is usually already narrowed; the script would add a
-second, redundant rule set. It refuses to run if it finds rules it did not
-write.
+**You may skip this where nginx is already in front with real-IP
+restoration** — but only once you have checked both halves of that sentence,
+because skipping on an assumption is how the origin ends up believing a
+header anyone can write. nginx resolving the caller itself replaces the
+header rewrite, not the firewall:
+
+```sh
+nginx -T | grep -E 'set_real_ip_from|real_ip_header|real_ip_recursive'
+ufw status numbered
+```
+
+Both of these print what you are judging rather than answering for you, which
+is deliberate: a check that can only say "fine" is worse than no check,
+because it is believed.
+
+**Read every `set_real_ip_from` line.** All of them must be Cloudflare
+ranges. A single `0.0.0.0/0` or `::/0` means the origin believes
+`CF-Connecting-IP` from whoever sends it, and that is the whole exposure.
+
+**Read every ALLOW row.** Not just the ones with `80` or `443` in them —
+`ufw allow 'Nginx Full'`, `'WWW Full'` and `'Apache Full'` open those ports
+without printing a digit, and a rule scoped to an interface prints as
+`80 on eth0`. `ufw app info '<name>'` says what a named profile opens.
+
+If either half is wrong, anyone who reaches the origin directly names their
+own address and country, and nothing else here will catch it. Fix it —
+install `deploy/nginx/cloudflare-realip.conf` as below, and narrow the
+firewall either by hand or with `--force` — before deciding the script is
+unnecessary. `./cloudflare-origin.sh --dry-run` reads the same table and
+names anything it would object to, without changing anything.
+
+The script refuses to run when it finds a web-port ALLOW rule it did not
+write, including one spelled as an application profile such as `Nginx Full`.
+Two flags waive two different things, deliberately kept apart: `--force`
+accepts those pre-existing rules, and `--no-ipv6` says this host has no IPv6
+address, which is the only case where leaving v6 unfiltered is not a hole.
+Passing `--force` does not waive the IPv6 check, because an operator getting
+past `Nginx Full` has not thereby decided anything about v6.
+
+**On the Caddy stack, check Docker's userland proxy is off first.** Caddy
+falls back to its peer address when a request carries no `CF-Connecting-IP`,
+and that fallback is only meaningful while the publish path preserves the
+peer. Where `docker-proxy` terminates the connection instead of iptables —
+the usual path for a published IPv6 port on a daemon without `ip6tables` —
+every request arrives from the bridge gateway, and the whole internet shares
+one rate-limit bucket:
+
+```sh
+grep -s userland-proxy /etc/docker/daemon.json \
+  || echo 'not set, so it is ON -- which is the case this step exists to catch'
+docker compose logs caddy | tail -20    # the peer should not be 172.x.0.1
+```
 
 Then check the origin is seeing real callers rather than edges. This is the
 step that catches a header rewrite that did not take effect, and it is far
@@ -180,7 +227,22 @@ everything that is not Cloudflare, a record switched back to DNS-only is
 unreachable. Re-open 80/443 first.
 
 Re-run `cloudflare-origin.sh` when Cloudflare changes its ranges — weekly
-from cron is plenty. The same applies to nginx's `set_real_ip_from` list.
+from cron is plenty. That one fetches its list every run, so it keeps itself
+current; the two static copies do not. `scripts/refresh-cf-ranges.sh` prints
+both, validated:
+
+```sh
+scripts/refresh-cf-ranges.sh --nginx > /tmp/realip.conf   # the whole snippet
+sudo install -m 644 /tmp/realip.conf /etc/nginx/snippets/cloudflare-realip.conf
+sudo nginx -t && sudo systemctl reload nginx
+
+scripts/refresh-cf-ranges.sh --caddy                      # paste into deploy/Caddyfile
+```
+
+A stale copy degrades quietly rather than failing: the firewall opens to a
+newly added edge while Caddy or nginx still does not trust it, so everyone
+behind that edge shares one rate-limit bucket. Nobody attributes that to a
+range list.
 
 ## Running behind an existing nginx
 
@@ -192,15 +254,29 @@ The files are in the repo rather than only on the server:
 
 - `deploy/nginx/klavyn.conf.example` — the API on `vault.`, the site on the
   apex, and `www` redirecting to it. `/health` and `/api` are proxied and
-  everything else is refused, matching what the Caddyfile does. An example,
+  everything else is refused, and the security headers match the Caddyfile
+  block for block — HSTS and `nosniff` everywhere, `Referrer-Policy` on the
+  API only, and `server_tokens off` standing in for Caddy's `-Server`. An example,
   with `example.com` throughout: copy it and edit, and keep your edited copy
   out of the repo. A checked-in live file is one nobody deploys from, which
   drifts from the host it claims to describe.
 - `deploy/nginx/klavyn-proxy.conf` — the shared proxy headers. Not an
   example: it names no host, so it installs verbatim. `X-Forwarded-For`
   is **set, not appended**: the server reads the rightmost entry, and
-  `$remote_addr` is already the real caller because Cloudflare real-IP
-  restoration runs ahead of it.
+  `$remote_addr` is the real caller only because the file below has already
+  rewritten it.
+- `deploy/nginx/cloudflare-realip.conf` — `set_real_ip_from` for each
+  Cloudflare range, `real_ip_header CF-Connecting-IP`, recursion off. It goes
+  in `snippets/` and is `include`d from the klavyn server block, **not** in
+  `conf.d/`: files there are included at `http` level, so a copy dropped
+  there rewrites `$remote_addr` for every other site on the box. If one of
+  those is not behind Cloudflare, or keys `allow`/`deny`/`limit_req` on
+  `$remote_addr`, that hands it an attacker-chosen address — and `nginx -t`
+  passes either way. **The proxy snippet is wrong without this file**:
+  `$remote_addr` would still be the Cloudflare edge, so the server would
+  record edge addresses, and everyone behind one edge would share a
+  rate-limit budget and count as one installation — exactly the failure this
+  whole section exists to prevent.
 - `deploy/docker-compose.override.yml.example` — publishes the app on
   `127.0.0.1:8787` only. Docker inserts its own iptables rules ahead of ufw,
   so a `0.0.0.0` publish would be reachable from the internet even with the
@@ -212,6 +288,7 @@ and 443:
 
 ```sh
 cp deploy/docker-compose.override.yml.example deploy/docker-compose.override.yml
+cp deploy/nginx/cloudflare-realip.conf /etc/nginx/snippets/
 cp deploy/nginx/klavyn-proxy.conf /etc/nginx/snippets/
 cp deploy/nginx/klavyn.conf.example /etc/nginx/sites-available/klavyn
 $EDITOR /etc/nginx/sites-available/klavyn     # replace example.com throughout
@@ -223,6 +300,20 @@ docker compose up -d --build klavyn    # the service by name, not the stack
 `nginx -t` before the reload is not optional on a host serving other sites: a
 bad block takes them all down, and testing first means the worst case is a
 symlink to remove.
+
+Then confirm the origin records real callers rather than edges, because every
+claim in this section rests on it:
+
+```sh
+nginx -T | grep -E 'set_real_ip_from|real_ip_header'   # read them; all must be CF ranges
+tail -50 /var/log/nginx/access.log                     # caller addresses, not 104.16.x / 172.64.x
+```
+
+A count is not a check here: `grep -c` answers "how many", and the thing that
+matters is *which*. One `set_real_ip_from 0.0.0.0/0` counts as one.
+
+Cloudflare addresses there mean `cloudflare-realip.conf` is not loading, and
+the rate limiter and installation count are both wrong until it does.
 
 Nothing in this setup reads `KLAVYN_ACME_EMAIL` or `KLAVYN_SITE_DOMAIN` —
 they belong to Caddy — but compose still requires them to be present, so keep

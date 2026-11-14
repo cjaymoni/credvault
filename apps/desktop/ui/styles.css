@@ -28,10 +28,10 @@
   --text-2: #4b5c67;
   --text-3: #566772;
 
-  --accent: #0f766e;
-  --accent-hover: #0b5f58;
-  --accent-soft: #dcf2ee;
-  --accent-soft-text: #0a4a44;
+  --accent: #123f3a;
+  --accent-hover: #0b2a27;
+  --accent-soft: #dde9e2;
+  --accent-soft-text: #123f3a;
   --on-accent: #ffffff;
   --on-danger: #ffffff;
 
@@ -44,15 +44,15 @@
   --warn-border: #eccd6e;
   --warn-text: #6e4a00;
 
-  --focus: #0f766e; /* 4.6:1+ against every surface it crosses */
-  --focus-ring: rgba(15, 118, 110, 0.3);
+  --focus: #123f3a; /* 4.6:1+ against every surface it crosses */
+  --focus-ring: rgba(18, 63, 58, 0.3);
 
-  --accent-glow: rgba(15, 118, 110, 0.35); /* the compose button's halo */
+  --accent-glow: rgba(18, 63, 58, 0.35); /* the compose button's halo */
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
   --shadow-md: 0 6px 20px rgba(16, 24, 40, 0.08), 0 1px 2px rgba(16, 24, 40, 0.06);
   --toast-bg: #15222b;
   --toast-fg: #ffffff;
-  --toast-icon: #5ad6c7;
+  --toast-icon: #b0e2d2;
   --badge-on-active: rgba(255, 255, 255, 0.55);
 
   /* avatar tint; the hue comes from the element via --h */
@@ -87,11 +87,11 @@
     --text-2: #aebbc4;
     --text-3: #93a3ae;
 
-    --accent: #2fc4b2;
-    --accent-hover: #5ad6c7;
-    --accent-soft: #163b39;
-    --accent-soft-text: #a6ece2;
-    --on-accent: #06211e;
+    --accent: #8fd3be;
+    --accent-hover: #b0e2d2;
+    --accent-soft: #15352f;
+    --accent-soft-text: #b9e8d9;
+    --on-accent: #0a1715;
     --on-danger: #1a0906;
 
     --danger: #ff8a7a;
@@ -103,15 +103,15 @@
     --warn-border: #8a7430;
     --warn-text: #f0d98a;
 
-    --focus: #3fd1bf;
-    --focus-ring: rgba(63, 209, 191, 0.35);
+    --focus: #8fd3be;
+    --focus-ring: rgba(143, 211, 190, 0.35);
 
-    --accent-glow: rgba(47, 196, 178, 0.3);
+    --accent-glow: rgba(143, 211, 190, 0.3);
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
     --toast-bg: #e8eef2;
     --toast-fg: #171e22;
-    --toast-icon: #0f766e;
+    --toast-icon: #123f3a;
     --badge-on-active: rgba(0, 0, 0, 0.25);
 
     --av-bg-s: 30%; --av-bg-l: 22%;
@@ -130,11 +130,11 @@
   --text-2: #aebbc4;
   --text-3: #93a3ae;
 
-  --accent: #2fc4b2;
-  --accent-hover: #5ad6c7;
-  --accent-soft: #163b39;
-  --accent-soft-text: #a6ece2;
-  --on-accent: #06211e;
+  --accent: #8fd3be;
+  --accent-hover: #b0e2d2;
+  --accent-soft: #15352f;
+  --accent-soft-text: #b9e8d9;
+  --on-accent: #0a1715;
   --on-danger: #1a0906;
 
   --danger: #ff8a7a;
@@ -146,15 +146,15 @@
   --warn-border: #8a7430;
   --warn-text: #f0d98a;
 
-  --focus: #3fd1bf;
-  --focus-ring: rgba(63, 209, 191, 0.35);
+  --focus: #8fd3be;
+  --focus-ring: rgba(143, 211, 190, 0.35);
 
-  --accent-glow: rgba(47, 196, 178, 0.3);
+  --accent-glow: rgba(143, 211, 190, 0.3);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
   --toast-bg: #e8eef2;
   --toast-fg: #171e22;
-  --toast-icon: #0f766e;
+  --toast-icon: #123f3a;
   --badge-on-active: rgba(0, 0, 0, 0.25);
 
   --av-bg-s: 30%; --av-bg-l: 22%;
@@ -474,13 +474,14 @@ select { padding-right: 34px; cursor: pointer; }
   width: 36px;
   height: 36px;
   border-radius: 10px;
-  background: #106e6e;
+  background: #123f3a;
   color: #ffffff;
 }
-.brand-mark svg { width: 20px; height: 20px; }
+/* The castle is drawn on a 300-unit tile with its own margins, so it fills
+   the plate rather than sitting inside it like a stroke icon. */
+.brand-mark svg { width: 100%; height: 100%; }
 .brand-name { font-weight: 700; font-size: var(--text-heading); letter-spacing: -0.01em; }
 .brand.compact .brand-mark { width: 28px; height: 28px; border-radius: 8px; }
-.brand.compact .brand-mark svg { width: 16px; height: 16px; }
 .brand.compact .brand-name { font-size: var(--text-emphasis); }
 
 .segmented {
@@ -843,7 +844,7 @@ input.mono.mismatch { border-color: var(--danger); }
 }
 /* Left as the platform's own checkbox rather than restyled: it is the one
    control here that every toolkit draws the same way its native dialogs do,
-   and `accent-color` tints it with the app's teal. Drawing our own would
+   and `accent-color` tints it with the app's evergreen. Drawing our own would
    also mean drawing the tick, and the page's CSP allows no `data:` images to
    draw it with. */
 .cf-hide input[type="checkbox"] { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
@@ -1256,7 +1257,6 @@ input.mono.mismatch { border-color: var(--danger); }
   .auth-card { max-width: none; margin-top: 0; padding: 0; border: none; background: transparent; box-shadow: none; }
   .auth .brand { gap: 12px; }
   .auth .brand-mark { width: 44px; height: 44px; border-radius: 14px; }
-  .auth .brand-mark svg { width: 24px; height: 24px; }
   .auth .brand-name { font-size: var(--text-heading); }
   .auth-title { font-size: var(--text-display); margin-top: 16px; letter-spacing: -0.02em; }
   /* The strapline in the footer makes the same promise in fewer words, so on

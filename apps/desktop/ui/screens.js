@@ -81,14 +81,13 @@
     return String(rawValue ?? "").trim() || fallback;
   }
 
-  /// The address this install was last signed in to, if pinning would strand
-  /// it. Null when there is nothing to worry about.
+  /// The address this install was last signed in to, when it is not the one
+  /// the app now forces. Null when there is nothing to say.
   ///
   /// `auth_hash` mixes the server's address into the credential, so an
-  /// account made on someone's own host cannot sign in to `fallback` at all:
-  /// the rejection reads as a wrong passphrase, and with the field locked
-  /// there is no way back. Submitting to `fallback` anyway would also hand a
-  /// server they never chose their email address and a login attempt.
+  /// account made on someone's own host cannot sign in to `fallback` at all,
+  /// and the rejection reads as a wrong passphrase. The address is forced
+  /// either way -- this only decides whether the screen says so first.
   ///
   /// Compared loosely -- case, trailing slash, whitespace -- because this
   /// decides whether to warn, and warning once too often is much cheaper

@@ -67,9 +67,8 @@ test("nothing reads the server field except the one reader and the lock", () => 
     .map((line, i) => [i + 1, line])
     .filter(([, line]) => /\$\("server"\)\.value/.test(line));
   const allowed = [
-    'return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER || state.serverUnlocked, $("server").value, DEFAULT_SERVER);',
+    'return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER, $("server").value, DEFAULT_SERVER);',
     '$("server").value = (ALLOW_CUSTOM_SERVER && recall("server")) || DEFAULT_SERVER;',
-    '$("server").value = address;',
     '  $("server-summary").textContent = Screens.serverSummaryText($("server").value, DEFAULT_SERVER);',
   ];
   for (const [lineNumber, line] of reads) {
@@ -101,7 +100,7 @@ test("the field and the phone line are both locked, not removed", () => {
   // Removing the markup would make the flag a lie: flipping it on has to
   // bring the feature back whole.
   assert.match(APP_JS, /function lockServerAddress\(\) \{/);
-  assert.match(APP_JS, /else if \(!ALLOW_CUSTOM_SERVER\) lockServerAddress\(\);/);
+  assert.match(APP_JS, /^if \(!ALLOW_CUSTOM_SERVER\) lockServerAddress\(\);$/m);
   assert.ok(INDEX_HTML.includes('id="btn-server-change"'), "the phone line was removed");
   assert.ok(INDEX_HTML.includes('id="server-field"'), "the server field was removed");
 });
@@ -154,13 +153,20 @@ test("a missing fallback is refused", () => {
   }
 });
 
-test("a stranded install keeps the field, and is told why", () => {
+test("a stranded install is told, and is still pinned like everyone else", () => {
+  // The address is forced for every install. This only decides whether the
+  // screen explains the refusal that is coming, rather than letting it read
+  // as a forgotten passphrase.
   assert.match(APP_JS, /const strandedServer = ALLOW_CUSTOM_SERVER \? null : Screens\.strandedAddress\(recall\("server"\), DEFAULT_SERVER\);/);
-  assert.match(APP_JS, /if \(strandedServer\) unlockServerFor\(strandedServer\);/);
-  // The notice has to name both addresses, or it is just a failure with
-  // better manners.
-  const notice = APP_JS.slice(APP_JS.indexOf("function unlockServerFor("));
-  assert.match(notice.slice(0, 900), /esc\(DEFAULT_SERVER\)/);
-  assert.match(notice.slice(0, 900), /esc\(address\)/);
+  assert.match(APP_JS, /if \(strandedServer\) noteStrandedServer\(strandedServer\);/);
+  assert.ok(!APP_JS.includes("serverUnlocked"), "a stranded install must not be an exception to the pin");
+
+  const notice = APP_JS.slice(APP_JS.indexOf("function noteStrandedServer("), APP_JS.indexOf("function noteStrandedServer(") + 900);
+  // Both addresses, or it is a failure with better manners and no content.
+  assert.match(notice, /esc\(DEFAULT_SERVER\)/);
+  assert.match(notice, /esc\(address\)/);
+  // The remembered value is whatever was last typed into the field, so it
+  // reaches this markup from storage and must be escaped.
+  assert.ok(!/\$\{address\}/.test(notice), "the stored address is interpolated unescaped");
   assert.ok(INDEX_HTML.includes('id="server-stranded"'), "the notice has nowhere to render");
 });

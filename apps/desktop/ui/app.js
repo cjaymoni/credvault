@@ -83,9 +83,6 @@ const state = { secrets: [], projects: [], selected: null, editing: false, editT
   // What the server at the URL in the box offers, and the Google sign-in
   // waiting for a passphrase, if there is one.
   capabilities: null, google: null, user: null,
-  // Set when this install's account is on a server the pin would strand, so
-  // the address stays editable for it. See unlockServerFor().
-  serverUnlocked: false,
   // The user opened the registration-token field themselves, on a server that
   // did not say it needs one. Kept so a re-render does not fold it away again.
   tokenFieldOpen: false,
@@ -590,23 +587,25 @@ function applySafeAreaInsets() {
 /// The address this app signs in to. Never reads the field while
 /// ALLOW_CUSTOM_SERVER is off; see Screens.serverUrlFor().
 function currentServerUrl() {
-  return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER || state.serverUnlocked, $("server").value, DEFAULT_SERVER);
+  return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER, $("server").value, DEFAULT_SERVER);
 }
 
-/// Say what happened to an install whose account is on another server, and
-/// give the field back so it can still be reached.
+/// Say what happened to an install whose account is on another server.
 ///
-/// The pin is for people whose vault is on DEFAULT_SERVER. Stranding anyone
-/// else was never the point of it: their credential is bound to the address
-/// they used, so signing in here cannot work, and the failure would read as
-/// a wrong passphrase. See Screens.strandedAddress().
-function unlockServerFor(address) {
-  state.serverUnlocked = true;
-  $("server").value = address;
+/// The address is forced for every install, this one included, so there is
+/// nothing to offer here but an explanation. It is worth printing anyway:
+/// `auth_hash` ties the credential to the address it was made under, so this
+/// account cannot be opened here at all, and the server answers that with a
+/// rejection the sign-in screen can only report as a wrong passphrase.
+/// Saying so beforehand is the difference between "my vault is on my own
+/// server" and "I have forgotten my passphrase".
+///
+/// See Screens.strandedAddress() for which installs this is shown to.
+function noteStrandedServer(address) {
   const notice = $("server-stranded");
-  notice.innerHTML = `${icon("alert")}<div>This app now signs in to <strong>${esc(DEFAULT_SERVER)}</strong>.
+  notice.innerHTML = `${icon("alert")}<div>This app signs in to <strong>${esc(DEFAULT_SERVER)}</strong>.
     You last used <strong>${esc(address)}</strong>, and an account made there can only be opened there \u2014
-    its password is tied to that address. The server box is left for you to change.</div>`;
+    its password is tied to that address, so signing in here will be refused.</div>`;
   notice.classList.remove("hidden");
 }
 
@@ -2738,8 +2737,8 @@ $("server").placeholder = DEFAULT_SERVER;
 // An install that was signed in somewhere else keeps the field; everyone
 // else gets the pinned address. See unlockServerFor().
 const strandedServer = ALLOW_CUSTOM_SERVER ? null : Screens.strandedAddress(recall("server"), DEFAULT_SERVER);
-if (strandedServer) unlockServerFor(strandedServer);
-else if (!ALLOW_CUSTOM_SERVER) lockServerAddress();
+if (!ALLOW_CUSTOM_SERVER) lockServerAddress();
+if (strandedServer) noteStrandedServer(strandedServer);
 syncServerSummary();
 $("email").value = recall("email");
 setAuthMode("login");

@@ -251,10 +251,10 @@
      buttons carry them in their tooltips and in aria-keyshortcuts instead.
      The source order is primary-first, which is what Windows and the phone
      want, so this reverses the row rather than reordering the markup. */
-  [data-platform="macos"] .form .form-actions { flex-direction: row-reverse; justify-content: flex-start; }
-  [data-platform="macos"] .form .form-actions .muted { display: none; }
+  [data-platform="macos"] .form-actions { flex-direction: row-reverse; justify-content: flex-start; }
+  [data-platform="macos"] .form-actions .muted { display: none; }
 
-[data-platform="macos"] .topbar { min-height: 52px; padding: 0 14px 0 20px; gap: 10px; background: var(--content-bg); border-bottom: 1px solid var(--border); }
+  [data-platform="macos"] .topbar { min-height: 52px; padding: 0 14px 0 20px; gap: 10px; background: var(--content-bg); border-bottom: 1px solid var(--border); }
   [data-platform="macos"] .toolbar-app-title { display: block; font-size: 0.9375rem; font-weight: 700; }
   [data-platform="macos"] .toolbar-sub { display: block; font-size: 0.6875rem; color: var(--text-2); }
   [data-platform="macos"] #btn-new, [data-platform="macos"] #btn-refresh {

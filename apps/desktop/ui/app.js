@@ -83,6 +83,9 @@ const state = { secrets: [], projects: [], selected: null, editing: false, editT
   // What the server at the URL in the box offers, and the Google sign-in
   // waiting for a passphrase, if there is one.
   capabilities: null, google: null, user: null,
+  // Set when this install's account is on a server the pin would strand, so
+  // the address stays editable for it. See unlockServerFor().
+  serverUnlocked: false,
   // The user opened the registration-token field themselves, on a server that
   // did not say it needs one. Kept so a re-render does not fold it away again.
   tokenFieldOpen: false,
@@ -252,6 +255,20 @@ function infoButtonHtml(controls, text) {
   return `<button type="button" class="info-btn" data-info-for="${controls}"
     aria-controls="${controls}" aria-expanded="false"
     aria-label="What this means" title="${esc(text)}">${icon("info")}</button>`;
+}
+
+/// Focus something in the editor, opening "More details" first if it is
+/// folded away.
+///
+/// focus() on a hidden element does nothing, so an error that points at a
+/// folded field leaves the message on screen with no field to act on -- the
+/// same failure the fold is opened for when editing a secret that already
+/// has those fields filled in.
+function focusInForm(element) {
+  if (!element) return;
+  const fold = element.closest?.("#more-details");
+  if (fold?.classList.contains("hidden")) toggleDisclosure($("btn-more-details"), fold);
+  element.focus();
 }
 
 /// Show or hide `panel`, keeping `button`'s aria-expanded honest.
@@ -573,7 +590,24 @@ function applySafeAreaInsets() {
 /// The address this app signs in to. Never reads the field while
 /// ALLOW_CUSTOM_SERVER is off; see Screens.serverUrlFor().
 function currentServerUrl() {
-  return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER, $("server").value, DEFAULT_SERVER);
+  return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER || state.serverUnlocked, $("server").value, DEFAULT_SERVER);
+}
+
+/// Say what happened to an install whose account is on another server, and
+/// give the field back so it can still be reached.
+///
+/// The pin is for people whose vault is on DEFAULT_SERVER. Stranding anyone
+/// else was never the point of it: their credential is bound to the address
+/// they used, so signing in here cannot work, and the failure would read as
+/// a wrong passphrase. See Screens.strandedAddress().
+function unlockServerFor(address) {
+  state.serverUnlocked = true;
+  $("server").value = address;
+  const notice = $("server-stranded");
+  notice.innerHTML = `${icon("alert")}<div>This app now signs in to <strong>${esc(DEFAULT_SERVER)}</strong>.
+    You last used <strong>${esc(address)}</strong>, and an account made there can only be opened there \u2014
+    its password is tied to that address. The server box is left for you to change.</div>`;
+  notice.classList.remove("hidden");
 }
 
 /// Take the address out of the person's hands without taking it out of sight.
@@ -855,12 +889,10 @@ function renderGoogleLinkForm({ afterEviction = false } = {}) {
              get back.
            </p>`
         : ""}
-      <p class="card-lead">
-        ${linked
-          ? `<strong>${esc(linked)}</strong> can sign in to this account without your passphrase.
-             Remove it if you did not add it, or if you no longer want to sign in that way.`
-          : ""}
-      </p>
+      ${linked
+        ? `<p class="card-lead"><strong>${esc(linked)}</strong> can sign in to this account without your
+           passphrase. Remove it if you did not add it, or if you no longer want to sign in that way.</p>`
+        : ""}
       <div class="field">
         <label for="gl-current">Your passphrase</label>
         <input id="gl-current" type="password" autocomplete="current-password" spellcheck="false">
@@ -2547,7 +2579,13 @@ function renderForm(existing) {
     if (event.key === "Escape") { event.preventDefault(); cancel(); return; }
     // Enter alone is a newline inside Notes, so saving from there needs the
     // modifier; requestSubmit() runs the same path as the button.
-    if (Screens.isSaveShortcut(event)) { event.preventDefault(); form.requestSubmit(); }
+    if (Screens.isSaveShortcut(event)) {
+      event.preventDefault();
+      // requestSubmit() is Safari 16 / WebKitGTK 2.38, above the floor this
+      // app holds itself to; clicking the button runs the same onsubmit.
+      if (typeof form.requestSubmit === "function") form.requestSubmit();
+      else $("btn-save").click();
+    }
   });
   form.onsubmit = async (event) => {
     event.preventDefault();
@@ -2573,7 +2611,7 @@ function renderForm(existing) {
           "To get rid of the field instead, use its Remove button.",
       );
       const rows = $("custom-fields").querySelectorAll(".custom-field");
-      rows[needValues[0].index]?.querySelector(".cf-value")?.focus();
+      focusInForm(rows[needValues[0].index]?.querySelector(".cf-value"));
       return;
     }
 
@@ -2583,7 +2621,7 @@ function renderForm(existing) {
     const unlabelled = state.formFields.findIndex((field) => field.label.trim() === "" && (field.kept || field.value));
     if (unlabelled !== -1) {
       setError("form-error", "Give every extra field a label, or remove it.");
-      $("custom-fields").querySelectorAll(".custom-field")[unlabelled]?.querySelector(".cf-label")?.focus();
+      focusInForm($("custom-fields").querySelectorAll(".custom-field")[unlabelled]?.querySelector(".cf-label"));
       return;
     }
     if (!existing && !entry.password) { setError("form-error", "Enter a password or generate one."); $("f-password").focus(); return; }
@@ -2610,7 +2648,7 @@ function renderForm(existing) {
     } catch (error) {
       setError("form-error", error);
       // A field the error names gets the focus, the way the checks above do.
-      if (error?.field) $(error.field)?.focus();
+      if (error?.field) focusInForm($(error.field));
       setBusy($("btn-save"), false);
     }
   };
@@ -2697,7 +2735,11 @@ applyTheme(recall(THEME_KEY) || "system");
 
 $("server").value = (ALLOW_CUSTOM_SERVER && recall("server")) || DEFAULT_SERVER;
 $("server").placeholder = DEFAULT_SERVER;
-if (!ALLOW_CUSTOM_SERVER) lockServerAddress();
+// An install that was signed in somewhere else keeps the field; everyone
+// else gets the pinned address. See unlockServerFor().
+const strandedServer = ALLOW_CUSTOM_SERVER ? null : Screens.strandedAddress(recall("server"), DEFAULT_SERVER);
+if (strandedServer) unlockServerFor(strandedServer);
+else if (!ALLOW_CUSTOM_SERVER) lockServerAddress();
 syncServerSummary();
 $("email").value = recall("email");
 setAuthMode("login");

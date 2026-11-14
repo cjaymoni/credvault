@@ -14,6 +14,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const APP_JS = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
+/// Whitespace-flattened, because these sentences live in template literals
+/// and get re-wrapped whenever a line grows. The test is about whether the
+/// sentence is still printed, not about where it breaks.
+const APP_TEXT = APP_JS.replace(/\s+/g, " ");
 
 /// The text of every `const *_NOTE`/`*_DISCLOSURE` string, which is what is
 /// hidden until someone asks for it.
@@ -68,7 +72,7 @@ const MUST_STAY_PRINTED = [
 test("a warning about what a button does is never folded away", () => {
   const folded = foldedTexts();
   for (const warning of MUST_STAY_PRINTED) {
-    assert.ok(APP_JS.includes(warning), `"${warning}" is gone from the interface entirely`);
+    assert.ok(APP_TEXT.includes(warning), `"${warning}" is gone from the interface entirely`);
     for (const { name, text } of folded) {
       assert.ok(
         !text.includes(warning),

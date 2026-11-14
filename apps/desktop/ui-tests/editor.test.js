@@ -154,7 +154,12 @@ test("a named key keeps the spelling each spelling wants", () => {
 });
 
 test("the form binds the shortcut rather than re-deriving it", () => {
-  assert.match(APP_JS, /if \(Screens\.isSaveShortcut\(event\)\) \{ event\.preventDefault\(\); form\.requestSubmit\(\); \}/);
+  assert.match(APP_JS, /if \(Screens\.isSaveShortcut\(event\)\)/);
+  // requestSubmit() is Safari 16 / WebKitGTK 2.38, above this app's floor,
+  // so it must be reached through a check with a fallback that runs the same
+  // submit handler.
+  assert.match(APP_JS, /typeof form\.requestSubmit === "function"/);
+  assert.match(APP_JS, /\$\("btn-save"\)\.click\(\)/);
   // requestSubmit, not submit(): submit() skips validation and the submit
   // handler, which is where every check in this form lives.
   assert.ok(!/form\.submit\(\)/.test(APP_JS), "form.submit() bypasses the submit handler");
@@ -164,8 +169,11 @@ test("the save button names its shortcut where the caption no longer does", () =
   assert.match(APP_JS, /aria-keyshortcuts="\$\{Screens\.shortcutKeys\(PLATFORM, "Enter"\)\}"/);
   assert.match(APP_JS, /title="\$\{saveShortcut\} to save"/);
   const platformCss = fs.readFileSync(path.join(__dirname, "../ui/platform.css"), "utf8");
-  assert.match(platformCss, /\[data-platform="macos"\] \.form \.form-actions \{ flex-direction: row-reverse;/);
-  assert.match(platformCss, /\[data-platform="macos"\] \.form \.form-actions \.muted \{ display: none; \}/);
+  // No `.form ` padding the selector: the platform layer already outranks
+  // components, so the extra class would be the habit STYLING.md retires.
+  assert.match(platformCss, /\[data-platform="macos"\] \.form-actions \{ flex-direction: row-reverse;/);
+  assert.match(platformCss, /\[data-platform="macos"\] \.form-actions \.muted \{ display: none; \}/);
+  assert.ok(!platformCss.includes('[data-platform="macos"] .form .form-actions'), "the padded selector is back");
 });
 
 // ----- labels inside a centred row -------------------------------------------

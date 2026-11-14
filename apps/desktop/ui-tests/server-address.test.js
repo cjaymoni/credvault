@@ -13,7 +13,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
-const { serverUrlFor } = require("../ui/screens.js");
+const { serverUrlFor, strandedAddress } = require("../ui/screens.js");
 
 const FALLBACK = "https://vault.example.com";
 const APP_JS = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
@@ -67,8 +67,9 @@ test("nothing reads the server field except the one reader and the lock", () => 
     .map((line, i) => [i + 1, line])
     .filter(([, line]) => /\$\("server"\)\.value/.test(line));
   const allowed = [
-    'return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER, $("server").value, DEFAULT_SERVER);',
+    'return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER || state.serverUnlocked, $("server").value, DEFAULT_SERVER);',
     '$("server").value = (ALLOW_CUSTOM_SERVER && recall("server")) || DEFAULT_SERVER;',
+    '$("server").value = address;',
     '  $("server-summary").textContent = Screens.serverSummaryText($("server").value, DEFAULT_SERVER);',
   ];
   for (const [lineNumber, line] of reads) {
@@ -100,7 +101,7 @@ test("the field and the phone line are both locked, not removed", () => {
   // Removing the markup would make the flag a lie: flipping it on has to
   // bring the feature back whole.
   assert.match(APP_JS, /function lockServerAddress\(\) \{/);
-  assert.match(APP_JS, /^if \(!ALLOW_CUSTOM_SERVER\) lockServerAddress\(\);$/m);
+  assert.match(APP_JS, /else if \(!ALLOW_CUSTOM_SERVER\) lockServerAddress\(\);/);
   assert.ok(INDEX_HTML.includes('id="btn-server-change"'), "the phone line was removed");
   assert.ok(INDEX_HTML.includes('id="server-field"'), "the server field was removed");
 });
@@ -108,4 +109,58 @@ test("the field and the phone line are both locked, not removed", () => {
 test("unfolding the field does nothing while the address is pinned", () => {
   const body = APP_JS.slice(APP_JS.indexOf("function showServerField()"));
   assert.match(body.slice(0, 200), /if \(!ALLOW_CUSTOM_SERVER\) return;/);
+});
+
+// ----- the installs the pin must not strand ----------------------------------
+//
+// `auth_hash` mixes the server's address into the credential, so an account
+// made on someone's own host cannot sign in to the default at all. Pinning
+// everybody would lock those people out with a rejection that reads as a
+// wrong passphrase, and would hand a server they never chose their email.
+
+test("an install that was on another server is reported", () => {
+  assert.equal(strandedAddress("https://vault.elsewhere.test", FALLBACK), "https://vault.elsewhere.test");
+  assert.equal(strandedAddress("http://127.0.0.1:8787", FALLBACK), "http://127.0.0.1:8787");
+  // A different path on the same host is a different instance, and the
+  // Rust side treats it as one too.
+  assert.equal(strandedAddress(FALLBACK + "/second", FALLBACK), FALLBACK + "/second");
+});
+
+test("an install that was already on the default is not", () => {
+  assert.equal(strandedAddress(FALLBACK, FALLBACK), null);
+  // The shapes the same address comes back in: a trailing slash, a different
+  // case, surrounding whitespace. Warning on one of these would send someone
+  // looking for an account that is exactly where they left it.
+  assert.equal(strandedAddress(FALLBACK + "/", FALLBACK), null);
+  assert.equal(strandedAddress("  " + FALLBACK + "  ", FALLBACK), null);
+  assert.equal(strandedAddress(FALLBACK.toUpperCase(), FALLBACK), null);
+});
+
+test("a fresh install has nothing to report", () => {
+  for (const nothing of ["", "   ", null, undefined]) {
+    assert.equal(strandedAddress(nothing, FALLBACK), null);
+  }
+});
+
+test("an unparseable remembered value is still reported rather than dropped", () => {
+  // It cannot be signed in to either, and saying so beats silently sending
+  // the credential somewhere else.
+  assert.equal(strandedAddress("not a url", FALLBACK), "not a url");
+});
+
+test("a missing fallback is refused", () => {
+  for (const bad of [undefined, null, "", 0]) {
+      assert.throws(() => strandedAddress("https://vault.elsewhere.test", bad), TypeError);
+  }
+});
+
+test("a stranded install keeps the field, and is told why", () => {
+  assert.match(APP_JS, /const strandedServer = ALLOW_CUSTOM_SERVER \? null : Screens\.strandedAddress\(recall\("server"\), DEFAULT_SERVER\);/);
+  assert.match(APP_JS, /if \(strandedServer\) unlockServerFor\(strandedServer\);/);
+  // The notice has to name both addresses, or it is just a failure with
+  // better manners.
+  const notice = APP_JS.slice(APP_JS.indexOf("function unlockServerFor("));
+  assert.match(notice.slice(0, 900), /esc\(DEFAULT_SERVER\)/);
+  assert.match(notice.slice(0, 900), /esc\(address\)/);
+  assert.ok(INDEX_HTML.includes('id="server-stranded"'), "the notice has nowhere to render");
 });

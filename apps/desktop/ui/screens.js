@@ -81,6 +81,39 @@
     return String(rawValue ?? "").trim() || fallback;
   }
 
+  /// The address this install was last signed in to, if pinning would strand
+  /// it. Null when there is nothing to worry about.
+  ///
+  /// `auth_hash` mixes the server's address into the credential, so an
+  /// account made on someone's own host cannot sign in to `fallback` at all:
+  /// the rejection reads as a wrong passphrase, and with the field locked
+  /// there is no way back. Submitting to `fallback` anyway would also hand a
+  /// server they never chose their email address and a login attempt.
+  ///
+  /// Compared loosely -- case, trailing slash, whitespace -- because this
+  /// decides whether to warn, and warning once too often is much cheaper
+  /// than locking somebody out of their vault. A superseded default is
+  /// reported too: signing in to `fallback` would have worked for it (the
+  /// Rust side retries those bindings), so the notice is redundant there
+  /// rather than wrong.
+  function strandedAddress(remembered, fallback) {
+    if (typeof fallback !== "string" || !fallback) {
+      throw new TypeError("strandedAddress needs the address the app now signs in to");
+    }
+    const canonical = (value) => {
+      const text = String(value ?? "").trim().replace(/\/+$/, "");
+      if (!text) return "";
+      try {
+        const url = new URL(text);
+        return `${url.protocol}//${url.host}${url.pathname}`.replace(/\/+$/, "").toLowerCase();
+      } catch {
+        return text.toLowerCase();
+      }
+    };
+    const was = canonical(remembered);
+    return was && was !== canonical(fallback) ? String(remembered).trim() : null;
+  }
+
   /// Whether the editor's "More details" section starts open.
   ///
   /// Creating, it is closed: a name, a username and a password are what a
@@ -430,5 +463,5 @@
     return shown ? `Version ${shown}` : null;
   }
 
-  return { esc, serverSummaryText, serverUrlFor, hasMoreDetails, isSaveShortcut, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
+  return { esc, serverSummaryText, serverUrlFor, strandedAddress, hasMoreDetails, isSaveShortcut, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
 });

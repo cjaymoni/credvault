@@ -89,7 +89,11 @@ test("the page asks the Android host under the name the host registers", () => {
 test("the host sends the four values the page unpacks", () => {
   // The bridge can only return a primitive, so the contract is a count and an
   // order. A mismatch would silently apply the wrong inset to an edge.
-  assert.match(MAIN_ACTIVITY, /lastInsets\.top, lastInsets\.right, lastInsets\.bottom, lastInsets\.left/);
+  // The host converts once and hands the string over; the bridge only reads
+  // it, because it runs on another thread.
+  assert.match(MAIN_ACTIVITY, /cssInsets = "\$top,\$right,\$bottom,\$left"/);
+  assert.match(MAIN_ACTIVITY, /@Volatile private var cssInsets/);
+  assert.match(MAIN_ACTIVITY, /fun cssPixels\(\): String = cssInsets/);
   const sides = APP_JS.match(/^const SAFE_AREA_SIDES = \[([^\]]+)\];$/m);
   assert.ok(sides, "app.js does not declare the order it unpacks");
   assert.deepStrictEqual(

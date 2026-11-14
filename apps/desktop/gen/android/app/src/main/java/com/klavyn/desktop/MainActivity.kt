@@ -30,6 +30,11 @@ class MainActivity : TauriActivity() {
   /// they cannot simply be applied once on the way in.
   private var lastInsets: Insets = Insets.NONE
 
+  /// What the bridge hands the page: the four insets in CSS pixels, in CSS
+  /// order. Written on the main thread, read on the JavaBridge thread, so it
+  /// is @Volatile and immutable rather than four fields read one at a time.
+  @Volatile private var cssInsets: String = "0,0,0,0"
+
   /// WryActivity keeps its own WebView private, so this is the only handle
   /// onResume() has. Cleared in onDestroy() so the activity does not outlive
   /// the view it is holding.
@@ -76,13 +81,15 @@ class MainActivity : TauriActivity() {
   /// Read by the page at startup; see applySafeAreaInsets() in app.js. Hands
   /// back the four CSS pixel values in one string, in CSS order, because a
   /// JavaScript interface can only return primitives.
+  ///
+  /// This runs on the WebView's own JavaBridge thread, not the main thread,
+  /// so it reads one @Volatile string and touches no View. Measuring here
+  /// would race the main-thread listener that writes the insets and could
+  /// hand the page zeros -- which is the bug this class exists to fix, only
+  /// intermittent.
   private inner class InsetBridge {
     @JavascriptInterface
-    fun cssPixels(): String {
-      val density = webView?.resources?.displayMetrics?.density?.takeIf { it > 0f } ?: 1f
-      return listOf(lastInsets.top, lastInsets.right, lastInsets.bottom, lastInsets.left)
-        .joinToString(",") { (it / density).toString() }
-    }
+    fun cssPixels(): String = cssInsets
   }
 
   /// Android reports insets in physical pixels; CSS wants density-independent
@@ -94,6 +101,10 @@ class MainActivity : TauriActivity() {
     val right = lastInsets.right / density
     val bottom = lastInsets.bottom / density
     val left = lastInsets.left / density
+    // The one conversion, kept for the bridge to hand over as-is. Computing
+    // it twice would mean two copies that have to agree about the order the
+    // page unpacks.
+    cssInsets = "$top,$right,$bottom,$left"
     webView.evaluateJavascript(
       """
       (function () {

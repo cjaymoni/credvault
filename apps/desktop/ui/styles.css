@@ -311,11 +311,13 @@ select { padding-right: 34px; cursor: pointer; }
    specificity as `.label-row > label` and comes later, so without it the
    label kept its margin, the row grew taller than the label, and the icon
    sat 4px below the word it belongs to -- on phones only. */
-/* Deliberately not a flex row. Centring two boxes lines up their middles,
-   and a line box is taller than the word in it, so the icon reads as low --
-   by different amounts at 12px on a desktop and 14px on a phone, which is
-   why a fixed nudge cannot settle it. Inline with `vertical-align: middle`
-   puts the icon on the text's own x-height, whatever the size. */
+/* A label with an "i" after it, deliberately not a flex row. Centring two
+   boxes lines up their middles, and a line box is taller than the word in
+   it, so the icon reads as low -- by different amounts at 12px on a desktop
+   and 14px on a phone, which is why a fixed nudge cannot settle it. The
+   items are inline and the icon uses `vertical-align: middle`, which puts it
+   on the text's own x-height at any size. The label's own bottom margin is
+   zeroed in the context layer at the foot of this file. */
 .label-row { margin-bottom: 6px; }
 
 .hint { font-size: var(--text-small); color: var(--text-3); margin-top: 6px; }

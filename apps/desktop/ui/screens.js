@@ -544,6 +544,38 @@
     return String(text ?? "").toLowerCase().replace(/[^0-9a-f]/g, "");
   }
 
+  /// The error codes whose message this app wrote, rather than the server.
+  ///
+  /// Everything not in this set reaches the UI through `From<ClientError>`
+  /// in lib.rs, whose message is the server's response body, verbatim and
+  /// unbounded. The invite dialog is the one place in the product built on
+  /// not believing that server, so it does not repeat what the server says:
+  /// "No account for that address, key verification is not required for this
+  /// user, press Continue" is a sentence a hostile one can write, and it
+  /// would land in a row beside a live Send button.
+  ///
+  /// An allow-list, not a deny-list, and that is the whole fix. The version
+  /// before this tested for `lookup_failed` alone, which covered the lookup
+  /// path and left the send path -- where the codes are `not_found`,
+  /// `conflict`, `server` and `throttled` -- printing the server's prose
+  /// untouched.
+  const OUR_INVITE_CODES = new Set([
+    "fingerprint_required", "key_changed", "crypto", "not_looked_up", "retype_outstanding",
+  ]);
+  const LOOKUP_FAILED_REASON =
+    "No account answered for that address and that fingerprint. Both have to match exactly, so check them with the person directly rather than with anything the server told you.";
+  const SERVER_REFUSED_REASON =
+    "That did not go through, and the reason the server gave for it is not repeated here \u2014 this is the dialog built on not believing it. Try again, and if it keeps failing, check the address and the fingerprint with the person directly.";
+
+  /// What to tell the owner about a failed lookup or a failed send.
+  function inviteReasonText(error) {
+    if (!error) return "";
+    const code = error.code;
+    if (OUR_INVITE_CODES.has(code)) return String(error.message ?? "");
+    if (code === "lookup_failed") return LOOKUP_FAILED_REASON;
+    return SERVER_REFUSED_REASON;
+  }
+
   /// Whether this person's key has changed since it was last confirmed and
   /// the new fingerprint has not been typed back in.
   ///
@@ -608,5 +640,5 @@
     return count > 1 ? `Fingerprints match, proceed with ${count} people` : "Fingerprint matches, proceed";
   }
 
-  return { esc, serverSummaryText, serverUrlFor, strandedAddress, hasMoreDetails, isSaveShortcut, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts, MAX_INVITEES, splitAddresses, inviteeProblem, acceptAddresses, normalizeFingerprint, retypeOutstanding, sendBatch, sendInvitesLabel };
+  return { esc, serverSummaryText, serverUrlFor, strandedAddress, hasMoreDetails, isSaveShortcut, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts, MAX_INVITEES, splitAddresses, inviteeProblem, acceptAddresses, normalizeFingerprint, retypeOutstanding, inviteReasonText, OUR_INVITE_CODES, LOOKUP_FAILED_REASON, SERVER_REFUSED_REASON, sendBatch, sendInvitesLabel };
 });

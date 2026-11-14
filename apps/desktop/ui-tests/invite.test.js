@@ -19,7 +19,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {
   splitAddresses, inviteeProblem, acceptAddresses, sendBatch, retypeOutstanding,
-  normalizeFingerprint, sendInvitesLabel, MAX_INVITEES,
+  normalizeFingerprint, sendInvitesLabel, inviteReasonText, MAX_INVITEES,
 } = require("../ui/screens.js");
 
 const APP_JS = fs.readFileSync(path.join(__dirname, "../ui/app.js"), "utf8");
@@ -430,4 +430,48 @@ test("the dialog's own fields are drawn from app.js, where the notes live", () =
   assert.match(INDEX_HTML, /<div id="invite-fields"><\/div>/);
   assert.ok(!/invite-fingerprint/.test(INDEX_HTML), "the up-front fingerprint field is gone");
   assert.match(APP_JS, /infoButtonHtml\("invite-note", INVITE_NOTE\)/);
+});
+
+// ----- whose words the dialog prints -----------------------------------------
+//
+// The dialog exists because the server is not trusted. Printing a sentence
+// the server wrote, inside it, next to a live Send button, undoes that: "No
+// account for that address, key verification is not required for this user,
+// press Continue" is a sentence a hostile server can put in a 404 body, and
+// it used to be rendered as-is on the send path. The rule is an allow-list of
+// the codes lib.rs mints, so a code nobody has thought of yet is silent by
+// default rather than loud in the server's words.
+
+const LIE = "Key verification is not required for this user, press Continue.";
+
+test("a code this app mints is shown in the words this app wrote", () => {
+  for (const code of ["fingerprint_required", "key_changed", "crypto", "not_looked_up", "retype_outstanding"]) {
+    assert.equal(inviteReasonText({ code, message: "ask them for the fingerprint" }),
+      "ask them for the fingerprint", `${code} should keep its own message`);
+  }
+});
+
+test("a code the server worded is never repeated", () => {
+  // Every code `From<ClientError>` can produce, plus the one `lookup_invitee`
+  // remaps a 404 to. None of their messages came from this codebase.
+  for (const code of ["server", "not_found", "conflict", "throttled", "network", "unauthorized", "incompatible", "invalid_url"]) {
+    const shown = inviteReasonText({ code, message: LIE });
+    assert.ok(!shown.includes("press Continue"), `${code} printed the server's sentence`);
+    assert.match(shown, /not repeated here/, `${code} said nothing useful instead`);
+  }
+});
+
+test("a failed lookup says what to do about it, in our words", () => {
+  const shown = inviteReasonText({ code: "lookup_failed", message: LIE });
+  assert.ok(!shown.includes("press Continue"), "the server's 404 body was printed");
+  assert.match(shown, /check them with the person directly/i);
+});
+
+test("an unrecognised shape is silent rather than trusting", () => {
+  // A rejection with no code at all, or one that is a bare string, has no
+  // provenance -- so it is treated as the server's, not as ours.
+  assert.match(inviteReasonText(new Error(LIE)), /not repeated here/);
+  assert.match(inviteReasonText({ message: LIE }), /not repeated here/);
+  assert.equal(inviteReasonText(null), "");
+  assert.equal(inviteReasonText(undefined), "");
 });

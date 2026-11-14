@@ -96,6 +96,12 @@ const state = { secrets: [], projects: [], selected: null, editing: false, editT
   // secret put the id back and re-armed every guard that watched it -- a
   // cancelled batch would resume into the dialog that had just replaced it.
   inviteSession: 0,
+  // Every address the server was caught substituting a key for, for the life
+  // of one run of the dialog. Keyed by address rather than flagged on the
+  // person, because dropping somebody from the batch and typing them in
+  // again builds a new person object -- which would have been a way to clear
+  // the one alarm this dialog exists to raise by retyping an address.
+  caughtSubstituting: new Set(),
   // What the server at the URL in the box offers, and the Google sign-in
   // waiting for a passphrase, if there is one.
   capabilities: null, google: null, user: null,
@@ -1960,7 +1966,13 @@ function openInviteDialog(id) {
   state.inviteFor = id;
   state.inviteSession = ++inviteSessions;
   state.invitees = [];
+  state.caughtSubstituting = new Set();
+  // `form.reset()` puts the fields back but not the button: `btn-invite` is
+  // static markup outside the region `renderInviteFields` rewrites, so it is
+  // the same node this dialog's predecessor left behind. One abandoned
+  // mid-lookup used to hand its busy state over, and Continue came up dead.
   $("invite-form").reset();
+  setBusy($("btn-invite"), false);
   $("invite-form").classList.remove("hidden");
   $("invite-confirm").innerHTML = "";
   setError("invite-error", "");
@@ -2077,6 +2089,7 @@ function closeInviteDialog() {
   state.inviteFor = null;
   state.inviteSession = 0;
   state.invitees = [];
+  state.caughtSubstituting = new Set();
   $("btn-open-invite")?.focus();
 }
 
@@ -2099,7 +2112,13 @@ async function submitInvite(event) {
     if (state.inviteSession !== session) return; // this dialog has been and gone
     renderInviteCheck(id);
   } finally {
-    setBusy($("btn-invite"), false);
+    // Only if this run is still the one on screen. The session check above
+    // returns early for an abandoned dialog, but a `finally` runs anyway --
+    // and this button survives a close and a reopen, so clearing it
+    // unconditionally reached into whatever dialog had replaced this one.
+    // It cleared the busy flag with the *old* label and, on the way in,
+    // left Continue disabled until an abandoned lookup happened to return.
+    if (state.inviteSession === session) setBusy($("btn-invite"), false);
   }
 }
 
@@ -2138,6 +2157,7 @@ async function lookUpOne(person) {
   } catch (error) {
     person.info = null;
     person.error = error;
+    noteSubstitution(person, error);
   } finally {
     person.pending = false;
   }
@@ -2146,6 +2166,29 @@ async function lookUpOne(person) {
 /// Comparing fingerprints by eye, and the rule about a key that changed,
 /// both live in screens.js where they can be tested without a dialog.
 const normalizeFingerprint = Screens.normalizeFingerprint;
+
+/// Said when a key arrives for somebody the server was already caught
+/// substituting one for. Not a per-version disclosure and not a hint: it is
+/// the record of the one event this dialog exists to catch.
+const SUBSTITUTION_SEEN =
+  "Earlier in this dialog the server answered for this person with a key that did not match the fingerprint you entered. This one does match. The server has still been caught once, so do not go on unless this fingerprint came from them directly.";
+
+/// What to tell the owner about a failure, in words this app chose rather
+/// than the server's. The rule itself is in screens.js, with the others.
+const inviteReasonText = Screens.inviteReasonText;
+
+/// Remember a substitution against the address, for as long as this dialog
+/// lives. Called from both paths that can catch one: the lookup and the send.
+function noteSubstitution(person, error) {
+  if (error?.code === "key_changed") state.caughtSubstituting.add(person.email);
+}
+
+/// Whether this dialog has already caught the server substituting a key for
+/// this person. A later lookup that succeeds does not undo it: the evidence
+/// is the point, and it used to disappear the moment the row redrew green.
+function caughtSubstituting(person) {
+  return state.caughtSubstituting.has(person.email);
+}
 
 /// One person in the check step: the key the server offers for them, or the
 /// field that fetches it.
@@ -2181,12 +2224,27 @@ function inviteCheckRow(person, index) {
       </li>`;
   }
   if (info) {
+    // A key that arrives after a substitution was caught keeps the red
+    // notice. It was drawn from `person.error.code` alone, which the next
+    // lookup overwrites, so the one event this dialog exists to record
+    // vanished as soon as the server relented and served an honest key.
+    //
+    // The notice stays; Send does not stay dead. The only way back to a key
+    // at all is a lookup that matched a fingerprint the owner typed in from
+    // the other person's own window, so the check has been made, not skipped
+    // -- and a second challenge for the same fingerprint would be theatre.
+    const caught = caughtSubstituting(person);
     const known = info.status === "known";
+    const badge = caught
+      ? `<span class="badge danger">Was substituted</span>`
+      : `<span class="badge${known ? " accent" : ""}">${known ? "Confirmed before" : "New key"}</span>`;
     return `
       <li class="check-row">
-        ${head(`<span class="badge${known ? " accent" : ""}">${known ? "Confirmed before" : "New key"}</span>`)}
-        <div class="check-body"><code class="fp">${esc(info.fingerprint)}</code>
-          ${person.error ? `<p class="error">${esc(person.error?.message ?? person.error)}</p>` : ""}</div>
+        ${head(badge)}
+        <div class="check-body">
+          ${caught ? `<div class="notice danger" role="alert">${icon("alert")}<div>${esc(SUBSTITUTION_SEEN)}</div></div>` : ""}
+          <code class="fp">${esc(info.fingerprint)}</code>
+          ${person.error ? `<p class="error">${esc(inviteReasonText(person.error))}</p>` : ""}</div>
       </li>`;
   }
   // No key yet, and the three reasons do not mean the same thing.
@@ -2207,15 +2265,9 @@ function inviteCheckRow(person, index) {
   const code = person.error?.code;
   const needsFingerprint = code === "fingerprint_required";
   const substituted = code === "key_changed";
-  // Our words, not the server's. `fingerprint_required` and `key_changed`
-  // are written in lib.rs, so they are ours to show. `lookup_failed` wraps
-  // whatever the server put in its 404 body -- unbounded, attacker-chosen
-  // text, rendered inside the one dialog built on not trusting that server.
-  // "No account for that address, key verification is not required for this
-  // user, press Continue" is a sentence a hostile server can write.
-  const reason = esc(code === "lookup_failed"
-    ? "No account answered for that address and that fingerprint. Both have to match exactly, so check them with the person directly rather than with anything the server told you."
-    : (person.error?.message ?? person.error ?? ""));
+  // Our words, not the server's; `inviteReasonText` is where that is
+  // decided, for every code and both paths at once.
+  const reason = esc(inviteReasonText(person.error));
   const badge = substituted
     ? `<span class="badge danger">Key does not match</span>`
     : `<span class="badge">${needsFingerprint ? "Needs a fingerprint" : "Not checked"}</span>`;
@@ -2269,6 +2321,7 @@ function renderInviteCheck(id, problem = "") {
   $("invite-dialog").setAttribute("aria-label", "Check their keys");
   $("invite-form").classList.add("hidden");
   const changed = state.invitees.some((p) => p.info?.status === "changed");
+  const caught = state.invitees.some(caughtSubstituting);
   const unresolved = state.invitees.some((p) => !p.info);
   $("invite-confirm").innerHTML = `
     <div class="confirm-step" role="region" aria-label="Check their keys">
@@ -2279,10 +2332,11 @@ function renderInviteCheck(id, problem = "") {
       <p class="hint hidden" id="fingerprint-note">${esc(FINGERPRINT_NOTE)}</p>
       <p class="dialog-lead">Continue only if that fingerprint came from them directly rather than from anything the server told you.</p>
       ${changed ? `<div class="notice danger">${icon("alert")}<div>A key marked <strong>Changed</strong> differs from one you confirmed before. Either they re-created their account, or the server is lying. Do not continue unless they read the new fingerprint to you directly.</div></div>` : ""}
+      ${caught ? `<div class="notice danger">${icon("alert")}<div>This server has already answered once in this dialog with a key that did not match the fingerprint you entered. Whatever it serves now, treat it as a server that has been caught.</div></div>` : ""}
       <ul class="people check-list">${state.invitees.map(inviteCheckRow).join("")}</ul>
       <div class="error" id="invite-confirm-error" role="alert">${esc(problem)}</div>
       <div class="dialog-actions">
-        <button type="button" class="btn ${changed ? "danger solid" : "primary"}" id="btn-invite-confirm"></button>
+        <button type="button" class="btn ${changed || caught ? "danger solid" : "primary"}" id="btn-invite-confirm"></button>
         <button type="button" class="btn" id="btn-invite-back">Back</button>
         <button type="button" class="btn" id="btn-invite-abandon">Cancel</button>
       </div>
@@ -2298,7 +2352,12 @@ function renderInviteCheck(id, problem = "") {
     // disabled, the button stuck on "Inviting...", and nothing anywhere to
     // say why.
     sendInvites(id).catch((error) => {
-      setError("invite-confirm-error", error);
+      // The same rule as the rows: whatever threw, the owner is told in
+      // words from this file. The original goes to the console, which is
+      // where a fault in this code is diagnosed -- and not somewhere a
+      // server can put a sentence in front of anyone.
+      console.error("sending the invite batch failed", error);
+      setError("invite-confirm-error", inviteReasonText(error));
       freezeInviteCheck(false);
       setBusy($("btn-invite-confirm"), false);
     });
@@ -2355,7 +2414,7 @@ function renderInviteCheck(id, problem = "") {
   if (restoreCaret(held)) return;
   const firstInput = box.querySelector(".check-row input");
   if (firstInput) firstInput.focus();
-  else (changed || unresolved ? $("btn-invite-back") : $("btn-invite-confirm")).focus();
+  else (changed || caught || unresolved ? $("btn-invite-back") : $("btn-invite-confirm")).focus();
 }
 
 function backToInviteFields() {
@@ -2462,11 +2521,15 @@ async function sendInvites(id) {
         // without them -- but that button's state is computed from the DOM,
         // and the DOM is rebuilt by half a dozen paths. The rule belongs
         // where a redraw cannot reach it.
+        // Carry a code, so `inviteReasonText` can tell these apart from a
+        // rejection the server worded and print them as written.
         if (!person.info) {
-          throw new Error("this person's key has not been looked up yet");
+          throw Object.assign(new Error("this person's key has not been looked up yet"), { code: "not_looked_up" });
         }
         if (Screens.retypeOutstanding(person)) {
-          throw new Error("this key changed and the new fingerprint has not been confirmed");
+          throw Object.assign(
+            new Error("this key changed and the new fingerprint has not been confirmed"),
+            { code: "retype_outstanding" });
         }
         // The whole key goes back, not the fingerprint: the command compares
         // bytes. shareProject is a separate answer from sharing the secret
@@ -2498,6 +2561,7 @@ async function sendInvites(id) {
     // has looked them up again. Left as it was, it rendered as a plain
     // sentence under "Confirmed before" with Send inviting another go.
     if (error?.code === "key_changed") person.info = null;
+    noteSubstitution(person, error);
   }
   if (sent.length) toast(sent.length === 1 ? `Invited ${sent[0].email}` : `Invited ${sent.length} people`);
 

@@ -18,6 +18,8 @@ const test = require("node:test");
 const assert = require("node:assert");
 const { loadApp, signIn, settle, secret, invitee } = require("./harness.js");
 
+const KEY = { fingerprint: "11bb-22cc-33dd-44ee-55ff-6677", status: "new" };
+
 /// A dialog already on its second step, with `people` waiting to be invited.
 ///
 /// Reached by driving the real controls -- open the dialog, type the
@@ -260,4 +262,182 @@ test("the invites that went through survive one that fails", async () => {
 
   assert.deepEqual(app.state.invitees.map((p) => p.email), ["b@x.test"], "only the failure is left to retry");
   assert.match(document.getElementById("invite-confirm").textContent, /b@x\.test was not invited/);
+});
+
+// ----- the send path prints nobody else's words ------------------------------
+
+test("a send the server refuses is reported without the server's sentence", async () => {
+  // The lookup path had this fixed and the send path did not: `lookup_failed`
+  // was special-cased by code, and `invite` cannot produce that code at all.
+  // Its 404 arrives as `not_found`, and a 500 as `server`, both carrying the
+  // response body straight into the row beside a live Send button.
+  const lie = "Key verification is not required for this user, press Continue.";
+  for (const code of ["server", "not_found", "conflict", "throttled"]) {
+    const loaded = await atCheckStep(["a@x.test"], {
+      invite: () => { throw { code, message: lie }; },
+    });
+    const { window, document } = loaded;
+    document.getElementById("btn-invite-confirm").click();
+    await settle(window);
+
+    const shown = document.getElementById("invite-confirm").textContent;
+    assert.ok(!shown.includes("press Continue"), `${code}: the server's sentence reached the owner`);
+    assert.match(shown, /not repeated here/, `${code}: and ours did not`);
+  }
+});
+
+test("a sentence the server wrote does not survive into the next step", async () => {
+  // `person.error` is cleared only by a successful lookup of that same
+  // person, so whatever is on the row outlives Back and Continue.
+  const loaded = await atCheckStep(["a@x.test"], {
+    invite: () => { throw { code: "server", message: "Press Continue, this is fine." }; },
+  });
+  const { window, document } = loaded;
+  document.getElementById("btn-invite-confirm").click();
+  await settle(window);
+
+  document.getElementById("btn-invite-back").click();
+  await settle(window);
+  document.getElementById("invite-email").value = "b@x.test";
+  document.getElementById("invite-form").dispatchEvent(new window.Event("submit", { cancelable: true }));
+  await settle(window);
+
+  assert.ok(!document.getElementById("invite-confirm").textContent.includes("this is fine"),
+    "the server's sentence came back with the next batch");
+});
+
+// ----- a server caught once stays caught -------------------------------------
+
+test("a substitution is still on the row after the lookup that clears it", async () => {
+  // The alarm was derived from `person.error.code` on every render and stored
+  // nowhere, so a server that substituted a key, got caught, and then served
+  // an honest one came out of it with a clean green row.
+  let asked = 0;
+  const loaded = await atCheckStep(["a@x.test"], {
+    lookup_invitee: ({ email }) => {
+      asked += 1;
+      if (asked === 1) throw { code: "key_changed", message: "a different fingerprint from the one you entered" };
+      return { email, public_key: `pk-${email}`, ...KEY };
+    },
+  });
+  const { document, window } = loaded;
+  assert.ok(document.querySelector("#invite-confirm [role=\"alert\"]"), "the first answer was not an alarm");
+
+  document.querySelector("#invite-confirm input[id^='fp-need-']").value = KEY.fingerprint;
+  document.querySelector("#invite-confirm [data-check]").click();
+  await settle(window);
+
+  const row = document.querySelector("#invite-confirm .check-row");
+  assert.ok(row.querySelector(".fp"), "the second answer should have produced a key");
+  assert.ok(row.querySelector("[role=\"alert\"]"), "the alarm was cleared by pressing Check");
+  assert.match(row.querySelector(".badge").textContent, /substituted/i, "the row went back to an ordinary badge");
+  assert.ok(document.getElementById("btn-invite-confirm").classList.contains("danger"),
+    "the step carried on as though nothing had happened");
+});
+
+test("a substitution caught at send time is still on the row afterwards", async () => {
+  let asked = 0;
+  const loaded = await atCheckStep(["a@x.test"], {
+    invite: () => { throw { code: "key_changed", message: "a different key than the one you confirmed" }; },
+    lookup_invitee: ({ email }) => { asked += 1; return { email, public_key: `pk-${email}`, ...KEY }; },
+  });
+  const { document, window } = loaded;
+  document.getElementById("btn-invite-confirm").click();
+  await settle(window);
+
+  document.querySelector("#invite-confirm input[id^='fp-need-']").value = KEY.fingerprint;
+  document.querySelector("#invite-confirm [data-check]").click();
+  await settle(window);
+
+  const row = document.querySelector("#invite-confirm .check-row");
+  assert.ok(row.querySelector("[role=\"alert\"]"), "the send-time alarm was cleared by pressing Check");
+  assert.ok(asked >= 2, "the recheck did not actually happen, so the test proves nothing");
+});
+
+test("taking somebody out and typing them in again does not clear the alarm", async () => {
+  // The record is kept against the address, not flagged on the person: a
+  // dropped recipient is a new object, which would have made retyping an
+  // address the way to make the alarm go away.
+  let asked = 0;
+  const loaded = await atCheckStep(["a@x.test"], {
+    lookup_invitee: ({ email }) => {
+      asked += 1;
+      if (asked === 1) throw { code: "key_changed", message: "a different fingerprint from the one you entered" };
+      return { email, public_key: `pk-${email}`, ...KEY };
+    },
+  });
+  const { window, document } = loaded;
+  assert.ok(document.querySelector("#invite-confirm [role=\"alert\"]"), "the first answer was not an alarm");
+
+  document.getElementById("btn-invite-back").click();
+  await settle(window);
+  document.querySelector("#invite-recipients [data-remove]").click();
+  document.getElementById("invite-email").value = "a@x.test";
+  document.getElementById("invite-form").dispatchEvent(new window.Event("submit", { cancelable: true }));
+  await settle(window);
+
+  const row = document.querySelector("#invite-confirm .check-row");
+  assert.ok(row.querySelector(".fp"), "the second lookup should have produced a key");
+  assert.ok(row.querySelector("[role=\"alert\"]"), "retyping the address cleared the alarm");
+});
+
+// ----- a lookup abandoned with its dialog ------------------------------------
+
+test("a lookup left in flight does not reach into the dialog that replaced it", async () => {
+  // `btn-invite` is static markup outside the region `renderInviteFields`
+  // rewrites, so it is the same node across a close and a reopen, and
+  // `form.reset()` does not touch `disabled`. Two things followed from the
+  // cleanup not checking whose run it belonged to: the next dialog opened
+  // with a dead Continue and no explanation, and when the abandoned lookup
+  // finally returned it cleared the *live* dialog's busy state mid-lookup.
+  const gate = (email) => {
+    let release;
+    const promise = new Promise((resolve) => { release = resolve; });
+    return { promise, release: () => release({ email, public_key: `pk-${email}`, ...KEY }) };
+  };
+  const gates = { "a@x.test": gate("a@x.test"), "b@x.test": gate("b@x.test") };
+  const loaded = await loadApp({
+    answers: {
+      list_secrets: () => [secret()],
+      lookup_invitee: ({ email }) => gates[email].promise,
+      invite: () => null,
+    },
+  });
+  await signIn(loaded);
+  const { app, window, document } = loaded;
+  const button = () => document.getElementById("btn-invite");
+  const lookUp = async (email) => {
+    document.getElementById("invite-email").value = email;
+    document.getElementById("invite-form").dispatchEvent(new window.Event("submit", { cancelable: true }));
+    await settle(window);
+  };
+
+  app.openInviteDialog(1);
+  await lookUp("a@x.test");
+  assert.equal(button().disabled, true, "the first lookup should be running");
+
+  // Abandoned mid-lookup, and a second run started on the same secret.
+  app.closeInviteDialog();
+  app.openInviteDialog(1);
+  await settle(window);
+  assert.equal(button().disabled, false, "the new dialog opened with the abandoned one's busy button");
+  assert.equal(button().textContent, "Continue", "and with the abandoned one's label");
+
+  await lookUp("b@x.test");
+  assert.equal(button().disabled, true, "the second lookup should be running");
+
+  // The abandoned lookup returns while the live one is still out.
+  gates["a@x.test"].release();
+  await settle(window);
+  assert.equal(button().disabled, true, "the abandoned lookup woke the live dialog's button up");
+  assert.match(button().textContent, /Checking/, "the abandoned lookup relabelled the live dialog's button");
+  assert.equal(document.getElementById("invite-form").classList.contains("hidden"), false,
+    "the abandoned lookup drew its own check step over the live dialog");
+
+  gates["b@x.test"].release();
+  await settle(window);
+  assert.equal(document.getElementById("invite-form").classList.contains("hidden"), true,
+    "the live lookup did not reach its own check step");
+  assert.deepEqual([...document.querySelectorAll("#invite-confirm .check-row .who")].map((el) => el.textContent),
+    ["b@x.test"], "the check step is not the one the live dialog asked for");
 });

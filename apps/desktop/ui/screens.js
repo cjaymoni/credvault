@@ -63,6 +63,58 @@
     return shown.length > limit ? `\u2026${shown.slice(-(limit - 1))}` : shown;
   }
 
+  /// Which address a sign-in actually submits.
+  ///
+  /// `allowCustom` off pins every sign-in to `fallback`, whatever is in the
+  /// field: the field is not editable then, but a value an earlier build
+  /// remembered would otherwise still be read out of it and a credential sent
+  /// somewhere the person can no longer see. See ALLOW_CUSTOM_SERVER in
+  /// app.js for why it is off.
+  ///
+  /// `fallback` is required for the same reason it is in serverSummaryText():
+  /// submitting a blank address is worse than failing loudly.
+  function serverUrlFor(allowCustom, rawValue, fallback) {
+    if (typeof fallback !== "string" || !fallback) {
+      throw new TypeError("serverUrlFor needs the address the form falls back to");
+    }
+    if (!allowCustom) return fallback;
+    return String(rawValue ?? "").trim() || fallback;
+  }
+
+  /// Whether the editor's "More details" section starts open.
+  ///
+  /// Creating, it is closed: a name, a username and a password are what a
+  /// secret usually is, and the rest is a second screenful that most people
+  /// scroll past. Editing is the opposite case -- a project, a URL, notes or
+  /// an extra field that someone already filled in must not be hidden behind
+  /// a toggle they have no reason to open, because a form that does not show
+  /// what it holds is a form that loses it.
+  function hasMoreDetails(existing) {
+    if (!existing) return false;
+    const filled = (value) => String(value ?? "").trim() !== "";
+    return Boolean(existing.project) ||
+      filled(existing.url) ||
+      filled(existing.notes) ||
+      (Array.isArray(existing.fields) && existing.fields.length > 0);
+  }
+
+  /// Whether a keystroke is "save this form".
+  ///
+  /// Either modifier counts on every platform, the way the vault's other
+  /// shortcuts are handled: the interface names one of them per platform,
+  /// but refusing the other buys nothing and surprises anyone on a keyboard
+  /// that is not their machine's own. Alt and Shift are excluded so a
+  /// combination meaning something else does not also save.
+  ///
+  /// It exists because the form holds a textarea, where Enter is a newline
+  /// and so cannot be submit. ⌘↩ is what a Mac form does there.
+  function isSaveShortcut(event) {
+    const { key, metaKey, ctrlKey, altKey, shiftKey } = event ?? {};
+    if (key !== "Enter") return false;
+    if (altKey || shiftKey) return false;
+    return Boolean(metaKey || ctrlKey);
+  }
+
   /// One section of the secrets list: an optional heading, then the rows.
   ///
   /// `#list` is a listbox and the rows are its options, so the wrapper the
@@ -289,13 +341,23 @@
   /// An unknown platform gets Ctrl, matching the Linux look it is given.
   /// A missing key is a bug rather than a label, and says so: printing
   /// "⌘undefined" in a tooltip would be worse than failing here.
+  /// A key as both spellings want it written.
+  ///
+  /// A single character is upper-cased, because a shortcut is ⌘N and
+  /// `aria-keyshortcuts` names that key "N". A key with a name of its own --
+  /// Enter, Escape, Tab -- is left alone: the spec's key set spells it
+  /// "Enter", and "ENTER" is not a key any of it names.
+  function namedKey(key) {
+    return key.length === 1 ? key.toUpperCase() : key;
+  }
+
   function shortcutLabel(platform, key) {
     if (typeof key !== "string" || !key) {
       throw new TypeError("shortcutLabel needs the key the shortcut is pressed with");
     }
     // Upper case in both spellings: a shortcut is written ⌘N, not ⌘n, and
     // aria-keyshortcuts takes the key's own name, which is "N".
-    const named = key.toUpperCase();
+    const named = namedKey(key);
     return COMMAND_KEY_PLATFORMS.includes(platform) ? `⌘${named}` : `Ctrl+${named}`;
   }
 
@@ -311,7 +373,7 @@
       throw new TypeError("shortcutKeys needs the key the shortcut is pressed with");
     }
     const modifier = COMMAND_KEY_PLATFORMS.includes(platform) ? "Meta" : "Control";
-    return `${modifier}+${key.toUpperCase()}`;
+    return `${modifier}+${namedKey(key)}`;
   }
 
   /// The platforms whose own apps print shortcuts in the interface at all.
@@ -368,5 +430,5 @@
     return shown ? `Version ${shown}` : null;
   }
 
-  return { esc, serverSummaryText, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
+  return { esc, serverSummaryText, serverUrlFor, hasMoreDetails, isSaveShortcut, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
 });

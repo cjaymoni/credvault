@@ -40,19 +40,49 @@ const STYLESHEETS = fs.readdirSync(UI_DIR).filter((name) => name.endsWith(".css"
 /// descend into, so listing it would claim a handling that is not there.
 const BLOCK_AT_RULES = ["@media", "@supports", "@keyframes", "@layer"];
 
-/// Every rule in a stylesheet, flattened, as `{ at, selector, declarations }`.
+/// The statement at-rules the reader understands. Each ends at a `;` and
+/// wraps nothing, so the reader steps over them rather than descending.
+const STATEMENT_AT_RULES = ["@layer", "@charset", "@import", "@namespace"];
+
+/// Fail on a statement at-rule nobody has thought about, rather than folding
+/// it into the prelude of the block that follows.
+function assertStatementsAreKnown(text) {
+  for (const statement of text.split(";").map((s) => s.trim()).filter(Boolean)) {
+    assert.ok(statement.startsWith("@"), `${statement}: a declaration outside any rule`);
+    const name = statement.split(/[\s(]/)[0];
+    assert.ok(
+      STATEMENT_AT_RULES.includes(name),
+      `${name} is not a statement at-rule the reader in this file handles. Extend it.`,
+    );
+  }
+}
+
+/// What follows the last rule must be nothing but statements and whitespace.
+function assertNoRuleAfter(text) {
+  assertStatementsAreKnown(text.replace(/[\s]/g, " "));
+}
+
+/// Every rule in a stylesheet, flattened, as `{ at, layer, selector, declarations }`.
 ///
 /// `at` is the enclosing at-rule preludes outermost first, so a rule inside
 /// `@media (prefers-color-scheme: dark)` can be told from the same selector
 /// written at the top level. `declarations` is only the custom properties,
 /// which is all these tests care about.
-function rules(css, at = []) {
+function rules(css, at = [], layer = null) {
   const found = [];
   let i = 0;
   while (true) {
     const open = css.indexOf("{", i);
-    if (open === -1) return found;
-    const prelude = css.slice(i, open).trim().replace(/\s+/g, " ");
+    if (open === -1) {
+      assertNoRuleAfter(css.slice(i));
+      return found;
+    }
+    // A statement at-rule ends at its `;` and wraps nothing. `@layer a, b;`
+    // declares the order and is not the prelude of the block after it.
+    const raw = css.slice(i, open);
+    const lastSemicolon = raw.lastIndexOf(";");
+    assertStatementsAreKnown(raw.slice(0, lastSemicolon + 1));
+    const prelude = raw.slice(lastSemicolon + 1).trim().replace(/\s+/g, " ");
     let depth = 0;
     let close = open;
     for (; close < css.length; close++) {
@@ -74,7 +104,14 @@ function rules(css, at = []) {
         BLOCK_AT_RULES.includes(name),
         `${name} is not an at-rule the reader in this file handles. Extend it.`,
       );
-      found.push(...rules(body, [...at, prelude]));
+      // A layer is not a condition: it decides which rule wins, not which
+      // rules match. Kept beside `at` rather than in it, so every test that
+      // asks "under which media query was this written" reads the same as it
+      // did before the stylesheets were layered.
+      const inner = name === "@layer"
+        ? rules(body, at, prelude.slice("@layer".length).trim() || layer)
+        : rules(body, [...at, prelude], layer);
+      found.push(...inner);
     } else {
       // A nested rule is the one break that makes the reader lie rather than
       // fail: customProperties() scans the whole body, so the nested block's
@@ -83,7 +120,7 @@ function rules(css, at = []) {
         !body.includes("{"),
         `${prelude}: nested rule. The reader in this file folds its declarations into the parent. Extend it.`,
       );
-      found.push({ at, selector: prelude, declarations: customProperties(body) });
+      found.push({ at, layer, selector: prelude, declarations: customProperties(body) });
     }
     i = close + 1;
   }

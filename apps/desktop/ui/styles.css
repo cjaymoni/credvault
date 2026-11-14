@@ -2,8 +2,25 @@
    Tokens first, then layout, then components. Colors pass WCAG AA (4.5:1) for
    text in both themes; interactive targets are at least 36px tall. */
 
+/* Layer order, declared once: a later layer wins over an earlier one
+   whatever the selectors say. ui/STYLING.md explains what goes where. */
+@layer tokens, base, components, context, platform, invariants;
+
+@layer tokens {
 :root {
   color-scheme: light dark;
+
+  /* The notch, the home bar and the navigation bar, as one place every rule
+     reads them from. They are not written as env(safe-area-inset-*) at the
+     point of use because Android's WebView reports those as 0 even with the
+     window edge-to-edge: a bottom bar is a window inset, and only a display
+     cutout reaches CSS. MainActivity.kt measures the real ones and overwrites
+     these four on the document, which is why the indirection exists. iOS and
+     desktop never do, and fall through to env() below. */
+  --safe-top: env(safe-area-inset-top);
+  --safe-right: env(safe-area-inset-right);
+  --safe-bottom: env(safe-area-inset-bottom);
+  --safe-left: env(safe-area-inset-left);
 
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
@@ -162,9 +179,11 @@
 }
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"] { color-scheme: dark; }
+}
 
 /* ----- base ---------------------------------------------------------------- */
 
+@layer base {
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 body {
@@ -218,7 +237,9 @@ input:not([type="checkbox"]):focus-visible, textarea:focus-visible {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
 
+}
 /* ----- form controls ------------------------------------------------------- */
+@layer components {
 
 /* Checkboxes are excluded everywhere these field-box rules are repeated: a
    checkbox is not a text field, and `appearance: none` plus a field's width,
@@ -282,6 +303,21 @@ select { padding-right: 34px; cursor: pointer; }
   margin-bottom: 6px;
 }
 .label-note { font-weight: 400; color: var(--text-3); }
+/* A label with an "i" after it. The row carries the bottom margin the label
+   used to, so the field below sits where it always did.
+
+   The `.field` in the selector is not decoration: the phone block further
+   down sets `.field label { margin-bottom: 8px }`, which has the same
+   specificity as `.label-row > label` and comes later, so without it the
+   label kept its margin, the row grew taller than the label, and the icon
+   sat 4px below the word it belongs to -- on phones only. */
+/* Deliberately not a flex row. Centring two boxes lines up their middles,
+   and a line box is taller than the word in it, so the icon reads as low --
+   by different amounts at 12px on a desktop and 14px on a phone, which is
+   why a fixed nudge cannot settle it. Inline with `vertical-align: middle`
+   puts the icon on the text's own x-height, whatever the size. */
+.label-row { margin-bottom: 6px; }
+
 .hint { font-size: var(--text-small); color: var(--text-3); margin-top: 6px; }
 .input-row { display: flex; gap: 8px; align-items: stretch; }
 .input-row > input { flex: 1; min-width: 0; }
@@ -319,8 +355,8 @@ select { padding-right: 34px; cursor: pointer; }
 @media (hover: hover) { .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); } }
 .btn.danger { color: var(--danger); border-color: var(--danger-border); }
 @media (hover: hover) { .btn.danger:hover { background: var(--danger-soft); border-color: var(--danger); } }
-.btn.danger.solid { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
-@media (hover: hover) { .btn.danger.solid:hover { background: var(--danger-hover); border-color: var(--danger-hover); } }
+/* The solid danger button is in the invariants layer at the foot of this
+   file: its red is meaning, not decoration. */
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
 @media (hover: hover) { .btn.ghost:hover { background: var(--surface-3); color: var(--text); border-color: transparent; } }
 .btn.ghost.danger { color: var(--danger); }
@@ -461,6 +497,16 @@ select { padding-right: 34px; cursor: pointer; }
 
 /* The phone layout swaps this in for the server field; see the phone block. */
 .server-summary { display: none; }
+
+/* The address is pinned (ALLOW_CUSTOM_SERVER in app.js): still readable,
+   plainly not a field to type in. The phone line keeps its shape and loses
+   only the action word, so nothing invites a tap that does nothing. */
+.auth.server-locked #server {
+  background: var(--surface-2);
+  color: var(--text-2);
+  cursor: default;
+}
+.auth.server-locked .server-summary-action { display: none; }
 
 .brand { display: flex; align-items: center; gap: 10px; }
 /* The plate is the artwork's own colours, not `--accent`, and deliberately
@@ -895,6 +941,34 @@ input.mono.mismatch { border-color: var(--danger); }
 
 /* form */
 .form .input-row > input { flex: 1; }
+/* The editor shows a name, a username and a password, and folds the rest
+   behind this. The toggle is a row of its own so the shorter form does not
+   read as a form that lost its fields. */
+#btn-more-details { display: block; margin: 2px 0 14px; }
+.more-details { margin-bottom: 4px; }
+
+/* A small "i" beside a label whose meaning is not guessable, rather than a
+   paragraph everyone reads once and then stops seeing. It sits on the label
+   line, so it must not push it taller. */
+.info-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-left: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  vertical-align: middle;
+}
+.info-btn .ic { width: 16px; height: 16px; }
+.info-btn[aria-expanded="true"] { color: var(--accent); }
+@media (hover: hover) { .info-btn:hover { color: var(--text-2); } }
+
 .form-actions { margin-top: 18px; }
 .form-actions .muted { margin-left: 6px; }
 
@@ -1015,7 +1089,7 @@ input.mono.mismatch { border-color: var(--danger); }
      this is the one control on the screen with no label but a placeholder. */
   .search input { min-height: 46px; padding-left: 44px; background: var(--surface-3); }
   .sidebar-count { padding: 2px 20px 8px; }
-  .list { padding: 0 16px calc(108px + env(safe-area-inset-bottom)); overscroll-behavior: contain; }
+  .list { padding: 0 16px calc(108px + var(--safe-bottom)); overscroll-behavior: contain; }
   .list-heading { padding: 14px 16px 8px; letter-spacing: 0.08em; }
 
   /* Each group is one inset card with hairlines between its rows, rather than
@@ -1061,7 +1135,7 @@ input.mono.mismatch { border-color: var(--danger); }
   /* No bottom padding here: the form's action bar sticks to the foot of the
      scrollport, so the breathing room goes inside the scrolled content. */
   .main { padding: 8px 16px 0; overscroll-behavior: contain; }
-  .main-inner { padding-bottom: calc(28px + env(safe-area-inset-bottom)); }
+  .main-inner { padding-bottom: calc(28px + var(--safe-bottom)); }
   .main.has-invites .empty { display: none; }
   /* invitations get their own screen */
   .main.has-selection #invites, .main.has-form #invites { display: none; }
@@ -1147,7 +1221,7 @@ input.mono.mismatch { border-color: var(--danger); }
     flex-wrap: nowrap;
     gap: 10px;
     margin: 24px -16px -18px;
-    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    padding: 12px 16px calc(12px + var(--safe-bottom));
     border-top: 1px solid var(--border);
     background: var(--surface);
   }
@@ -1167,7 +1241,7 @@ input.mono.mismatch { border-color: var(--danger); }
     flex-direction: column;
     align-items: stretch;
     gap: 10px;
-    padding: 10px 16px calc(24px + env(safe-area-inset-bottom));
+    padding: 10px 16px calc(24px + var(--safe-bottom));
     border-radius: 24px 24px 0 0;
     background: var(--surface);
     box-shadow: var(--shadow-md);
@@ -1226,7 +1300,7 @@ input.mono.mismatch { border-color: var(--danger); }
 
   /* toast above the compose button */
   .toast {
-    bottom: calc(104px + env(safe-area-inset-bottom));
+    bottom: calc(104px + var(--safe-bottom));
     max-width: calc(100% - 40px);
     padding: 14px 18px;
     border-radius: var(--radius);
@@ -1248,7 +1322,7 @@ input.mono.mismatch { border-color: var(--danger); }
   .auth {
     position: relative;
     justify-content: flex-start;
-    padding: calc(20px + env(safe-area-inset-top)) 20px calc(16px + env(safe-area-inset-bottom));
+    padding: calc(20px + var(--safe-top)) 20px calc(16px + var(--safe-bottom));
   }
   /* `border: none`, not the `border: 0` used elsewhere, so the static CSS
      checker reads the reset: it parses the keyword but not the bare 0, and
@@ -1310,7 +1384,7 @@ input.mono.mismatch { border-color: var(--danger); }
   .auth-foot { flex-direction: row; gap: 10px; margin-top: 14px; font-size: var(--text-caption); }
   .auth-foot .theme-switch {
     position: absolute;
-    top: calc(22px + env(safe-area-inset-top)); /* centres on the 44px brand mark */
+    top: calc(22px + var(--safe-top)); /* centres on the 44px brand mark */
     right: 20px;
   }
   .auth .theme-switch button { width: 44px; height: 44px; }
@@ -1351,3 +1425,38 @@ input.mono.mismatch { border-color: var(--danger); }
 .link-btn.block { display: block; width: 100%; margin-top: 10px; text-align: center; }
 
 #btn-link-google .ic { width: 16px; height: 16px; }
+
+
+}
+
+/* ----- context ------------------------------------------------------------- */
+/* Rules that re-dress a component for where it sits. This layer exists to
+   win: a label used as a row item has to beat `.field label`, which is
+   written earlier but reappears in the phone block later, and tying on
+   specificity meant losing on source order. See ui/STYLING.md. */
+@layer context {
+  /* A label beside something rather than above it. `.field label` gives every
+     label a bottom margin to separate it from its field; as a row item that
+     margin pushes it off centre, and flex and grid centring both count it.
+     It bit the "i" beside Project and the Hide checkbox, where it read as the
+     delete button being out of line. */
+  .label-row > label,
+  .label-row > .field-label { display: inline; margin-bottom: 0; }
+  .custom-field .cf-hide { margin-bottom: 0; }
+}
+/* ----- invariants ---------------------------------------------------------- */
+/* The last layer, so nothing can outrank it -- not even a platform rule that
+   is more specific. Only for meaning a platform must not be able to erase.
+
+   One member so far. `.btn.danger.solid` is the button that confirms a
+   delete, and it held its red only because three classes outranked
+   `[data-platform="windows"] .btn`, which paints every button the window's
+   surface colour. Layers retired that accident, and on Windows the confirm
+   button went white and on GNOME its label went dark. A destructive action
+   that looks ordinary is the one styling bug that costs somebody data. */
+@layer invariants {
+  .btn.danger.solid { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
+  @media (hover: hover) {
+    .btn.danger.solid:hover { background: var(--danger-hover); border-color: var(--danger-hover); }
+  }
+}

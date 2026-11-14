@@ -37,7 +37,11 @@
            to be sent, and that is worth seeing before it is sent. It is a
            button because the address has to stay changeable on a phone --
            self-hosting is the point of the product, and a default pointing at
-           someone else's server is not a default anyone can be held to. -->
+           someone else's server is not a default anyone can be held to.
+
+           Both the button and the field below are inert for now: see
+           ALLOW_CUSTOM_SERVER in app.js, which is what turns them back on.
+           The markup is left whole so that flag is the only switch. -->
       <button type="button" class="server-summary" id="btn-server-change">
         <span class="server-summary-label">Server</span>
         <span class="server-summary-value" id="server-summary"></span>

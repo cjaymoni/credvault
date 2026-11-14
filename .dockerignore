@@ -42,3 +42,8 @@ dist/
 # .pyc files apps/desktop/scripts leaves behind have been committed by
 # accident once already.
 **/__pycache__/
+
+# Dev-only, and gitignored, so the test above requires it here too. It is also
+# the largest thing in the tree by far: `COPY . .` would copy every file of it
+# into the builder layer on every build whose cache missed.
+**/node_modules/

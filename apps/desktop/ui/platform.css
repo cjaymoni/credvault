@@ -37,11 +37,18 @@
 
 /* Off by default; each platform turns on the parts it draws. */
 .pane-head, .list-title, .bottombar, #btn-back, .toolbar-app-title, .toolbar-sub,
-.mobile-title, .delete-bottom, #btn-bar-more, .new-compose, .acct-person, .acct-menu, .acct-key,
+.mobile-title, .delete-bottom, #btn-bar-more, .new-compose, .sys-phone, .acct-person, .acct-menu, .acct-key,
 .acct-avatar, .acct-text, .ib-icon, .ib-label, .ib-sentence, .ib-view, .ib-chev,
 .invites-banner .count-pill, .window-drag { display: none; }
+/* "Match the system" means this device, and on these two it is a phone. */
+[data-platform="ios"] .sys-desktop, [data-platform="android"] .sys-desktop { display: none; }
+[data-platform="ios"] .sys-phone, [data-platform="android"] .sys-phone { display: inline-block; }
+
 .toolbar-title { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-.toolbar-actions { display: flex; align-items: center; gap: 4px; }
+/* The actions keep their size; the title and the search give way. A flex
+   item shrinks by default, and these hold buttons with words in them, so
+   without this they were squeezed until the search overlapped them. */
+.toolbar-actions { display: flex; align-items: center; gap: 4px; flex: none; }
 .back-arrow { display: none; }
 .sidebar-search { display: block; padding: 0 12px 8px; }
 .sidebar-search .search input { min-height: 34px; }
@@ -73,7 +80,12 @@
 }
 .acct-text { flex-direction: column; align-items: flex-start; min-width: 0; text-align: start; line-height: 1.3; }
 .acct-email { font-weight: 500; }
-.acct-fp { font-size: 0.6875rem; color: var(--text-2); }
+/* One line, always. A fingerprint is 29 characters and at 11px it fitted the
+   sidebar in Chrome and overran it in WKWebView, where the button grew a
+   third line and the code broke across it. 10px leaves room in both. It is
+   not truncated: the whole point of the line is being read out to somebody
+   comparing keys, and half a fingerprint compares as well as none. */
+.acct-fp { font-size: 0.625rem; color: var(--text-2); white-space: nowrap; }
 @media (min-width: 721px) {
   .account-tools {
     display: none; position: fixed; z-index: 20; width: 320px; max-height: calc(100vh - 80px); overflow-y: auto;
@@ -257,13 +269,33 @@
   [data-platform="macos"] .topbar { min-height: 52px; padding: 0 14px 0 20px; gap: 10px; background: var(--content-bg); border-bottom: 1px solid var(--border); }
   [data-platform="macos"] .toolbar-app-title { display: block; font-size: 0.9375rem; font-weight: 700; }
   [data-platform="macos"] .toolbar-sub { display: block; font-size: 0.6875rem; color: var(--text-2); }
+  /* One line each, cut rather than wrapped: the toolbar is a fixed height
+     and the count is the most expendable thing in it. */
+  [data-platform="macos"] .toolbar-app-title,
+  [data-platform="macos"] .toolbar-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Both carry their words. A "+" and a circling arrow in a toolbar are only
+     obvious to someone who already knows what the app does with them, and
+     the tooltip that said so arrived a second after the pointer stopped --
+     which is a second after most people have given up and clicked to find
+     out. The icon stays: it is what the eye finds, the word is what tells
+     you what it found. */
   [data-platform="macos"] #btn-new, [data-platform="macos"] #btn-refresh {
-    width: 32px; height: 28px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--text-2); box-shadow: none;
+    width: auto; height: 28px; padding: 0 9px; gap: 5px; border: 0; border-radius: 6px;
+    background: transparent; color: var(--text-2); box-shadow: none; font-size: 0.8125rem;
   }
-  [data-platform="macos"] #btn-new .btn-text, [data-platform="macos"] #btn-refresh .btn-label { display: none; }
-  [data-platform="macos"] .toolbar-end .search { width: 200px; flex: none; }
+  @media (hover: hover) {
+    [data-platform="macos"] #btn-new:hover, [data-platform="macos"] #btn-refresh:hover { background: rgba(0, 0, 0, 0.06); }
+  }
+  [data-platform="macos"] #btn-new .btn-text { display: inline; }
+  [data-platform="macos"] #btn-refresh .btn-label { display: inline; }
+  /* The search gives up width before the words do: it has its placeholder
+     to say what it is, and 760px is as narrow as this window goes. */
+  [data-platform="macos"] .toolbar-end .search { flex: 0 1 200px; min-width: 120px; }
   [data-platform="macos"] .toolbar-end .search input { min-height: 28px; height: 28px; padding: 0 8px 0 26px; border-radius: 7px; border-color: var(--border-input); background: rgba(0, 0, 0, 0.04); font-size: 0.8125rem; }
-  [data-platform="macos"] .toolbar-end .search .ic { left: 8px; width: 13px; height: 13px; }
+  [data-platform="macos"] .toolbar-end .search > .ic { left: 8px; width: 13px; height: 13px; }
+  /* A 28px-high field: a smaller button, closer to the edge. */
+  [data-platform="macos"] .toolbar-end .search-clear { right: 3px; width: 20px; height: 20px; }
+  [data-platform="macos"] .toolbar-end .search.has-text input { padding-right: 24px; }
 
   [data-platform="macos"] .main { padding: 24px 32px 40px; }
   [data-platform="macos"] .main-inner { max-width: 860px; margin: 0; }
@@ -354,8 +386,16 @@
 [data-platform="windows"] .toolbar-title { flex: 0 1 0; }
 [data-platform="windows"] .toolbar-center { display: flex; justify-content: center; flex: 1; }
 [data-platform="windows"] .toolbar-center .search { flex: 0 1 400px; }
-[data-platform="windows"] .toolbar-center .search .ic { left: auto; right: 10px; }
+[data-platform="windows"] .toolbar-center .search > .ic { left: auto; right: 10px; }
 [data-platform="windows"] .toolbar-center .search input { min-height: 32px; height: 32px; padding: 0 36px 0 11px; border: 1px solid var(--border); border-bottom-color: var(--border-input); background: rgba(0, 0, 0, 0.03); }
+/* Fluent keeps the magnifier at the trailing edge, which is where the clear
+   button wants to be. While there is text the glyph gives up the spot: a
+   magnifier beside a typed query says nothing the field has not already
+   said, and the room is already reserved by the padding above. */
+/* The direct child only: the clear button has an `.ic` of its own, and
+   hiding every icon in the field hid the x as well as the magnifier. */
+[data-platform="windows"] .toolbar-center .search.has-text > .ic { display: none; }
+[data-platform="windows"] .toolbar-center .search-clear { right: 6px; width: 24px; height: 24px; border-radius: 4px; }
 [data-platform="windows"] #btn-account .acct-avatar { display: inline-grid; }
 [data-platform="windows"] #btn-account { width: 40px; height: 40px; border-radius: 50%; }
 [data-platform="windows"] .account-tools { top: 52px; right: 12px; }
@@ -402,6 +442,11 @@
 [data-platform="windows"] .kv-row .value { grid-area: value; padding: 0; color: var(--text-2); }
 [data-platform="windows"] .kv-row .pw-timer { grid-area: value; justify-self: end; }
 [data-platform="windows"] .kv-actions { grid-area: actions; opacity: 1; gap: 8px; }
+/* The project picker is the one thing inside a `dd` that is not a `.value`,
+   so the grid above has no area for it and auto-placement drops it in the
+   actions column instead of under the label, where every other row puts its
+   answer. Android has the same grid and the same fix, with worse symptoms. */
+[data-platform="windows"] .kv-row .select-wrap { grid-area: value; justify-self: start; max-width: 100%; }
 /* Fluent puts words on these buttons; the accessible name stays the full
    "Copy password", which begins with the visible word. */
 [data-platform="windows"] .kv-actions .icon-btn { width: auto; height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 4px; background: rgba(0, 0, 0, 0.03); color: var(--text); }
@@ -525,6 +570,7 @@
 [data-platform="linux"] .kv-row dt { width: auto; padding: 0; font-size: 0.8125rem; color: var(--text-2); }
 [data-platform="linux"] .kv-row dt .ic { display: none; }
 [data-platform="linux"] .kv-row .value { padding: 0; font-size: 0.9375rem; }
+[data-platform="linux"] .kv-row .select-wrap select { font-size: 0.9375rem; }
 [data-platform="linux"] .kv-actions { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); opacity: 1; }
 [data-platform="linux"] .kv-actions .icon-btn { width: 34px; height: 34px; border-radius: 50%; color: var(--text); }
 [data-platform="linux"] #sharing { margin-top: 24px; }
@@ -597,7 +643,9 @@
 [data-platform="ios"] .list-title { display: block; padding: 0 16px 8px; font-size: 2.125rem; font-weight: 700; line-height: 1.2; }
 [data-platform="ios"] .sidebar-search { padding: 0 16px 12px; }
 [data-platform="ios"] .sidebar-search .search input { min-height: 36px; height: 36px; padding: 0 8px 0 32px; border: 1px solid var(--border-input); border-radius: 10px; background: rgba(118, 118, 128, 0.12); font-size: 1.0625rem; }
-[data-platform="ios"] .sidebar-search .search .ic { left: 8px; width: 18px; height: 18px; }
+[data-platform="ios"] .sidebar-search .search > .ic { left: 8px; width: 18px; height: 18px; }
+[data-platform="ios"] .sidebar-search .search-clear { right: 5px; width: 24px; height: 24px; }
+[data-platform="ios"] .sidebar-search .search.has-text input { padding-right: 30px; }
 [data-platform="ios"] .sidebar-count { display: none; }
 [data-platform="ios"] .invites-banner { margin: 0 16px 20px; width: calc(100% - 32px); min-height: 52px; padding: 0 16px; gap: 12px; border-radius: 10px; background: var(--surface); }
 [data-platform="ios"] .ib-icon { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 7px; background: var(--accent); color: var(--on-accent); }
@@ -638,6 +686,7 @@
 [data-platform="ios"] .kv-row dt { width: auto; padding: 0; font-size: 0.8125rem; font-weight: 400; color: var(--text-2); }
 [data-platform="ios"] .kv-row dt .ic { display: none; }
 [data-platform="ios"] .kv-row .value { font-size: 1.0625rem; }
+[data-platform="ios"] .kv-row .select-wrap select { font-size: 1.0625rem; }
 [data-platform="ios"] .kv-actions { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); }
 [data-platform="ios"] .kv-actions .icon-btn { width: 44px; height: 44px; background: transparent; color: var(--tint); }
 [data-platform="ios"] #sharing { margin-top: 24px; }
@@ -711,8 +760,15 @@
    height -- they sit side by side, and any difference reads as a mistake. */
 [data-platform="android"] .sidebar-search { --search-row-h: 56px; display: flex; align-items: center; gap: 8px; padding: calc(8px + var(--safe-top)) 16px 8px; }
 [data-platform="android"] .sidebar-search .search { display: flex; align-items: center; height: var(--search-row-h); padding: 0 16px; border: 1px solid var(--border-input); border-radius: 28px; background: var(--surface-3); }
-[data-platform="android"] .sidebar-search .search .ic { position: static; transform: none; width: 24px; height: 24px; color: var(--text-2); }
+[data-platform="android"] .sidebar-search .search > .ic { position: static; transform: none; width: 24px; height: 24px; color: var(--text-2); }
 [data-platform="android"] .sidebar-search .search input { flex: 1; min-height: 48px; margin-left: 16px; padding: 0; border: 0; background: transparent; font-size: 1rem; }
+/* The pill is already a flex row -- a static icon, then the field -- so the
+   clear button is the next item in it rather than something floated over
+   the text, and the field needs no padding held back for it. */
+[data-platform="android"] .sidebar-search .search-clear { position: static; transform: none; flex: none; width: 40px; height: 40px; }
+/* Drawn at the weight of the magnifier across from it, not at the desktop's. */
+[data-platform="android"] .sidebar-search .search-clear .ic { width: 20px; height: 20px; }
+[data-platform="android"] .sidebar-search .search.has-text input { padding-right: 0; }
 /* padding: 0 because the button's own UA padding (6px a side) was squeezing
    the circle inside it to 44px wide against 56px tall -- a visible oval. */
 [data-platform="android"] #btn-account { flex: none; width: var(--search-row-h); height: var(--search-row-h); padding: 0; border-radius: 50%; }
@@ -764,6 +820,14 @@
 [data-platform="android"] .bar-menu-item:focus-visible { outline-offset: -2px; }
 @media (hover: hover) { [data-platform="android"] .bar-menu-item:hover { background: var(--surface-3); } }
 [data-platform="android"] .detail-head .actions { display: none; }
+/* The app bar above already names this secret, and Material puts the screen's
+   title there rather than repeating it in the content -- so the name is not
+   printed twice. The avatar stays: it is what the eye lands on, and it is
+   the same mark the list drew beside this secret a moment ago. Under it goes
+   the line the bar cannot carry: whose it is and when it last changed. */
+[data-platform="android"] .detail-head h2 { display: none; }
+[data-platform="android"] .detail-head { margin-bottom: 0; gap: 8px; }
+[data-platform="android"] .detail-meta { flex-direction: row; flex-wrap: wrap; justify-content: center; column-gap: 12px; margin-top: 0; }
 [data-platform="android"] #detail > .card, [data-platform="android"] #sharing { padding: 0; border: 0; background: transparent; box-shadow: none; }
 [data-platform="android"] .avatar.lg { width: 56px; height: 56px; border-radius: 50%; }
 [data-platform="android"] .kv { border: 1px solid var(--border); border-radius: 16px; background: var(--surface); overflow: hidden; }
@@ -776,14 +840,26 @@
 [data-platform="android"] .kv-row dt .ic { grid-area: icon; width: 24px; height: 24px; color: var(--text-2); }
 [data-platform="android"] .kv-label { grid-area: label; font-size: 0.75rem; color: var(--text-2); }
 [data-platform="android"] .kv-row .value { grid-area: value; padding: 0; font-size: 1rem; }
+[data-platform="android"] .kv-row .select-wrap select { font-size: 1rem; }
 [data-platform="android"] .kv-row .pw-timer { grid-area: value; justify-self: end; }
 [data-platform="android"] .kv-actions { grid-area: actions; opacity: 1; gap: 0; }
+/* Same as the Windows grid above, and here it was visible: the actions
+   column is sized to the copy buttons, so the picker was squeezed against
+   the card's edge with its name cut in half. */
+[data-platform="android"] .kv-row .select-wrap { grid-area: value; justify-self: start; max-width: 100%; }
 [data-platform="android"] .kv-actions .icon-btn { width: 48px; height: 48px; border-radius: 50%; background: transparent; color: var(--text-2); }
 [data-platform="android"] #sharing { margin-top: 24px; }
 [data-platform="android"] #sharing .card-title { font-size: 0.875rem; font-weight: 500; color: var(--tint); }
 [data-platform="android"] #sharing .card-title .ic, [data-platform="android"] .ell { display: none; }
 [data-platform="android"] .share-head { flex-direction: column; align-items: flex-start; }
 [data-platform="android"] #sharing .btn.share-invite { order: 4; height: 40px; padding: 0 24px 0 16px; border: 1px solid var(--border-input); border-radius: 20px; background: transparent; color: var(--tint); }
+/* The sharing list is drawn as one card, like the fields above it. Without
+   it the people sat loose on the background under the Invite button, with
+   nothing saying where the list began or ended -- and the detail pane's own
+   card two rows up made that look like a mistake rather than a style. */
+[data-platform="android"] #sharing .people { border: 1px solid var(--border); border-radius: 16px; background: var(--surface); overflow: hidden; }
+[data-platform="android"] #sharing .people li { padding-left: 16px; padding-right: 8px; }
+[data-platform="android"] #sharing .people li.person + .person { border-top: 1px solid var(--border); }
 [data-platform="android"] .people li { min-height: 56px; border-top: 0; }
 [data-platform="android"] .btn { border-radius: 20px; font-weight: 500; }
 [data-platform="android"] .btn.primary, [data-platform="android"] .btn.block { border: 0; border-radius: 24px; }
@@ -819,11 +895,20 @@
 }
 
 /* On a phone a long address wraps rather than being cut off: it is the only
-   place the full address of someone with access is shown. */
+   place the full address of someone with access is shown.
+
+   It wraps inside its own box rather than claiming a whole line. The line
+   used to be reserved because the row carried a status, a project toggle and
+   a revoke button after the address, and the four together never fitted;
+   with the controls now behind the row's own button there is room, and an
+   address that still does not fit breaks across lines where it sits. */
 @media (max-width: 720px) {
   .people li { flex-wrap: wrap; row-gap: 6px; }
-  .people .who { flex: 1 1 calc(100% - 48px); white-space: normal; overflow-wrap: anywhere; }
-  .people .people-status { margin-inline-start: auto; }
+  .people .who { flex: 1 1 auto; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+  /* Pushed to the trailing edge on the rows that are one line -- a project
+     and its count. A sharing row is two lines on purpose, with its status
+     indented under the address, so it keeps the margin it was given. */
+  .people li:not(.person) .people-status { margin-inline-start: auto; }
   /* Account sheet: every row at the same weight; Log out keeps its colour. */
   .account-tools .icon-btn { font-weight: inherit; }
   /* iOS draws the sheet in its grouped background with rows as cells, so

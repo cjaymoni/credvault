@@ -41,6 +41,12 @@ const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLen
 /// still printed in full.
 const SHARING_NOTE =
   "People you invite get read-only access to this one secret. Revoking re-encrypts it with a new key.";
+const INVITE_NOTE =
+  "Everyone you add gets read-only access to this one secret, and nothing else in your vault. Use the address each of them signed up with.";
+const INVITE_PROJECT_NOTE =
+  "They will see the project's name on this secret. Once they accept, you can change your mind for each person from the Sharing list.";
+const FINGERPRINT_NOTE =
+  "A fingerprint is the short code under \u201cYour key\u201d in the other person's account settings. Ask them for it by phone or in person \u2014 anything except this server, which is what the check is for.";
 const PROJECTS_NOTE =
   "Headings your secrets are grouped under. Deleting one never deletes the secrets in it \u2014 they simply stop being grouped.";
 const GOOGLE_LINK_NOTE =
@@ -80,6 +86,16 @@ const state = { secrets: [], projects: [], selected: null, editing: false, editT
   // The invitations view is open in the detail pane (reached from the
   // invitations entry in the list), and the secret the invite dialog is for.
   showingInvites: false, inviteFor: null,
+  // The people the invite dialog is collecting, in the order they were
+  // typed. Each is `{ email, fingerprint, info, error }`: `info` is what
+  // `lookup_invitee` answered and `error` why it could not, so one address
+  // that cannot be resolved does not hold up the rest.
+  invitees: [],
+  // Which run of the invite dialog is current. Compared instead of the
+  // secret's id, because closing and reopening the dialog on the *same*
+  // secret put the id back and re-armed every guard that watched it -- a
+  // cancelled batch would resume into the dialog that had just replaced it.
+  inviteSession: 0,
   // What the server at the URL in the box offers, and the Google sign-in
   // waiting for a passphrase, if there is one.
   capabilities: null, google: null, user: null,
@@ -179,6 +195,8 @@ const ICONS = {
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
   chevronRight: '<path d="m9 6 6 6-6 6"/>',
+  more: '<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>',
+  close: '<path d="M18 6 6 18M6 6l12 12"/>',
 };
 function icon(name) {
   return `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
@@ -425,6 +443,95 @@ function closeBarMenu({ restoreFocus = false } = {}) {
   $("btn-bar-more").setAttribute("aria-expanded", "false");
   if (restoreFocus) $("btn-bar-more").focus();
 }
+// ----- row menus -------------------------------------------------------------
+//
+// A small menu dropped from the "more" button on a row of a list.
+//
+// It is placed against the viewport and parented to the body rather than
+// drawn inside the row, because the lists these open from are cards that
+// clip their contents on two of the five platforms -- a menu laid out inside
+// one would be cut off at the card's edge. The row expanded to hold its
+// controls before this, which pushed everything below it down the screen to
+// answer a question about one person.
+
+/// The open menu: `{ menu, button }`, or null.
+let rowMenu = null;
+
+function rowMenuItems() {
+  return rowMenu ? [...rowMenu.menu.querySelectorAll('[role^="menuitem"]')] : [];
+}
+
+function closeRowMenu({ restoreFocus = false } = {}) {
+  if (!rowMenu) return;
+  const { menu, button } = rowMenu;
+  rowMenu = null;
+  menu.remove();
+  button.setAttribute("aria-expanded", "false");
+  if (restoreFocus && button.isConnected) button.focus();
+}
+
+/// Put the menu under its button, or above it when there is no room below.
+/// Clamped to the window on both sides so a row near an edge cannot push it
+/// off screen.
+function placeRowMenu(menu, button) {
+  const box = button.getBoundingClientRect();
+  const margin = 8;
+  const below = window.innerHeight - box.bottom - margin;
+  const top = menu.offsetHeight <= below ? box.bottom + 4 : Math.max(margin, box.top - menu.offsetHeight - 4);
+  const left = Math.min(
+    Math.max(margin, box.right - menu.offsetWidth),
+    window.innerWidth - menu.offsetWidth - margin,
+  );
+  menu.style.top = `${Math.round(top)}px`;
+  menu.style.left = `${Math.round(Math.max(margin, left))}px`;
+}
+
+/// Open a menu of `items` from `button`. Each item is
+/// `{ label, icon, run, danger?, checked? }`: `icon` names one of ICONS and
+/// is drawn at the leading edge, and an item with `checked` is a checkbox
+/// item -- it says so to a screen reader and carries a tick at the trailing
+/// edge while it is on.
+function openRowMenu(button, items) {
+  const wasOpen = rowMenu?.button === button;
+  closeRowMenu();
+  if (wasOpen) return; // a second press on the same button closes it
+  const menu = document.createElement("div");
+  menu.className = "row-menu";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", button.getAttribute("aria-label") ?? "Options");
+  menu.innerHTML = items.map((item, index) => {
+    const checkable = item.checked !== undefined;
+    return `<button type="button" class="row-menu-item${item.danger ? " danger" : ""}" data-index="${index}"
+      role="${checkable ? "menuitemcheckbox" : "menuitem"}"${checkable ? ` aria-checked="${Boolean(item.checked)}"` : ""}
+      tabindex="-1">${icon(item.icon)}<span class="row-menu-label">${esc(item.label)}</span>${checkable && item.checked ? `<span class="row-menu-tick">${icon("check")}</span>` : ""}</button>`;
+  }).join("");
+  document.body.append(menu);
+  rowMenu = { menu, button };
+  button.setAttribute("aria-expanded", "true");
+  placeRowMenu(menu, button);
+  menu.addEventListener("keydown", rowMenuKeydown);
+  for (const el of menu.querySelectorAll("[data-index]")) {
+    el.onclick = () => {
+      const item = items[Number(el.dataset.index)];
+      closeRowMenu({ restoreFocus: true });
+      item.run();
+    };
+  }
+  rowMenuItems()[0]?.focus({ preventScroll: true });
+}
+
+/// The same keys the top bar's menu takes: arrows, Home and End move between
+/// items; Escape closes back to the button; Tab closes and lets focus move on.
+function rowMenuKeydown(event) {
+  const items = rowMenuItems();
+  const index = items.indexOf(document.activeElement);
+  const last = items.length - 1;
+  const moves = { ArrowDown: index >= last ? 0 : index + 1, ArrowUp: index <= 0 ? last : index - 1, Home: 0, End: last };
+  if (event.key in moves) { event.preventDefault(); items[moves[event.key]]?.focus(); return; }
+  if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeRowMenu({ restoreFocus: true }); return; }
+  if (event.key === "Tab") closeRowMenu();
+}
+
 /// The APG menu keys: arrows, Home and End move between items; Escape closes
 /// back to the button; Tab closes and lets focus move on.
 function barMenuKeydown(event) {
@@ -1060,6 +1167,7 @@ function showApp(user) {
   state.secrets = []; state.projects = []; state.selected = null; state.editing = false; state.inviteCount = 0;
   state.showingInvites = false; state.showingProjects = false; state.projectRow = null;
   $("filter").value = "";
+  syncSearchClear();
   $("app").dataset.screen = "list";
   renderDetail();
   refresh();
@@ -1077,6 +1185,12 @@ function resetToSignedOut() {
   state.user = null;
   state.secrets = []; state.projects = []; state.selected = null; state.editing = false; state.inviteCount = 0;
   state.showingInvites = false; state.showingProjects = false; state.projectRow = null;
+  state.invitees = []; state.inviteFor = null; state.inviteSession = 0;
+  // Both belong to the account that is going away: the menu would otherwise
+  // sit over the sign-in screen naming one of its members, with live handlers
+  // behind it, and the next account would read the last one's member list.
+  closeRowMenu();
+  sharedWith = { members: [], invites: [] };
   closeDialog($("invite-dialog"));
   closeDialog($("form-dialog"));
   // Lives outside #detail, so emptying that below does not reach it: a modal
@@ -1163,9 +1277,21 @@ function matchesFilter(secret, needle) {
 
 function itemHtml(s) {
   const selected = s.id === state.selected;
+  // The words go in their own span. `.item-sub` is a flex container so that
+  // the broken-secret icon sits beside them, and `text-overflow` does not
+  // reach the anonymous box a bare text node gets inside one: an address too
+  // long for the row was cut off mid-character with no ellipsis to say so,
+  // while the name above it -- not a flex container -- ellipsised properly.
   const subtitle = s.error
-    ? `${icon("alert")} Cannot be decrypted`
-    : (s.username ? esc(s.username) : "<em>No username</em>");
+    ? `${icon("alert")}<span class="item-sub-text">Cannot be decrypted</span>`
+    : `<span class="item-sub-text">${s.username ? esc(s.username) : "<em>No username</em>"}</span>`;
+  // Shared rows sit under a "Shared with me" heading that already says so, so
+  // the badge is the icon alone and gives the row's name the ~45px the word
+  // was taking. What the word did not say -- who shared it -- is what is
+  // left: in the tooltip for a pointer, and in text for a screen reader,
+  // which would otherwise be read the icon's absence of a name.
+  const shared = s.is_owner ? "" : `
+      <span class="badge" title="Shared by ${esc(s.owner_email)}">${icon("users")}<span class="sr-only">Shared by ${esc(s.owner_email)}</span></span>`;
   return `
     <button type="button" class="item${selected ? " active" : ""}${s.error ? " broken" : ""}"
       role="option" aria-selected="${selected}" data-id="${s.id}" tabindex="${selected ? 0 : -1}">
@@ -1173,8 +1299,7 @@ function itemHtml(s) {
       <span class="item-text">
         <span class="item-name">${esc(s.name)}</span>
         <span class="item-sub">${subtitle}</span>
-      </span>
-      ${s.is_owner ? "" : `<span class="badge" title="Shared by ${esc(s.owner_email)}">${icon("users")} Shared</span>`}
+      </span>${shared}
       <span class="chev">${icon("chevronRight")}</span>
     </button>`;
 }
@@ -1211,6 +1336,24 @@ function renderList() {
 }
 
 /// Arrow keys move focus within the list; Enter/Space activate the focused item.
+/// Show the clear button only while there is something to clear, and give
+/// the field the room it needs while it is there.
+function syncSearchClear() {
+  const typed = $("filter").value.length > 0;
+  $("search-box").classList.toggle("has-text", typed);
+  $("btn-clear-search").hidden = !typed;
+}
+
+/// Empty the search and put the cursor back in it. Focus matters: the button
+/// disappears the moment it is used, so leaving focus on it would strand it
+/// on nothing.
+function clearSearch() {
+  $("filter").value = "";
+  syncSearchClear();
+  renderList();
+  $("filter").focus();
+}
+
 function listKeydown(event) {
   const items = [...$("list").querySelectorAll(".item")];
   const index = items.indexOf(document.activeElement);
@@ -1388,6 +1531,11 @@ function projectRow(secret) {
 
 function renderDetail() {
   clearReveals();
+  // The pane is about to be rewritten. loadSharing() closes the menu too, but
+  // it only runs for a secret this account owns -- a shared or broken one, or
+  // the empty state, would leave a menu floating over the new screen with its
+  // handlers still closed over the secret that is no longer open.
+  closeRowMenu();
   syncScreenChrome();
   const s = state.secrets.find((x) => x.id === state.selected);
   $("main").classList.toggle("has-selection", Boolean(s));
@@ -1676,95 +1824,250 @@ function renderBroken(s) {
 
 // ----- sharing ---------------------------------------------------------------
 
+/// Who the open secret is already shared with, as the last `get_access`
+/// reported it. The invite dialog reads it so somebody who is already on the
+/// list is caught while they are being typed, rather than after a lookup and
+/// a fingerprint check have been spent on them.
+let sharedWith = { members: [], invites: [] };
+
 async function loadSharing(id) {
+  // Before the early return, not after it: the menu is parented to the body
+  // and outlives the pane it was opened from.
+  closeRowMenu();
   const box = $("sharing");
   if (!box) return;
+  // Emptied before the fetch, not after it: it belongs to whichever secret
+  // is open, and the previous one's members must not be left standing while
+  // this one loads -- the invite dialog reads it, and would refuse somebody
+  // on the grounds that they can see a different secret.
+  sharedWith = { members: [], invites: [] };
   try {
     const access = await invoke("get_access", { id });
     if (!box.isConnected || state.selected !== id) return; // user moved on
+    sharedWith = access;
     // Members and pending invites in one list, each saying where it stands,
     // the way every platform's own sharing list reads.
-    // Always drawn, even when the secret is filed nowhere.
     //
-    // The flag belongs to the membership, not to the project, and it
-    // outlives any particular filing. Hiding the control while a secret is
-    // unfiled hid a grant that was still switched on: the owner could not
-    // see it and had no way to clear it, and filing the secret under a
-    // *different* project later would show that person its name without
-    // anyone being asked again. Unfiled, the control says what it will do
-    // rather than disappearing.
+    // One row per person: who they are, where they stand, and one button
+    // holding everything that can be done about them. A wide pane fits that
+    // on a line; the phone layout wraps the status under the address, which
+    // is the only way all three fit at 360dp without the address being cut
+    // short -- and the address is what says whose access this is.
     const filed = state.secrets.find((s) => s.id === id)?.project ?? null;
-    const seesProject = (m) => {
-      const label = filed
-        ? `Let ${esc(m.email)} see that this is in ${esc(filed.name)}`
-        : `Let ${esc(m.email)} see which project this is in, if it is filed under one`;
-      return `
-      <label class="checkbox sees-project"><input type="checkbox" data-sees="${m.user_id}" ${m.sees_project ? "checked" : ""}
-        aria-label="${label}"> ${filed ? "Sees project" : "Would see project"}</label>`;
-    };
-    const members = access.members.map((m) => `
-      <li>${avatar(m.email, { size: "sm" })}<span class="who">${esc(m.email)}</span>
-        <span class="people-status">Can view</span>
-        ${seesProject(m)}
-        <button type="button" class="btn danger sm" data-revoke="${m.user_id}" aria-label="Revoke access for ${esc(m.email)}"><span>Revoke<span class="ell">…</span></span></button></li>`);
-    const pending = access.invites.map((i) => `
-      <li>${avatar(i.email, { size: "sm" })}<span class="who">${esc(i.email)}</span>
-        <span class="people-status">Invite pending</span>
-        <button type="button" class="btn sm" data-cancel="${i.id}" aria-label="Cancel invite for ${esc(i.email)}">Cancel Invite</button></li>`);
-    const people = [...members, ...pending];
+    const personRow = (email, status, key) => `
+      <li class="person">${avatar(email, { size: "sm" })}<span class="who">${esc(email)}</span>
+        <span class="people-status">${esc(status)}</span>
+        <button type="button" class="icon-btn row-more" data-menu="${key}" aria-haspopup="menu" aria-expanded="false"
+          aria-label="Options for ${esc(email)}" title="Options">${icon("more")}</button></li>`;
+    const people = [
+      ...access.members.map((m) => personRow(m.email, "Can view", `m${m.user_id}`)),
+      ...access.invites.map((i) => personRow(i.email, "Invite pending", `i${i.id}`)),
+    ];
     box.innerHTML = `
       <div class="share-head">
         <div class="share-head-text">
           <h3 id="sharing-title" class="card-title">${icon("users")} Sharing${infoButtonHtml("sharing-note", SHARING_NOTE)}</h3>
           <p class="hint hidden" id="sharing-note">${esc(SHARING_NOTE)}</p>
         </div>
-        <button type="button" class="btn primary share-invite" id="btn-open-invite">${icon("plus")} <span>Invite Someone<span class="ell">…</span></span></button>
+        <button type="button" class="btn primary share-invite" id="btn-open-invite">${icon("plus")} <span>Invite People<span class="ell">\u2026</span></span></button>
       </div>
       <div id="revoke-confirm"></div>
       <ul class="people" id="members">${people.length ? people.join("") : `<li class="only-you">Only you have access.</li>`}</ul>`;
 
     $("btn-open-invite").onclick = () => openInviteDialog(id);
-    for (const el of box.querySelectorAll("[data-revoke]")) {
-      el.onclick = () => revokeMember(id, Number(el.dataset.revoke), el, []);
+    // The project item is offered even when the secret is filed nowhere. The
+    // flag belongs to the membership, not to the project, and it outlives any
+    // particular filing: leaving the item out while a secret is unfiled hid a
+    // grant that was still switched on, which the owner could neither see nor
+    // clear -- and filing the secret under a *different* project later would
+    // have shown that person its name without anyone being asked again.
+    for (const member of access.members) {
+      const button = box.querySelector(`[data-menu="m${member.user_id}"]`);
+      if (!button) continue;
+      button.onclick = () => openRowMenu(button, [
+        {
+          label: filed ? `Can see this is in ${filed.name}` : "Can see which project this is in",
+          icon: "folder",
+          checked: member.sees_project,
+          run: () => setMemberProject(id, member, !member.sees_project),
+        },
+        { label: "Revoke access\u2026", icon: "trash", danger: true, run: () => revokeMember(id, member.user_id, button, []) },
+      ]);
     }
-    for (const el of box.querySelectorAll("[data-sees]")) el.onchange = async () => {
-      const wanted = el.checked;
-      el.disabled = true;
-      try {
-        await invoke("set_member_project", { id, userId: Number(el.dataset.sees), shareProject: wanted });
-        toast(wanted ? "They can see the project" : "They can no longer see the project");
-      } catch (error) {
-        // Put the box back: leaving it ticked would say someone can see
-        // something they cannot, which is the wrong direction to be wrong in.
-        el.checked = !wanted;
-        setError("main-error", error);
-      } finally {
-        el.disabled = false;
-      }
-    };
-    for (const el of box.querySelectorAll("[data-cancel]")) el.onclick = async () => {
-      if (await act("cancel_invite", { id, inviteId: Number(el.dataset.cancel) }, "Invite cancelled", el)) loadSharing(id);
-    };
+    for (const invite of access.invites) {
+      const button = box.querySelector(`[data-menu="i${invite.id}"]`);
+      if (!button) continue;
+      button.onclick = () => openRowMenu(button, [
+        { label: "Cancel invite", icon: "close", danger: true, run: () => cancelInvite(id, invite.id, button) },
+      ]);
+    }
   } catch (error) {
     if (box.isConnected) box.innerHTML = `<h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3><div class="error">${esc(error?.message ?? error)}</div>`;
   }
 }
 
+/// Let one member see which project the secret is filed under, or stop them.
+///
+/// The list is redrawn from what the server then reports rather than from
+/// what was asked for: a failure must not leave the menu saying somebody can
+/// see something they cannot, which is the wrong direction to be wrong in.
+async function setMemberProject(id, member, wanted) {
+  try {
+    await invoke("set_member_project", { id, userId: member.user_id, shareProject: wanted });
+    toast(wanted ? "They can see the project" : "They can no longer see the project");
+  } catch (error) {
+    setError("main-error", error);
+  }
+  loadSharing(id);
+}
+
+async function cancelInvite(id, inviteId, button) {
+  if (await act("cancel_invite", { id, inviteId }, "Invite cancelled", button)) loadSharing(id);
+}
+
+// ----- inviting --------------------------------------------------------------
+//
+// One dialog, two steps, any number of people. Step one collects addresses;
+// step two shows the key the server offers for each of them and sends the
+// invites once the owner has said the fingerprints are right.
+//
+// It takes several people at once because the thing being avoided is not the
+// typing, it is the checking: handing one credential to three colleagues used
+// to mean opening the dialog three times, and re-reading the same warning
+// three times is how people learn to click past it.
+
+/// Counts the runs of the invite dialog; `state.inviteSession` holds the
+/// current one. Numbers are never reused, so a guard that captured an
+/// earlier run can always tell that it is no longer the one on screen.
+let inviteSessions = 0;
+
+/// The dialog session whose batch is going out, or null. A session rather
+/// than a flag: an abandoned batch keeps its last invite in flight for a
+/// moment, and a plain boolean left the dialog that replaced it with dead
+/// controls and no explanation for them.
+///
+/// This is the invariant. The disabled controls are only the view of it, so
+/// everything that can start work asks this, not the DOM.
+let sendingSession = null;
+
+/// Whether the dialog on screen is mid-send.
+function sendingNow() {
+  return sendingSession !== null && sendingSession === state.inviteSession;
+}
+
 /// The invite dialog, emptied, for the secret `id`.
 function openInviteDialog(id) {
   state.inviteFor = id;
+  state.inviteSession = ++inviteSessions;
+  state.invitees = [];
   $("invite-form").reset();
-  // Nothing to offer when the secret is filed nowhere, and a checkbox that
-  // did nothing would still read as a promise that something was shared.
-  const project = state.secrets.find((s) => s.id === id)?.project ?? null;
-  $("invite-project-field").classList.toggle("hidden", !project);
-  if (project) $("invite-project-label").textContent = `Also tell them this is in ${project.name}`;
   $("invite-form").classList.remove("hidden");
-  $("invite-message").maxLength = UI.maxMessageLength;
   $("invite-confirm").innerHTML = "";
   setError("invite-error", "");
+  renderInviteFields();
   openDialog($("invite-dialog"));
   $("invite-email").focus();
+}
+
+/// Step one: who, what to say, and whether the project's name goes with it.
+///
+/// Drawn here rather than written into index.html because two of its labels
+/// carry an "i", and the text an "i" reveals has to be the same string as the
+/// one in its tooltip -- which is a constant in this file, not a sentence
+/// typed twice in two places that can drift apart.
+function renderInviteFields() {
+  // Nothing to offer when the secret is filed nowhere, and a checkbox that
+  // did nothing would still read as a promise that something was shared.
+  const project = state.secrets.find((s) => s.id === state.inviteFor)?.project ?? null;
+  $("invite-dialog").setAttribute("aria-label", "Invite people");
+  $("invite-fields").innerHTML = `
+    <div class="label-row">
+      <h2 class="dialog-title">Invite people</h2>
+      ${infoButtonHtml("invite-note", INVITE_NOTE)}
+    </div>
+    <p class="hint hidden" id="invite-note">${esc(INVITE_NOTE)}</p>
+    <div class="field">
+      <label for="invite-email">Email</label>
+      <ul class="recipients hidden" id="invite-recipients" aria-label="People this will be sent to" aria-live="polite"></ul>
+      <input id="invite-email" type="email" placeholder="friend@example.com" autocomplete="off" spellcheck="false" inputmode="email">
+      <p class="hint">Press Enter after each one to invite several people at once.</p>
+    </div>
+    <div class="field">
+      <label for="invite-message">Message <span class="label-note">(optional)</span></label>
+      <input id="invite-message" placeholder="e.g. The shared Wi-Fi password">
+    </div>
+    ${project ? `
+      <div class="field" id="invite-project-field">
+        <div class="label-row">
+          <label class="checkbox"><input type="checkbox" id="invite-share-project">
+            Also tell them this is in ${esc(project.name)}</label>
+          ${infoButtonHtml("invite-project-note", INVITE_PROJECT_NOTE)}
+        </div>
+        <p class="hint hidden" id="invite-project-note">${esc(INVITE_PROJECT_NOTE)}</p>
+      </div>` : ""}`;
+  $("invite-message").maxLength = UI.maxMessageLength;
+  const box = $("invite-email");
+  box.onkeydown = (event) => {
+    if (event.key === "Enter") { event.preventDefault(); commitTypedInvitees(); return; }
+    // Backspace in an empty box takes the last person back into it, the way
+    // every other recipient field behaves.
+    if (event.key === "Backspace" && box.value === "" && state.invitees.length) {
+      box.value = state.invitees.pop().email;
+      renderRecipients();
+    }
+  };
+  // A separator typed or pasted ends an address. This covers a pasted list
+  // as well as a typed one, which is why it is not done on keydown alone.
+  box.oninput = () => { if (/[,;\s]/.test(box.value)) commitTypedInvitees({ keepFocus: true }); };
+  renderRecipients();
+}
+
+/// Turn whatever is in the box into recipients, all or nothing.
+///
+/// Nothing is added unless every address in the box can be. The box is then
+/// either emptied or left exactly as it was typed, which is what makes a
+/// mis-parsed paste fixable: an earlier version committed the good prefix
+/// and rewrote the rest of the line, so every keystroke after the error
+/// re-normalised the text under the caret and threw the caret to the end,
+/// in the one place the user had been asked to go and edit.
+///
+/// Returns whether the box emptied, which is what submitting reads to decide
+/// between going on and stopping on the error.
+function commitTypedInvitees({ keepFocus = false } = {}) {
+  const box = $("invite-email");
+  if (!box) return true;
+  const { accepted, problem } = Screens.acceptAddresses(box.value, {
+    me: state.user?.email,
+    queued: state.invitees.map((p) => p.email),
+    members: sharedWith.members.map((m) => m.email),
+    invites: sharedWith.invites.map((i) => i.email),
+  });
+  if (problem) {
+    setError("invite-error", problem);
+    return false;
+  }
+  for (const email of accepted) state.invitees.push({ email, fingerprint: "", info: null, error: null });
+  box.value = "";
+  setError("invite-error", "");
+  renderRecipients();
+  if (keepFocus) box.focus();
+  return true;
+}
+
+function renderRecipients() {
+  const list = $("invite-recipients");
+  if (!list) return;
+  list.innerHTML = state.invitees.map((person, index) => `
+    <li class="recipient">${avatar(person.email, { size: "sm" })}<span class="who">${esc(person.email)}</span>
+      <button type="button" class="icon-btn" data-remove="${index}" aria-label="Remove ${esc(person.email)}" title="Remove">${icon("close")}</button></li>`).join("");
+  list.classList.toggle("hidden", state.invitees.length === 0);
+  for (const el of list.querySelectorAll("[data-remove]")) el.onclick = () => {
+    state.invitees.splice(Number(el.dataset.remove), 1);
+    renderRecipients();
+    $("invite-email").focus();
+  };
+  const button = $("btn-invite");
+  if (button) button.textContent = state.invitees.length > 1 ? `Check ${state.invitees.length} keys` : "Continue";
 }
 
 /// Closing the dialog, by Cancel, Escape or a sent invite, hands focus back
@@ -1772,40 +2075,459 @@ function openInviteDialog(id) {
 function closeInviteDialog() {
   closeDialog($("invite-dialog"));
   state.inviteFor = null;
+  state.inviteSession = 0;
+  state.invitees = [];
   $("btn-open-invite")?.focus();
 }
 
-/// Look the person up and show their key to confirm. Nothing is sent yet.
+/// Look everybody up and show what came back. Nothing is sent yet.
 async function submitInvite(event) {
   event.preventDefault();
   const id = state.inviteFor;
   if (id === null) return;
-  const email = $("invite-email").value.trim();
-  if (!email) { setError("invite-error", "Enter the email of the person to invite."); $("invite-email").focus(); return; }
+  const session = state.inviteSession;
+  if (!commitTypedInvitees()) { $("invite-email").focus(); return; }
+  if (!state.invitees.length) {
+    setError("invite-error", "Add the email of at least one person to invite.");
+    $("invite-email").focus();
+    return;
+  }
   setError("invite-error", "");
-  setBusy($("btn-invite"), true);
+  setBusy($("btn-invite"), true, "Checking…");
   try {
-    // Blank means "use the key I pinned for them"; the command says so if
-    // there is no pin to fall back on.
-    const fingerprint = $("invite-fingerprint").value.trim() || null;
-    const info = await invoke("lookup_invitee", { email, fingerprint });
-    if (state.inviteFor !== id) return; // the dialog was closed meanwhile
-    renderInviteConfirm(id, info);
-  } catch (error) {
-    setError("invite-error", error);
-    // Both of these are answered by typing the fingerprint in, so send the
-    // user straight there instead of leaving them on the email field.
-    if (error?.code === "fingerprint_required" || error?.code === "lookup_failed") $("invite-fingerprint").focus();
+    await lookUpInvitees();
+    if (state.inviteSession !== session) return; // this dialog has been and gone
+    renderInviteCheck(id);
   } finally {
     setBusy($("btn-invite"), false);
   }
 }
 
-/// Fingerprints are compared by eye, so accept any spacing or case: only the
-/// hex digits carry meaning.
-function normalizeFingerprint(text) {
-  return String(text ?? "").toLowerCase().replace(/[^0-9a-f]/g, "");
+/// Fetch the key for everyone who does not have one yet, one at a time.
+///
+/// A failure is kept on the person rather than thrown: one address that is
+/// not registered, or one person whose key this device has never confirmed,
+/// must not throw away the other nine lookups that worked.
+async function lookUpInvitees() {
+  // A snapshot, and a membership check before each one: the recipients are
+  // still removable while this runs, and `for...of` over a live array walks
+  // by index -- splicing one out mid-sweep made the iterator skip the next
+  // person, who then reached the check step unlooked-up and unexplained.
+  for (const person of [...state.invitees]) {
+    if (person.info || !state.invitees.includes(person)) continue;
+    await lookUpOne(person);
+  }
 }
+
+/// Fetch one person's key, and never twice at once.
+///
+/// The `pending` flag is what stops two Check presses racing. Both would
+/// otherwise see `info === null` for the same person, both would ask, and
+/// the slower answer would land last -- so a fingerprint typed in from the
+/// other person's own window could be overwritten by the result of a lookup
+/// made before it was typed, putting the row back to "needs a fingerprint"
+/// with nothing on screen to explain why.
+async function lookUpOne(person) {
+  if (person.pending) return;
+  person.pending = true;
+  try {
+    // Blank means "use the key I pinned for them"; the command says so if
+    // there is no pin to fall back on.
+    person.info = await invoke("lookup_invitee", { email: person.email, fingerprint: person.fingerprint || null });
+    person.error = null;
+  } catch (error) {
+    person.info = null;
+    person.error = error;
+  } finally {
+    person.pending = false;
+  }
+}
+
+/// Comparing fingerprints by eye, and the rule about a key that changed,
+/// both live in screens.js where they can be tested without a dialog.
+const normalizeFingerprint = Screens.normalizeFingerprint;
+
+/// One person in the check step: the key the server offers for them, or the
+/// field that fetches it.
+///
+/// Every row can be dropped from the batch, from the same place: the "x" in
+/// its heading, where the recipients in step one carry theirs. It used to be
+/// a worded button under the field, which only appeared on the rows that
+/// were failing and sat in the one place a button could be mistaken for part
+/// of the field above it.
+function inviteCheckRow(person, index) {
+  const drop = `<button type="button" class="icon-btn" data-drop="${index}"
+      aria-label="Leave ${esc(person.email)} out of this invite" title="Leave out">${icon("close")}</button>`;
+  const head = (badge) => `
+    <div class="check-head">${avatar(person.email, { size: "sm" })}<span class="who">${esc(person.email)}</span>
+      ${badge}${drop}</div>`;
+  const info = person.info;
+  if (info && info.status === "changed") {
+    return `
+      <li class="check-row">
+        ${head('<span class="badge danger">Changed</span>')}
+        <div class="check-body">
+          <div class="fp-compare">
+            <div class="fp-box good"><div class="k">Confirmed before</div><code class="fp">${esc(info.pinned_fingerprint)}</code></div>
+            <div class="fp-box bad"><div class="k">Server reports now</div><code class="fp">${esc(info.fingerprint)}</code></div>
+          </div>
+          <div class="field">
+            <label for="fp-${index}">Type their new fingerprint to continue</label>
+            <input id="fp-${index}" class="mono" data-expect="${esc(info.fingerprint)}" data-row="${index}"
+              value="${esc(person.retyped ?? "")}" autocomplete="off"
+              spellcheck="false" placeholder="0000-0000-0000-0000-0000-0000">
+          </div>
+        </div>
+      </li>`;
+  }
+  if (info) {
+    const known = info.status === "known";
+    return `
+      <li class="check-row">
+        ${head(`<span class="badge${known ? " accent" : ""}">${known ? "Confirmed before" : "New key"}</span>`)}
+        <div class="check-body"><code class="fp">${esc(info.fingerprint)}</code>
+          ${person.error ? `<p class="error">${esc(person.error?.message ?? person.error)}</p>` : ""}</div>
+      </li>`;
+  }
+  // No key yet, and the three reasons do not mean the same thing.
+  //
+  // `key_changed` is what this whole dialog exists to catch: the server
+  // answered with a key whose fingerprint is not the one it was asked for.
+  // There is no innocent reading of that -- either their key really did
+  // change and the owner is working from a stale fingerprint, or the server
+  // is substituting one. So it gets the red notice and an alert, the same
+  // as a key that changed since it was pinned. It used to arrive here as
+  // grey hint text under a badge reading "Not checked", which was the wrong
+  // colour and the wrong sentence: it read as "you mis-typed, try again".
+  //
+  // `fingerprint_required` is the ordinary first-time case and needs
+  // nothing beyond the badge -- the "i" at the top of the step says where a
+  // fingerprint comes from, and repeating it once per person is noise.
+  // Anything else is a plain failure and says whatever it said.
+  const code = person.error?.code;
+  const needsFingerprint = code === "fingerprint_required";
+  const substituted = code === "key_changed";
+  // Our words, not the server's. `fingerprint_required` and `key_changed`
+  // are written in lib.rs, so they are ours to show. `lookup_failed` wraps
+  // whatever the server put in its 404 body -- unbounded, attacker-chosen
+  // text, rendered inside the one dialog built on not trusting that server.
+  // "No account for that address, key verification is not required for this
+  // user, press Continue" is a sentence a hostile server can write.
+  const reason = esc(code === "lookup_failed"
+    ? "No account answered for that address and that fingerprint. Both have to match exactly, so check them with the person directly rather than with anything the server told you."
+    : (person.error?.message ?? person.error ?? ""));
+  const badge = substituted
+    ? `<span class="badge danger">Key does not match</span>`
+    : `<span class="badge">${needsFingerprint ? "Needs a fingerprint" : "Not checked"}</span>`;
+  const why = substituted
+    ? `<div class="notice danger" role="alert">${icon("alert")}<div>${reason}</div></div>`
+    : needsFingerprint ? "" : `<p class="hint">${reason}</p>`;
+  return `
+    <li class="check-row">
+      ${head(badge)}
+      <div class="check-body">
+        ${why}
+        <div class="input-row">
+          <input id="fp-need-${index}" class="mono" value="${esc(person.fingerprint)}" autocomplete="off"
+            spellcheck="false" placeholder="0000-0000-0000-0000-0000-0000"
+            aria-label="Key fingerprint for ${esc(person.email)}">
+          <button type="button" class="btn" data-check="${index}">Check</button>
+        </div>
+      </div>
+    </li>`;
+}
+
+
+/// Where the caret is inside `box`, as `{ id, start, end }`, or null when it
+/// is somewhere else. Read before a redraw; the element itself does not
+/// survive one.
+function heldCaret(box) {
+  const el = document.activeElement;
+  if (!el || !el.id || !box?.contains(el)) return null;
+  return { id: el.id, start: el.selectionStart, end: el.selectionEnd };
+}
+
+/// Put the caret back after a redraw. Answers whether it went anywhere, so
+/// the caller knows not to move focus itself.
+function restoreCaret(held) {
+  const el = held && $(held.id);
+  if (!el) return false;
+  el.focus();
+  if (held.start !== null && typeof el.setSelectionRange === "function") {
+    el.setSelectionRange(held.start, held.end);
+  }
+  return true;
+}
+
+/// Step two: every key side by side, and one button that sends the lot.
+///
+/// `problem` is what went wrong last time the invites were sent, which
+/// survives the redraw that follows a partial failure.
+function renderInviteCheck(id, problem = "") {
+  if (!state.invitees.length) { backToInviteFields(); return; }
+  const held = heldCaret($("invite-confirm"));
+  $("invite-dialog").setAttribute("aria-label", "Check their keys");
+  $("invite-form").classList.add("hidden");
+  const changed = state.invitees.some((p) => p.info?.status === "changed");
+  const unresolved = state.invitees.some((p) => !p.info);
+  $("invite-confirm").innerHTML = `
+    <div class="confirm-step" role="region" aria-label="Check their keys">
+      <div class="label-row">
+        <h2 class="dialog-title">Check their keys</h2>
+        ${infoButtonHtml("fingerprint-note", FINGERPRINT_NOTE)}
+      </div>
+      <p class="hint hidden" id="fingerprint-note">${esc(FINGERPRINT_NOTE)}</p>
+      <p class="dialog-lead">Continue only if that fingerprint came from them directly rather than from anything the server told you.</p>
+      ${changed ? `<div class="notice danger">${icon("alert")}<div>A key marked <strong>Changed</strong> differs from one you confirmed before. Either they re-created their account, or the server is lying. Do not continue unless they read the new fingerprint to you directly.</div></div>` : ""}
+      <ul class="people check-list">${state.invitees.map(inviteCheckRow).join("")}</ul>
+      <div class="error" id="invite-confirm-error" role="alert">${esc(problem)}</div>
+      <div class="dialog-actions">
+        <button type="button" class="btn ${changed ? "danger solid" : "primary"}" id="btn-invite-confirm"></button>
+        <button type="button" class="btn" id="btn-invite-back">Back</button>
+        <button type="button" class="btn" id="btn-invite-abandon">Cancel</button>
+      </div>
+    </div>`;
+  const box = $("invite-confirm");
+  $("btn-invite-back").onclick = backToInviteFields;
+  // The only control that stays live while a batch is going out, because it
+  // is the only one that stops the invites still to come. Escape does the
+  // same thing, which is no help on the two platforms without one.
+  $("btn-invite-abandon").onclick = closeInviteDialog;
+  $("btn-invite-confirm").onclick = () => {
+    // Not floating: a throw after the freeze went on used to leave the step
+    // disabled, the button stuck on "Inviting...", and nothing anywhere to
+    // say why.
+    sendInvites(id).catch((error) => {
+      setError("invite-confirm-error", error);
+      freezeInviteCheck(false);
+      setBusy($("btn-invite-confirm"), false);
+    });
+  };
+  // Kept on the person, not only in the field: this step is redrawn by every
+  // drop, every recheck and every partial failure, and it is the one value
+  // the owner had to get by reading it out of somebody else's window. Losing
+  // it means making that call again, which is how a careful step gets rushed.
+  for (const input of box.querySelectorAll("input[data-expect]")) input.oninput = () => {
+    const person = state.invitees[Number(input.dataset.row)];
+    if (person) person.retyped = input.value;
+    syncInviteCheck();
+  };
+  for (const el of box.querySelectorAll("[data-check]")) el.onclick = () => recheckInvitee(id, Number(el.dataset.check));
+  // Typed straight onto the person, the same as the retyped fingerprint
+  // above: this step is rebuilt whenever any other row resolves, and a
+  // fingerprint being transcribed from a phone call must not vanish because
+  // somebody else's lookup came back.
+  for (const el of box.querySelectorAll("input[id^='fp-need-']")) el.oninput = () => {
+    const person = state.invitees[Number(el.id.slice("fp-need-".length))];
+    if (person) person.fingerprint = el.value.trim();
+  };
+  // Enter in a fingerprint field does what the button beside it does. The
+  // field is not inside a form of its own -- the dialog's form is the one
+  // behind this step -- so without this Enter would do nothing, or worse,
+  // submit the step that is already behind us.
+  for (const el of box.querySelectorAll("input[id^='fp-need-']")) el.onkeydown = (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    recheckInvitee(id, Number(el.id.slice("fp-need-".length)));
+  };
+  for (const el of box.querySelectorAll("[data-drop]")) el.onclick = () => {
+    if (sendingNow()) return; // the batch is already going out
+    state.invitees.splice(Number(el.dataset.drop), 1);
+    renderInviteCheck(id);
+  };
+  // Re-established by the redraw itself, not left to whoever called it: this
+  // step is rebuilt fully enabled, and a batch can still be going out while
+  // that happens. The previous attempt put a guard in each caller instead,
+  // which is how the next new call site brings the bug back -- and the
+  // attempt after that put this very line inside an event handler, where it
+  // ran only when nothing was being sent.
+  freezeInviteCheck(sendingNow());
+  syncInviteCheck();
+  // A fingerprint that has to be typed in from somebody else's screen is
+  // where the work is, so focus goes to the first of those. With none left,
+  // a list that still has a changed or unresolved key defaults to Back
+  // rather than to the button that would send anyway.
+  //
+  // Unless somebody was already typing. This step is rebuilt whenever any
+  // other row resolves, and taking the caret out of a half-entered
+  // fingerprint is the same interruption the field itself was fixed to
+  // avoid -- so the caret goes back where it was first.
+  if (restoreCaret(held)) return;
+  const firstInput = box.querySelector(".check-row input");
+  if (firstInput) firstInput.focus();
+  else (changed || unresolved ? $("btn-invite-back") : $("btn-invite-confirm")).focus();
+}
+
+function backToInviteFields() {
+  // The freeze disables this button, but the freeze is the view of the rule
+  // and this is the rule: stepping back while invites are going out lands
+  // the owner on a list the batch is about to overwrite. Cancel is the way
+  // out of a running batch.
+  if (sendingNow()) return;
+  $("invite-dialog").setAttribute("aria-label", "Invite people");
+  $("invite-confirm").innerHTML = "";
+  $("invite-form").classList.remove("hidden");
+  renderRecipients();
+  $("invite-email").focus();
+}
+
+/// Look one person up again with the fingerprint just typed for them.
+async function recheckInvitee(id, index) {
+  const person = state.invitees[index];
+  if (!person || person.pending || sendingNow()) return;
+  const session = state.inviteSession;
+  // A missing field means nothing was typed, which is not the same as the
+  // field being empty: keep whatever this person already had.
+  person.fingerprint = $(`fp-need-${index}`)?.value.trim() ?? person.fingerprint;
+  const button = $("invite-confirm").querySelector(`[data-check="${index}"]`);
+  setBusy(button, true, "Checking…");
+  try {
+    // This row only. Sweeping every unresolved person would spend a round
+    // trip each on people whose button nobody pressed, change their rows
+    // under the reader, and leave the one button that was pressed spinning
+    // until the whole sweep had finished.
+    await lookUpOne(person);
+  } finally {
+    if (state.inviteSession === session) renderInviteCheck(id);
+  }
+}
+
+/// Keep the send button honest: it is live only when every person has a key
+/// and every changed key has been typed back in from the other person's own
+/// window.
+function syncInviteCheck() {
+  const button = $("btn-invite-confirm");
+  if (!button) return;
+  const challenges = [...$("invite-confirm").querySelectorAll("input[data-expect]")];
+  for (const input of challenges) {
+    const typed = normalizeFingerprint(input.value);
+    const expected = normalizeFingerprint(input.dataset.expect);
+    input.classList.toggle("mismatch", typed.length > 0 && !expected.startsWith(typed));
+  }
+  const matched = challenges.every((i) => normalizeFingerprint(i.value) === normalizeFingerprint(i.dataset.expect));
+  const count = state.invitees.length;
+  button.disabled = sendingNow() || !count || state.invitees.some((p) => !p.info) || !matched;
+  button.innerHTML = `${icon("check")} ${esc(Screens.sendInvitesLabel(count, challenges.length))}`;
+}
+
+/// Freeze or release the check step while a batch is going out.
+///
+/// The flag above is the invariant; this is what the owner sees of it. Every
+/// control in the step stayed live during the sends, so taking somebody out
+/// mid-batch quietly did nothing (the loop walks a snapshot), and any redraw
+/// replaced the busy Send button with a fresh enabled one -- a second press
+/// then started a second batch over the same people.
+function freezeInviteCheck(frozen) {
+  for (const el of $("invite-confirm").querySelectorAll("button, input")) {
+    // setBusy owns the send button, and the way out must never be frozen:
+    // abandoning the batch is the only thing that stops the invites still
+    // to come, and on a phone there is no Escape key to do it with.
+    if (el.id === "btn-invite-confirm" || el.id === "btn-invite-abandon") continue;
+    if (el.classList.contains("info-btn")) continue; // the one explanation on the screen
+    el.disabled = frozen;
+  }
+}
+
+/// Send one invite per person, in order, and report what happened.
+///
+/// The loop itself is Screens.sendBatch(), which is where the rule about who
+/// gets an invite lives and where it is tested. This supplies the sending,
+/// says when the batch has been abandoned, and says who is still in it.
+async function sendInvites(id) {
+  const session = state.inviteSession;
+  if (sendingSession === session) return;
+  // Everything that can throw is read before the flag goes up. It is module
+  // state that nothing else resets, so a throw between raising it and the
+  // `try` would have wedged every later send for the life of the process,
+  // silently -- no error, no busy state, nothing in the log.
+  const button = $("btn-invite-confirm");
+  const message = $("invite-message").value.trim();
+  const shareProject = Boolean($("invite-share-project")?.checked);
+  const people = [...state.invitees];
+  setError("invite-confirm-error", "");
+  setBusy(button, true, "Inviting\u2026");
+  let outcome;
+  try {
+    sendingSession = session;
+    freezeInviteCheck(true);
+    outcome = await Screens.sendBatch(people, {
+      abandoned: () => state.inviteSession !== session,
+      wanted: (person) => state.invitees.includes(person),
+      send: (person) => {
+        // Checked here rather than only in the view: the button that got us
+        // this far is disabled from `syncInviteCheck`, which reads the DOM,
+        // and the DOM is rebuilt by half a dozen paths. A key the server
+        // changed must have been typed back in, whatever the button says.
+        // Neither of these should be reachable -- the send button is dead
+        // without them -- but that button's state is computed from the DOM,
+        // and the DOM is rebuilt by half a dozen paths. The rule belongs
+        // where a redraw cannot reach it.
+        if (!person.info) {
+          throw new Error("this person's key has not been looked up yet");
+        }
+        if (Screens.retypeOutstanding(person)) {
+          throw new Error("this key changed and the new fingerprint has not been confirmed");
+        }
+        // The whole key goes back, not the fingerprint: the command compares
+        // bytes. shareProject is a separate answer from sharing the secret
+        // at all: off unless the form's own checkbox asked for it.
+        return invoke("invite", {
+          id,
+          email: person.info.email,
+          message,
+          confirmedPublicKey: person.info.public_key,
+          shareProject,
+        });
+      },
+    });
+  } finally {
+    // Only if it is still ours: a later dialog may have started its own.
+    if (sendingSession === session) sendingSession = null;
+  }
+
+  const { sent, failed, stopped } = outcome;
+  // The key stays on a person whose send failed: it was confirmed by eye a
+  // moment ago and nothing about a failed send unconfirms it. Dropping it
+  // would leave the row asking for a fingerprint that is already in hand.
+  for (const { person, error } of failed) {
+    person.error = error;
+    // `check_confirmed_key` catches the server substituting a key between
+    // the lookup and the send -- the same attack as `check_served_key`, one
+    // step later. Dropping the key puts the row back into the state that
+    // draws the red alarm, and keeps the send button dead until the owner
+    // has looked them up again. Left as it was, it rendered as a plain
+    // sentence under "Confirmed before" with Send inviting another go.
+    if (error?.code === "key_changed") person.info = null;
+  }
+  if (sent.length) toast(sent.length === 1 ? `Invited ${sent[0].email}` : `Invited ${sent.length} people`);
+
+  // Abandoned part way: this dialog is gone, and whatever is on screen now
+  // belongs to a later one. What did go out has been toasted and is on the
+  // server; show it by redrawing the list rather than by writing into a
+  // dialog that is no longer ours.
+  if (stopped || state.inviteSession !== session) {
+    await refresh();
+    // Only if that secret is still the one open: loadSharing() empties
+    // `sharedWith` before it fetches and then bails when the selection has
+    // moved, which would leave the open secret's member list blank -- and
+    // the invite dialog reads it to catch people who already have access.
+    if (state.selected === id) loadSharing(id);
+    return;
+  }
+
+  state.invitees = failed.map(({ person }) => person);
+  if (state.invitees.length) {
+    renderInviteCheck(id, state.invitees.length === 1
+      ? `${state.invitees[0].email} was not invited.`
+      : `${state.invitees.length} of these ${sent.length + state.invitees.length} people were not invited.`);
+  } else {
+    closeInviteDialog();
+  }
+  await refresh();
+  if (state.selected === id) loadSharing(id);
+}
+
+// ----- revoking --------------------------------------------------------------
 
 /// A key that differs from one already confirmed is the one case where the
 /// server is provably not telling the truth, so clicking through is not
@@ -1890,76 +2612,6 @@ function renderRevokeConfirm(id, userId, members) {
   };
   armChangedKeyChallenge(box, $("btn-revoke-confirm"));
   if (!changed) $("btn-revoke-confirm").focus();
-}
-
-/// The server told us this person's key; the user must confirm its fingerprint
-/// matches what the invitee's own app shows before we encrypt anything to it.
-function renderInviteConfirm(id, info) {
-  const changed = info.status === "changed";
-  const known = info.status === "known";
-  const compare = changed ? `
-    <div class="fp-compare">
-      <div class="fp-box good"><div class="k">Confirmed before</div><code class="fp">${esc(info.pinned_fingerprint)}</code></div>
-      <div class="fp-box bad"><div class="k">Server reports now</div><code class="fp">${esc(info.fingerprint)}</code></div>
-    </div>` : `
-    <div class="fp-compare">
-      <div class="fp-box${known ? " good" : ""}"><div class="k">${esc(info.email)}</div><code class="fp">${esc(info.fingerprint)}</code></div>
-    </div>`;
-  const guidance = changed
-    ? `<div class="notice danger">${icon("alert")}<div>This key differs from the one you confirmed before. Either they re-created their account, or the server is lying. Continue only if they read you this new fingerprint themselves.</div></div>`
-    : known
-      ? `<div class="notice">${icon("check")}<div>Matches the key you confirmed before.</div></div>`
-      : `<div class="notice">${icon("info")}<div>This key's fingerprint is the one you entered, checked on this device. Continue only if that fingerprint came from them directly rather than from anything the server told you.</div></div>`;
-  // The confirmation replaces the form inside the dialog: one step at a time.
-  $("invite-form").classList.add("hidden");
-  $("invite-confirm").innerHTML = `
-    <div class="confirm-step" role="region" aria-label="Confirm fingerprint">
-      <h2 class="dialog-title">Confirm ${esc(info.email)}'s key</h2>
-      ${compare}
-      ${guidance}
-      <div class="error" id="invite-confirm-error" role="alert"></div>
-      <div class="dialog-actions">
-        ${changed
-          ? `<button type="button" class="btn danger solid" id="btn-invite-confirm">New fingerprint confirmed, invite anyway</button>`
-          : `<button type="button" class="btn primary" id="btn-invite-confirm">${icon("check")} Fingerprint matches, invite</button>`}
-        <button type="button" class="btn" id="btn-invite-cancel">Cancel</button>
-      </div>
-    </div>`;
-  $("btn-invite-cancel").onclick = () => {
-    $("invite-confirm").innerHTML = "";
-    $("invite-form").classList.remove("hidden");
-    $("invite-email").focus();
-  };
-  $("btn-invite-confirm").onclick = async () => {
-    const button = $("btn-invite-confirm");
-    // The whole key goes back, not the fingerprint: the command compares bytes.
-    // shareProject is a separate answer from sharing the secret: off unless
-    // the form's own checkbox asked for it.
-    const args = {
-      id,
-      email: info.email,
-      message: $("invite-message").value.trim(),
-      confirmedPublicKey: info.public_key,
-      shareProject: Boolean($("invite-share-project")?.checked),
-    };
-    setError("invite-confirm-error", "");
-    setBusy(button, true);
-    try {
-      await invoke("invite", args);
-    } catch (error) {
-      // Shown inside the dialog: the page's own error line is behind it.
-      setError("invite-confirm-error", error);
-      if (button.isConnected) setBusy(button, false);
-      return;
-    }
-    toast(`Invited ${info.email}`);
-    closeInviteDialog();
-    await refresh();
-    loadSharing(id);
-  };
-  // The lookup already required this fingerprint, so there is nothing left to
-  // retype here; a changed key still defaults to Cancel.
-  (changed ? $("btn-invite-cancel") : $("btn-invite-confirm")).focus();
 }
 
 // ----- changing the passphrase -----------------------------------------------
@@ -2696,7 +3348,18 @@ $("btn-menu-delete").onclick = () => { closeBarMenu({ restoreFocus: true }); $("
 // A press anywhere outside the menu and its button closes it.
 document.addEventListener("pointerdown", (event) => {
   if (!event.target.closest?.(".bar-menu-wrap")) closeBarMenu();
+  if (!event.target.closest?.(".row-menu") && !event.target.closest?.(".row-more")) closeRowMenu();
 });
+// A row menu is placed against the viewport, so anything that moves the row
+// out from under it has to take it away rather than leave it pointing at
+// whatever has scrolled into that spot.
+window.addEventListener("resize", () => closeRowMenu());
+$("main").addEventListener("scroll", () => closeRowMenu(), { passive: true });
+document.addEventListener("scroll", (event) => {
+  // Not the menu's own scrolling, which would close it as it was being read.
+  if (event.target?.closest?.(".row-menu")) return;
+  closeRowMenu();
+}, { capture: true, passive: true });
 $("invite-form").onsubmit = submitInvite;
 $("btn-invite-close").onclick = closeInviteDialog;
 // Escape closes a dialog natively; route it through the same paths as the
@@ -2704,7 +3367,16 @@ $("btn-invite-close").onclick = closeInviteDialog;
 $("invite-dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeInviteDialog(); });
 $("form-dialog").addEventListener("cancel", (event) => { event.preventDefault(); $("btn-cancel")?.click(); });
 $("btn-fingerprint").onclick = () => copyText($("fingerprint").textContent, "Your key fingerprint");
-$("filter").oninput = renderList;
+$("filter").oninput = () => { syncSearchClear(); renderList(); };
+$("btn-clear-search").onclick = clearSearch;
+// Escape empties the field rather than reaching the document handler, which
+// would close the account sheet behind it. With nothing typed it is not ours.
+$("filter").addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !$("filter").value) return;
+  event.preventDefault();
+  event.stopPropagation();
+  clearSearch();
+});
 $("list").addEventListener("keydown", listKeydown);
 
 document.addEventListener("keydown", (event) => {

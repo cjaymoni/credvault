@@ -27,3 +27,7 @@ docs/security-audit.md
 
 # Python bytecode from apps/desktop/scripts.
 __pycache__/
+
+# Dev-only: the UI tests drive the real interface under jsdom. Nothing the
+# app ships depends on any of it; apps/desktop/ui stays plain files.
+node_modules/

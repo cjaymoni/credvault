@@ -116,7 +116,12 @@
   <div class="auth-foot"><span>End-to-end encrypted · Self-hosted · Open source</span>
     <div class="theme-switch" id="theme-switch-auth" role="group" aria-label="Appearance">
       <button type="button" data-theme-choice="system" aria-pressed="true" title="Match the system" aria-label="Match the system">
-        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <!-- "The system" is whatever this device is, so the icon has to be
+             too: a monitor where there is one, a handset on iOS and Android.
+             Both ship and platform.css shows one, the way the new-secret
+             button carries a plus and a pencil. -->
+        <svg class="ic sys-desktop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <svg class="ic sys-phone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M12 18.5h.01"/></svg>
       </button>
       <button type="button" data-theme-choice="light" aria-pressed="false" title="Light" aria-label="Light">
         <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
@@ -148,6 +153,14 @@
       <div class="search" id="search-box">
         <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         <input id="filter" type="search" placeholder="Search" aria-label="Search secrets" autocomplete="off" spellcheck="false">
+        <!-- The platform's own clear button is turned off in styles.css
+             (`::-webkit-search-cancel-button`), because it is invisible in
+             dark mode on some of these webviews and unstyleable on all of
+             them. This is the replacement: hidden until there is something
+             to clear, so an empty field carries nothing to press. -->
+        <button type="button" class="search-clear" id="btn-clear-search" aria-label="Clear search" title="Clear search" hidden>
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
       </div>
     </div>
     <div class="slot" data-slot="sidebar-top">
@@ -268,7 +281,12 @@
 
     <div class="theme-switch" id="theme-switch-app" role="group" aria-label="Appearance">
       <button type="button" data-theme-choice="system" aria-pressed="true" title="Match the system" aria-label="Match the system">
-        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <!-- "The system" is whatever this device is, so the icon has to be
+             too: a monitor where there is one, a handset on iOS and Android.
+             Both ship and platform.css shows one, the way the new-secret
+             button carries a plus and a pencil. -->
+        <svg class="ic sys-desktop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <svg class="ic sys-phone" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M12 18.5h.01"/></svg>
       </button>
       <button type="button" data-theme-choice="light" aria-pressed="false" title="Light" aria-label="Light">
         <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
@@ -334,34 +352,25 @@
   </form>
 </dialog>
 
-<!-- Invite someone to the open secret. A modal dialog on every platform: it
-     holds the email, the fingerprint check and the confirmation in one place. -->
-<dialog class="dialog" id="invite-dialog" aria-labelledby="invite-dialog-title">
+<!-- Invite people to the open secret. A modal dialog on every platform: it
+     holds the recipients, the fingerprint checks and the confirmation in one
+     place, and takes as many people at once as the owner has to tell.
+
+     Two things about it are not written here.
+
+     The body of the form is drawn by renderInviteFields() in app.js, because
+     its labels carry "i" buttons whose tooltip has to be the same string as
+     the paragraph they reveal -- which is a constant in app.js, and typing
+     the sentence here as well is how one of the two ends up reworded alone.
+
+     The dialog is named by whichever step is showing, also from app.js: the
+     heading changes from "Invite people" to "Check their keys" halfway
+     through and the form it started with is only hidden, so an
+     `aria-labelledby` pointing at that heading would go on reading out the
+     step that is no longer on screen. -->
+<dialog class="dialog" id="invite-dialog">
   <form id="invite-form" novalidate>
-    <h2 id="invite-dialog-title" class="dialog-title">Invite someone</h2>
-    <p class="dialog-lead">They get read-only access to this one secret. Use the email they signed up with.</p>
-    <div class="field">
-      <label for="invite-email">Email</label>
-      <input id="invite-email" type="email" placeholder="friend@example.com" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="field">
-      <label for="invite-fingerprint">Their key fingerprint</label>
-      <input id="invite-fingerprint" class="mono" placeholder="0000-0000-0000-0000-0000-0000" autocomplete="off" spellcheck="false">
-      <p class="hint">Ask them to read it from their klavyn account settings. Leave blank for someone you have already shared with.</p>
-    </div>
-    <div class="field">
-      <label for="invite-message">Message <span class="label-note">(optional)</span></label>
-      <input id="invite-message" placeholder="e.g. The shared Wi-Fi password">
-    </div>
-    <!-- A separate answer from sharing the secret, and off by default: the
-         project name is the owner's own label for a group of their secrets,
-         and handing one credential over is not handing over how a vault is
-         organised. Hidden by the app when the secret is filed nowhere. -->
-    <div class="field hidden" id="invite-project-field">
-      <label class="checkbox"><input type="checkbox" id="invite-share-project">
-        <span id="invite-project-label">Also tell them which project this is in</span></label>
-      <p class="hint">They will see the project's name on this secret. Once they accept, you can change your mind from the Sharing list.</p>
-    </div>
+    <div id="invite-fields"></div>
     <div class="error" id="invite-error" role="alert"></div>
     <div class="dialog-actions">
       <button type="submit" class="btn primary" id="btn-invite">Continue</button>

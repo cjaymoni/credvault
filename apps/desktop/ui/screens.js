@@ -462,5 +462,151 @@
     return shown ? `Version ${shown}` : null;
   }
 
-  return { esc, serverSummaryText, serverUrlFor, strandedAddress, hasMoreDetails, isSaveShortcut, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts };
+
+  // ----- inviting several people at once --------------------------------
+
+  /// How many people one invite dialog will take. Each invite is its own
+  /// round trip -- the secret's key is wrapped separately for every public
+  /// key -- so a list long enough to take minutes would look like the app
+  /// had stopped rather than like it was working.
+  const MAX_INVITEES = 20;
+
+  /// What separates one address from the next in the recipients box: a
+  /// comma, a semicolon or any whitespace. Pasting a list from a mail client
+  /// goes through the same split as typing one, which is why this is not
+  /// done on Enter alone.
+  const ADDRESS_SEPARATORS = /[,;\s]+/;
+
+  /// An address has an @ and no spaces. The server decides what an address
+  /// really is; this only catches the comma that was meant to be a
+  /// separator, and the sentence someone pasted by accident.
+  const LOOKS_LIKE_EMAIL = /^[^\s@]+@[^\s@]+$/;
+
+  function splitAddresses(text) {
+    return String(text ?? "").split(ADDRESS_SEPARATORS).filter(Boolean);
+  }
+
+  /// Why `email` cannot be added to the invite in progress, or null when it
+  /// can be.
+  ///
+  /// Checked while it is being typed rather than after the lookup, because
+  /// the server answers a lookup for somebody who already has access exactly
+  /// as it answers one for anybody else. Without this the owner would read
+  /// out a fingerprint, compare it, press invite, and only then be told
+  /// there was nothing to do.
+  ///
+  /// Addresses are compared case-insensitively, which is more forgiving than
+  /// the server: the local part of an address is case-sensitive by the spec,
+  /// so `A@x.test` and `a@x.test` *may* be two people. Being wrong that way
+  /// costs a refusal the user can work around by inviting them separately;
+  /// being wrong the other way spends a fingerprint check on a duplicate.
+  function inviteeProblem(email, { me = "", queued = [], members = [], invites = [], max = MAX_INVITEES } = {}) {
+    const address = String(email ?? "");
+    const lower = address.toLowerCase();
+    const holds = (list) => (Array.isArray(list) ? list : []).some((other) => String(other ?? "").toLowerCase() === lower);
+    if (!LOOKS_LIKE_EMAIL.test(address)) return `"${address}" is not an email address.`;
+    if (String(me ?? "").toLowerCase() === lower) return "That is your own address, and this secret is already yours.";
+    if (holds(queued)) return `${address} is already on the list.`;
+    if (holds(members)) return `${address} already has access to this secret.`;
+    if (holds(invites)) return `${address} already has an invite waiting.`;
+    if ((Array.isArray(queued) ? queued.length : 0) >= max) {
+      return `That is more than ${max} people at once. Invite the rest afterwards.`;
+    }
+    return null;
+  }
+
+  /// Read a whole typed or pasted list, all or nothing.
+  ///
+  /// Returns `{ accepted, problem }`: the addresses to add, or the reason the
+  /// first unusable one cannot be added. Nothing is accepted when anything
+  /// fails, so the box keeps exactly what was typed and the caller never has
+  /// to rewrite it -- which is what makes a mis-parsed paste fixable. An
+  /// earlier version committed the good prefix and rewrote the rest of the
+  /// line, so every keystroke that followed re-normalised the text under the
+  /// caret and threw it to the end of the field.
+  ///
+  /// Duplicates inside one paste are caught as well as duplicates against
+  /// the list already collected, which is why `accepted` grows as it goes.
+  function acceptAddresses(text, context = {}) {
+    const accepted = [];
+    for (const address of splitAddresses(text)) {
+      const queued = [...(context.queued ?? []), ...accepted];
+      const problem = inviteeProblem(address, { ...context, queued });
+      if (problem) return { accepted: [], problem };
+      accepted.push(address);
+    }
+    return { accepted, problem: null };
+  }
+
+  /// Fingerprints are compared by eye, so accept any spacing or case: only
+  /// the hex digits carry meaning.
+  function normalizeFingerprint(text) {
+    return String(text ?? "").toLowerCase().replace(/[^0-9a-f]/g, "");
+  }
+
+  /// Whether this person's key has changed since it was last confirmed and
+  /// the new fingerprint has not been typed back in.
+  ///
+  /// The send asks this per person, not just the button. The button's own
+  /// disabled state is computed from the fields on screen, and the step is
+  /// rebuilt by half a dozen paths -- so the rule that a changed key must be
+  /// re-confirmed belongs somewhere a redraw cannot reach, and somewhere a
+  /// test can.
+  function retypeOutstanding(person) {
+    const info = person?.info;
+    if (!info || info.status !== "changed") return false;
+    return normalizeFingerprint(person.retyped) !== normalizeFingerprint(info.fingerprint);
+  }
+
+  /// Send to each of `people` in turn, and say what happened.
+  ///
+  /// The sending itself is injected, so the rule this encodes -- who gets an
+  /// invite and who does not -- can be tested without a dialog, a server or
+  /// a DOM. Two things it has to get right, both of which went wrong in
+  /// review when they lived inside the view:
+  ///
+  /// - `abandoned()` is asked *before* every send, never once at the start.
+  ///   The dialog is modal, so Escape reaches it while this is running, and
+  ///   a batch that checked only once carried on inviting people the owner
+  ///   had just pressed Escape to stop.
+  /// - `wanted(person)` is asked too, because `people` is a snapshot. Taking
+  ///   somebody out of the batch while it runs is an access decision, and a
+  ///   loop walking the snapshot invited them regardless.
+  ///
+  /// Returns `{ sent, failed, stopped }`. `failed` carries the error beside
+  /// the person it belongs to; nothing is mutated here. `stopped` says the
+  /// batch was abandoned part way, which is not the same as finishing with
+  /// failures and is reported differently.
+  async function sendBatch(people, { send, abandoned = () => false, wanted = () => true } = {}) {
+    if (typeof send !== "function") throw new TypeError("sendBatch needs something to send with");
+    const sent = [];
+    const failed = [];
+    for (const person of people) {
+      if (abandoned()) return { sent, failed, stopped: true };
+      if (!wanted(person)) continue;
+      try {
+        await send(person);
+        sent.push(person);
+      } catch (error) {
+        failed.push({ person, error });
+      }
+    }
+    return { sent, failed, stopped: abandoned() };
+  }
+
+  /// What the button that sends the invites says.
+  ///
+  /// `retyped` is how many fingerprints had to be typed back in from the
+  /// other person's own window, which only happens for a key that differs
+  /// from one confirmed before. That case says "anyway", because it is one:
+  /// the server has been caught serving a different key and the owner is
+  /// going ahead regardless.
+  function sendInvitesLabel(count, retyped = 0) {
+    if (retyped > 0) {
+      return count > 1 ? `New fingerprints confirmed, invite ${count} people` : "New fingerprint confirmed, invite anyway";
+    }
+    return count > 1 ? `Fingerprints match, proceed with ${count} people` : "Fingerprint matches, proceed";
+  }
+
+  return { esc, serverSummaryText, serverUrlFor, strandedAddress, hasMoreDetails, isSaveShortcut, appVersionLabel, listGroupHtml, listSections, namesProject, shouldPopToList, UNFILED_TITLE, SHARED_TITLE, MINE_TITLE, tokenPrompt, PLATFORMS, platformFrom, resolvePlatform, placementFor, shortcutLabel, shortcutKeys, namesShortcuts, MAX_INVITEES, splitAddresses, inviteeProblem, acceptAddresses, normalizeFingerprint, retypeOutstanding, sendBatch, sendInvitesLabel };
 });

@@ -1,0 +1,11 @@
+{
+  "name": "klavyn-ui-tests",
+  "private": true,
+  "description": "Dev-only. The app ships no JavaScript dependencies: apps/desktop/ui is plain files with no build step, and that has not changed. This exists so the UI tests can drive the real interface under a real DOM.",
+  "scripts": {
+    "test": "node --test apps/desktop/ui-tests/"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

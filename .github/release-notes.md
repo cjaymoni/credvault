@@ -50,6 +50,16 @@ server that changes address. This release does not raise the minimum server
 version — see the warning at the top — so an app from this release still
 works against an older server; it just cannot do that one thing there.
 
+**Sharing is quicker, and the phone caught up with the desktop.** You can
+invite several people to one secret in one go: type or paste their addresses,
+compare everyone's key fingerprint side by side on one screen, and send the
+invites together. Each person in the sharing list now has a menu holding what
+you can do about them -- let them see which project it is in, revoke access,
+cancel an invite -- rather than a row of controls beside their address. The
+search box has a clear button, the buttons in the toolbar say what they do
+instead of being bare icons, and a number of things that were cut off, stacked
+oddly or repeated on a phone screen are fixed.
+
 **Two things carried over, because they are easy to miss and neither is new
 enough to announce again.** The app tells whatever server you point it at
 which version and which operating system it is, on every request, and the

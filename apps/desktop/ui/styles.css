@@ -292,7 +292,6 @@ select { padding-right: 34px; cursor: pointer; }
   color: var(--text-2);
 }
 .checkbox input[type="checkbox"] { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
-.people .sees-project { flex: none; white-space: nowrap; }
 
 .field { margin-bottom: 14px; }
 .field label {
@@ -509,6 +508,11 @@ select { padding-right: 34px; cursor: pointer; }
   cursor: default;
 }
 .auth.server-locked .server-summary-action { display: none; }
+/* Nothing to say about how to write an address nobody can write. The line
+   under the field explains the choice between http and https, and while the
+   address is pinned there is no choice to explain -- so it is one more
+   sentence to read past on the first screen of the app. */
+.auth.server-locked #server-field .hint { display: none; }
 
 .brand { display: flex; align-items: center; gap: 10px; }
 /* The plate is the artwork's own colours, not `--accent`, and deliberately
@@ -630,8 +634,38 @@ select { padding-right: 34px; cursor: pointer; }
 }
 .sidebar-tools { display: flex; gap: 8px; padding: 12px 12px 8px; }
 .search { position: relative; flex: 1; min-width: 0; }
-.search .ic { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--text-3); pointer-events: none; }
+/* The magnifier, and only it: `>` because the clear button after the
+   input carries an `.ic` too, and this rule lifted that one out of its
+   button and parked it at the magnifier's coordinates. */
+.search > .ic { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--text-3); pointer-events: none; }
 .search input { padding-left: 34px; }
+/* Sits inside the field, at its trailing edge, and only while there is
+   something to clear: a permanent "x" on an empty box is one more control
+   to read past on a screen that is mostly list. The field makes room for it
+   with the same class, so the text never runs underneath. */
+.search-clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+/* `display` is set above, so the attribute's own rule has to be said again:
+   an author declaration beats the one the browser gives `[hidden]`. */
+.search-clear[hidden] { display: none; }
+.search-clear .ic { width: 14px; height: 14px; }
+@media (hover: hover) { .search-clear:hover { background: var(--surface-3); color: var(--text); } }
+.search.has-text input { padding-right: 30px; }
 .sidebar-count { padding: 2px 16px 8px; font-size: var(--text-caption); color: var(--text-3); }
 
 .list { overflow-y: auto; flex: 1; padding: 0 8px 12px; }
@@ -673,6 +707,9 @@ select { padding-right: 34px; cursor: pointer; }
   white-space: nowrap;
 }
 .item-sub .ic { width: 13px; height: 13px; }
+/* The words inside the flex row, so they can be ellipsised: the overflow
+   rules on `.item-sub` itself govern the row, not the text in it. */
+.item-sub-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .item-sub em { font-style: normal; opacity: 0.8; }
 .item.active .item-sub { color: inherit; opacity: 0.8; }
 .item.broken .item-sub { color: var(--danger); }
@@ -916,6 +953,90 @@ input.mono.mismatch { border-color: var(--danger); }
 .people li:first-child { border-top: 0; }
 .people .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .people .only-you { color: var(--text-3); font-size: var(--text-small); }
+
+/* A sharing row: who, where they stand, and one button holding everything
+   that can be done about them. One line wherever there is room for it; the
+   phone block wraps the status under the address. */
+.row-more { flex: none; }
+.badge.danger { background: var(--danger-soft); color: var(--danger); }
+
+/* The menu a row's "more" button opens. Fixed to the viewport and parented
+   to the body: the lists it opens from are cards that clip their contents on
+   two of the five platforms, so a menu laid out inside one would be cut off
+   at the card's edge. app.js places it. */
+.row-menu {
+  position: fixed;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  max-width: calc(100vw - 16px);
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg, 0 10px 30px rgba(0, 0, 0, 0.18));
+}
+.row-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-small);
+  text-align: start;
+  cursor: pointer;
+}
+.row-menu-item.danger { color: var(--danger); }
+@media (hover: hover) {
+  .row-menu-item:hover { background: var(--surface-3); }
+  .row-menu-item.danger:hover { background: var(--danger-soft); }
+}
+/* Each item is an icon, its words, and -- on the one that can be switched
+   on and off -- a tick at the far end saying which it is. The icon says what
+   the item acts on at a glance; the tick is state, so it sits apart from it
+   rather than in the same column. */
+.row-menu-item > .ic { flex: none; width: 16px; height: 16px; color: var(--text-3); }
+.row-menu-item.danger > .ic { color: currentColor; }
+.row-menu-label { flex: 1; min-width: 0; }
+.row-menu-tick { display: inline-flex; flex: none; margin-left: 8px; color: var(--accent); }
+.row-menu-tick .ic { width: 16px; height: 16px; }
+
+/* The people an invite is being written to: one removable row each, above the
+   box that takes the next address. */
+.recipients { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.recipients .recipient {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px 4px 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.recipients .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* One person in the key check. The parts stack rather than share a line: a
+   fingerprint is 29 characters, and a row holding one of those beside an
+   address and a badge is unreadable before it is unwrappable. The indent
+   lines the detail up under the address rather than under the avatar. */
+.check-list .check-row { display: block; padding: 12px 0; }
+.check-row .check-head { display: flex; align-items: center; gap: 10px; }
+.check-row .check-head .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The space under the row is a margin, not padding: four of the five
+   platforms set `padding` on `.people li` whole, from a layer that wins, so
+   the macOS rule's 6px was all that stood between the input and the bottom
+   edge of the card. */
+.check-row .check-body { margin: 8px 0 6px 38px; }
+.check-row .check-body > .fp { display: inline-block; }
+.check-row .check-body > .hint { margin-top: 0; margin-bottom: 8px; }
+.check-row .field { margin: 10px 0 0; }
+.check-row .fp-compare { margin-top: 0; margin-bottom: 0; }
 #project-delete-name[aria-invalid="true"] { border-color: var(--border-strong); }
 
 /* A project's name and its count belong together, so the count sits beside
@@ -1044,11 +1165,15 @@ input.mono.mismatch { border-color: var(--danger); }
     background: var(--surface-2);
   }
   textarea { min-height: 112px; }
+  /* The rule above resets `padding` whole, which took back the room the
+     caret is drawn in -- so a project name ran underneath it and read as
+     one letter short. The caret is a border, not part of the control, so
+     the space has to be asked for again at this size. */
+  select { padding-right: 38px; }
   .checkbox input[type="checkbox"] { width: 20px; height: 20px; }
-  /* The sharing row carries an address, a status, a toggle and a button; on
-     a phone it wraps, with the address on its own line and the controls
-     below it in source order -- which leaves the destructive one last,
-     where it should be. */
+  /* The Projects panel's rows still wrap when a name and its buttons will
+     not share a line. A sharing row no longer needs to: it is two lines by
+     construction, and its one button is 36px. */
   .people li { flex-wrap: wrap; }
   .field { margin-bottom: 18px; }
   .field label, .field-label { font-size: var(--text-small); margin-bottom: 8px; }
@@ -1085,11 +1210,14 @@ input.mono.mismatch { border-color: var(--danger); }
   /* ----- list screen ----- */
   .sidebar { border-right: 0; background: var(--bg); }
   .sidebar-tools { padding: 6px 16px 10px; }
-  .search .ic { left: 14px; width: 20px; height: 20px; }
+  .search > .ic { left: 14px; width: 20px; height: 20px; }
   /* The fill is almost the colour of the sidebar behind it (1.04:1 in light),
      so the border stays: it is the only thing that marks the field out, and
      this is the one control on the screen with no label but a placeholder. */
   .search input { min-height: 46px; padding-left: 44px; background: var(--surface-3); }
+  .search-clear { right: 8px; width: 32px; height: 32px; }
+  .search-clear .ic { width: 18px; height: 18px; }
+  .search.has-text input { padding-right: 46px; }
   .sidebar-count { padding: 2px 20px 8px; }
   .list { padding: 0 16px calc(108px + var(--safe-bottom)); overscroll-behavior: contain; }
   .list-heading { padding: 14px 16px 8px; letter-spacing: 0.08em; }
@@ -1189,6 +1317,35 @@ input.mono.mismatch { border-color: var(--danger); }
   .fp-compare { grid-template-columns: 1fr; }
   .fp-box { padding: 14px; border-radius: var(--radius); }
   .people li { gap: 12px; padding: 14px 0; }
+  /* The row's gap grows to 12px on a phone and the avatar in these rows
+     stays 28px (`.avatar.sm` outranks the phone block's `.avatar`), so what
+     lines up under the address is 40px, not the 44 + 12 the bigger avatar
+     elsewhere would suggest. */
+  /* The status goes under the address: an address, a status and a button
+     do not share 360dp, and the address is the one that must not be cut
+     short. `order` puts it after the button so the button keeps the first
+     line, and the full-width basis is what breaks the line. */
+  .people .person { flex-wrap: wrap; row-gap: 2px; }
+  .people .person .people-status { order: 1; flex: 0 0 100%; margin-left: 40px; }
+  /* The same two-line shape the sharing rows take, for the same reason: an
+     address, a badge and a close button will not share 360dp, and an address
+     is the one thing here that must not be cut short -- it is what tells you
+     whose key you are about to approve. So the address keeps the first line
+     with the close button, and the badge drops under it. */
+  .check-row .check-head { flex-wrap: wrap; row-gap: 6px; }
+  /* The break is an empty flex item of full width rather than a wide badge:
+     a badge told to fill the line fills its background with it too, and the
+     pink of "Changed" ran the width of the sheet. This leaves the badge at
+     the width of its own words, on a line of its own. */
+  .check-row .check-head::after { content: ""; flex: 0 0 100%; height: 0; }
+  /* Flush left, not indented under the address: at this width the row needs
+     every pixel it can get for the field below, and a badge on its own line
+     reads as belonging to the row above it without being pushed in. */
+  .check-row .check-head .badge { order: 1; margin-left: 0; }
+  .check-row .check-body { margin-left: 0; }
+  /* The field and the button that checks it stay on one line, so the button
+     keeps its words but gives up the padding it would have on its own. */
+  .check-row .input-row > .btn { padding: 0 14px; }
   .people .who { font-size: var(--text-body); }
   .empty { padding: 56px 20px; }
   .empty-icon { width: 72px; height: 72px; border-radius: 22px; }
@@ -1444,6 +1601,30 @@ input.mono.mismatch { border-color: var(--danger); }
      delete button being out of line. */
   .label-row > label,
   .label-row > .field-label { display: inline; margin-bottom: 0; }
+  .label-row > .dialog-title { display: inline; margin-bottom: 0; }
+
+  /* The project picker sits in a column of plain values, so it is dressed as
+     one: no border, no fill, the same size and colour as the text in the
+     rows above it, and a caret to say it can be changed. A bordered, filled
+     control in that column announced itself as the one thing on the screen
+     worth pressing, which it is not -- it is the least urgent row of the
+     six, and it was drawing the eye away from the password.
+
+     The negative margin pulls the control's own padding back so its text
+     starts on the same line as every other value. The padding stays, because
+     it is what the hover and focus states are drawn around. */
+  .kv-row .select-wrap { margin-left: -8px; }
+  .kv-row .select-wrap select {
+    padding: 7px 26px 7px 8px;
+    border-color: transparent;
+    background: transparent;
+    font-size: var(--text-small);
+    color: var(--text);
+  }
+  .kv-row .select-wrap::after { right: 10px; }
+  @media (hover: hover) {
+    .kv-row .select-wrap select:hover { background: var(--surface-3); }
+  }
   .custom-field .cf-hide { margin-bottom: 0; }
 }
 /* ----- invariants ---------------------------------------------------------- */

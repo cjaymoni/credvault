@@ -155,7 +155,10 @@ then add the Android APK by hand — CI cannot build it.
 ## Before any commit
 
 `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`, and `node --test apps/desktop/ui-tests/`. A commit
+`cargo test --workspace`, `node --test apps/desktop/ui-tests/`, and
+`bash deploy/tests/cloudflare-origin.test.sh` (the firewall script's parsing
+decides whether the origin is open, and every review pass so far has found a
+string-handling bug in it). A commit
 hook also requires a code review pass before pushing.
 
 ## Names that must never be renamed
@@ -230,9 +233,24 @@ in the reference path:
 - **The records stay proxied.** An origin certificate is trusted only by
   Cloudflare, so a grey-clouded record serves something no browser accepts —
   the opposite of the Let's Encrypt path, which needs grey to issue.
-- **`cloudflare-origin.sh` is unnecessary there**, and now refuses to run
-  when it finds 80/443 rules it did not write. nginx restores the real client
-  address itself via `set_real_ip_from`, and the firewall is already narrowed.
+- **`cloudflare-origin.sh` is unnecessary there** *provided both of the
+  things that make it unnecessary are actually true*, and they are worth
+  checking rather than assuming — getting this wrong leaves the origin
+  believing a header anyone can write. nginx restores the real client
+  address via `deploy/nginx/cloudflare-realip.conf`, which goes in
+  `/etc/nginx/snippets/` and is `include`d from the klavyn server block:
+  `klavyn-proxy.conf` forwards `$remote_addr` as `X-Forwarded-For`, so
+  without that file it forwards the Cloudflare edge and every client behind
+  one edge shares a rate-limit budget. **Never `conf.d/`** — that is `http`
+  level, so it would rewrite `$remote_addr` for the other production site on
+  that box, and anything there keying `allow`/`deny`/`limit_req` on the
+  client address would start accepting an attacker-chosen one. `nginx -t`
+  passes either way, and `nginx -T | grep set_real_ip_from` prints the same
+  thing from both contexts, so nothing catches it afterwards. And the
+  firewall must be narrowed to Cloudflare's ranges — `ufw status` says, and
+  a `set_real_ip_from` list that trusts `0.0.0.0/0` trusts whoever reaches
+  the box directly. The script refuses to run when it finds a web-port ALLOW
+  rule it did not write, application profiles such as `Nginx Full` included.
 
 That host also serves another production site, so `nginx -t` before a reload
 is not a formality.

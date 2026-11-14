@@ -1,5 +1,30 @@
 {
 	email {$KLAVYN_ACME_EMAIL}
+
+	# Who may be believed when they say who the caller is, and which header
+	# says it. Together these make {client_ip} mean the caller behind
+	# Cloudflare, and fall back to the peer address for anything that did not
+	# come through Cloudflare -- a grey-clouded record, or a direct request
+	# during the window the README's ordering opens. Without the fallback,
+	# every such request forwards an empty address and collapses into one
+	# rate-limit bucket.
+	#
+	# A stale list degrades rather than exposes: an edge in a range not listed
+	# here is not believed, so requests through it are limited per edge
+	# instead of per caller. Refresh it with
+	#   scripts/refresh-cf-ranges.sh --caddy
+	# which validates what it fetched and prints this block ready to paste,
+	# alongside the weekly cloudflare-origin.sh run that fetches the same
+	# list for the firewall.
+	servers {
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 \
+			141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 \
+			197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 \
+			104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 \
+			2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 \
+			2a06:98c0::/29 2c0f:f248::/32
+		client_ip_headers CF-Connecting-IP
+	}
 }
 
 # The API. Nothing but /api and /health belongs here, so everything else is
@@ -30,13 +55,36 @@
 			# Replacing the header rather than adding to it: the server reads
 			# one entry and this is the only one worth reading.
 			#
-			# SAFE ONLY WHILE NOTHING BUT CLOUDFLARE CAN REACH THIS HOST.
-			# CF-Connecting-IP is an ordinary header to anyone connecting
-			# directly, so a reachable origin means a forgeable client
-			# address, and with it someone else's rate-limit budget. The
-			# firewall is what makes this true -- deploy/cloudflare-origin.sh,
-			# and "Putting Cloudflare in front" in README.md.
-			header_up X-Forwarded-For {http.request.header.Cf-Connecting-Ip}
+			# {client_ip} rather than the CF-Connecting-IP header directly.
+			# The header can be absent -- any request that did not come
+			# through Cloudflare -- and forwarding it blind then sets an
+			# empty X-Forwarded-For, which the server cannot parse, so it
+			# falls back to its peer: this container, identical for every
+			# such request. {client_ip} is resolved from the trusted_proxies
+			# and client_ip_headers settings at the top of this file, and
+			# falls back to the peer address instead of to nothing.
+			#
+			# THAT FALLBACK IS ONLY AS GOOD AS THE PEER. Caddy's peer is the
+			# real caller only while the publish path preserves it. Docker's
+			# userland proxy does not: where docker-proxy terminates the
+			# connection rather than iptables DNAT -- the usual path for a
+			# published IPv6 port on a daemon without ip6tables -- the peer
+			# is the bridge gateway, 172.x.0.1, for every request alike, and
+			# the single-bucket collapse above comes back by another road.
+			# Adding 172.16.0.0/12 to trusted_proxies would NOT fix it: that
+			# makes anyone who reaches the published port a trusted proxy,
+			# free to forge CF-Connecting-IP. Set "userland-proxy": false
+			# (and ip6tables) in the daemon config, and check what Caddy
+			# actually logs as the peer before relying on this.
+			#
+			# STILL SAFE ONLY WHILE NOTHING BUT CLOUDFLARE CAN REACH THIS
+			# HOST. trusted_proxies stops a direct caller being believed, but
+			# a reachable origin is still one more address per attacker, and
+			# the country in the installation count comes from CF-IPCountry
+			# on the same request. The firewall is what closes that --
+			# deploy/cloudflare-origin.sh, and "Putting Cloudflare in front"
+			# in README.md.
+			header_up X-Forwarded-For {client_ip}
 		}
 	}
 

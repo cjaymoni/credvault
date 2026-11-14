@@ -10,6 +10,17 @@ const $ = (id) => document.getElementById(id);
 // the Rust side refuses http for anything but loopback, and it refuses it
 // after the password has been entered. Checked by ui-tests/screens.test.js.
 const DEFAULT_SERVER = "https://vault.klavyn.com";
+
+/// Whether the sign-in screen lets the address be edited.
+///
+/// Off for now: every build signs in to DEFAULT_SERVER. The address is still
+/// shown -- it is where the credential is about to be sent, and that is worth
+/// seeing before it is sent -- but the field is inert and the phone line has
+/// no "Change".
+///
+/// Turning this back on is the whole switch: the markup, the styles and the
+/// Rust command all still take an address, so nothing else has to move.
+const ALLOW_CUSTOM_SERVER = false;
 const REVEAL_HIDE_AFTER_MS = 30_000;
 const TOAST_MS = 2200;
 const MASKED = "••••••••••••";
@@ -19,6 +30,38 @@ const UI = { minPasswordLength: 12, maxMessageLength: 1000, generatedPasswordLen
 // The server would also refuse a blank token, but its answer is written for
 // an API caller ("a registration token is required") and arrives only after a
 // round-trip that was never going to succeed.
+/// Descriptions that explain a screen rather than warn about what a button is
+/// about to do. Each one is reachable from the "i" beside its heading.
+///
+/// The line between these and the text that stays on screen is what the
+/// button does next: a consequence of pressing it is not an explanation and
+/// is never folded away. That is why the warning about revoking with
+/// unconfirmed keys, the passphrase's "there is no reset", and the line
+/// saying a linked Google account can sign in without the passphrase are all
+/// still printed in full.
+const SHARING_NOTE =
+  "People you invite get read-only access to this one secret. Revoking re-encrypts it with a new key.";
+const PROJECTS_NOTE =
+  "Headings your secrets are grouped under. Deleting one never deletes the secrets in it \u2014 they simply stop being grouped.";
+const GOOGLE_LINK_NOTE =
+  "Sign in to this server with your Google account next time. Your passphrase is still what unlocks the vault \u2014 Google only proves who you are.";
+const SIGN_OUT_OTHERS_NOTE =
+  "This is the thing to do first if you think someone else is signed in as you. Nothing they can do stops it \u2014 and because you stay signed in here, you can go straight on to remove a Google sign-in they added, before they have time to come back.";
+
+/// Said once, in the one place it applies, and reachable rather than always
+/// on screen. It is a disclosure, not a tip: a project name does not get the
+/// encryption the rest of a secret gets, and someone choosing a project is
+/// entitled to know that before they type a client's name into it. Kept as a
+/// constant so the button's tooltip and the text it reveals cannot drift
+/// apart. See docs/privacy.md, which is where the standing version lives.
+const PROJECT_NAME_DISCLOSURE =
+  "The project name is stored unencrypted, like the secret's name, and is not shared with anyone you share this secret with unless you say so.";
+
+/// What "Hide" does, which is not guessable from the word: it also clears the
+/// value from the clipboard the way the password does.
+const EXTRA_FIELDS_DISCLOSURE =
+  "A PIN, a recovery code, an account number. Hide masks a value and clears it from the clipboard, like the password.";
+
 const TOKEN_REQUIRED_HINT = "This server only creates accounts for people who have its token. Whoever invited you can give you one.";
 const TOKEN_OPTIONAL_HINT = "Only needed if the server was set up to ask for one.";
 const TOKEN_MISSING_ERROR = "Paste the registration token for this server. Ask whoever invited you for it.";
@@ -198,6 +241,42 @@ function remember(key, value) {
 }
 function recall(key) {
   try { return localStorage.getItem(key) || ""; } catch (_) { return ""; }
+}
+
+/// A small "i" that reveals `text` under the field it belongs to.
+///
+/// The text is both the tooltip and the revealed paragraph, so a pointer gets
+/// it on hover and a finger gets it on tap. `controls` is the id of the
+/// paragraph, which starts hidden.
+function infoButtonHtml(controls, text) {
+  return `<button type="button" class="info-btn" data-info-for="${controls}"
+    aria-controls="${controls}" aria-expanded="false"
+    aria-label="What this means" title="${esc(text)}">${icon("info")}</button>`;
+}
+
+/// Focus something in the editor, opening "More details" first if it is
+/// folded away.
+///
+/// focus() on a hidden element does nothing, so an error that points at a
+/// folded field leaves the message on screen with no field to act on -- the
+/// same failure the fold is opened for when editing a secret that already
+/// has those fields filled in.
+function focusInForm(element) {
+  if (!element) return;
+  const fold = element.closest?.("#more-details");
+  if (fold?.classList.contains("hidden")) toggleDisclosure($("btn-more-details"), fold);
+  element.focus();
+}
+
+/// Show or hide `panel`, keeping `button`'s aria-expanded honest.
+///
+/// Returns whether the panel ended up open, which is what callers that move
+/// focus into it need.
+function toggleDisclosure(button, panel) {
+  const opening = panel.classList.contains("hidden");
+  panel.classList.toggle("hidden", !opening);
+  button.setAttribute("aria-expanded", String(opening));
+  return opening;
 }
 
 /// Disable a button while its action runs; `label` swaps the visible text.
@@ -472,8 +551,78 @@ function setAuthMode(mode) {
 /// default that cannot be corrected is how someone's vault ends up on a
 /// stranger's server.
 function showServerField() {
+  if (!ALLOW_CUSTOM_SERVER) return;
   $("auth").classList.add("server-open");
   $("server").focus();
+}
+
+/// Put the real window insets into the four --safe-* properties.
+///
+/// Only Android needs this: its WebView reports env(safe-area-inset-*) as 0
+/// even with the window edge-to-edge, so styles.css reads the properties and
+/// MainActivity.kt measures them. It pushes them too, but the page is loaded
+/// after it does that and the push lands on a document that is thrown away --
+/// so the page asks here, where there is one to style. Everywhere else the
+/// bridge is absent and the properties keep their env() fallbacks.
+const SAFE_AREA_SIDES = ["top", "right", "bottom", "left"];
+function applySafeAreaInsets() {
+  const bridge = window.__klavynInsets;
+  if (!bridge || typeof bridge.cssPixels !== "function") return;
+  let pixels;
+  try {
+    pixels = String(bridge.cssPixels()).split(",");
+  } catch (_) {
+    return; // a bridge that cannot answer leaves the fallbacks in place
+  }
+  if (pixels.length !== SAFE_AREA_SIDES.length) return;
+  SAFE_AREA_SIDES.forEach((side, i) => {
+    const value = Number(pixels[i]);
+    // A negative or unreadable inset would push content off the screen
+    // instead of away from an edge.
+    if (!Number.isFinite(value) || value < 0) return;
+    document.documentElement.style.setProperty(`--safe-${side}`, `${value}px`);
+  });
+}
+
+/// The address this app signs in to. Never reads the field while
+/// ALLOW_CUSTOM_SERVER is off; see Screens.serverUrlFor().
+function currentServerUrl() {
+  return Screens.serverUrlFor(ALLOW_CUSTOM_SERVER, $("server").value, DEFAULT_SERVER);
+}
+
+/// Say what happened to an install whose account is on another server.
+///
+/// The address is forced for every install, this one included, so there is
+/// nothing to offer here but an explanation. It is worth printing anyway:
+/// `auth_hash` ties the credential to the address it was made under, so this
+/// account cannot be opened here at all, and the server answers that with a
+/// rejection the sign-in screen can only report as a wrong passphrase.
+/// Saying so beforehand is the difference between "my vault is on my own
+/// server" and "I have forgotten my passphrase".
+///
+/// See Screens.strandedAddress() for which installs this is shown to.
+function noteStrandedServer(address) {
+  const notice = $("server-stranded");
+  notice.innerHTML = `${icon("alert")}<div>This app signs in to <strong>${esc(DEFAULT_SERVER)}</strong>.
+    You last used <strong>${esc(address)}</strong>, and an account made there can only be opened there \u2014
+    its password is tied to that address, so signing in here will be refused.</div>`;
+  notice.classList.remove("hidden");
+}
+
+/// Take the address out of the person's hands without taking it out of sight.
+///
+/// The desktop layout shows the field and the phone layout shows the summary
+/// line, so both are dealt with: the input goes read-only, and the line loses
+/// its "Change" and stops being a button.
+function lockServerAddress() {
+  $("auth").classList.add("server-locked");
+  const field = $("server");
+  field.readOnly = true;
+  field.setAttribute("aria-readonly", "true");
+  field.tabIndex = -1;
+  const change = $("btn-server-change");
+  change.disabled = true;
+  change.tabIndex = -1;
 }
 
 function syncServerSummary() {
@@ -514,7 +663,7 @@ async function authenticate(event) {
   event.preventDefault();
   setError("auth-error", "");
   const isRegister = state.authMode === "register";
-  const serverUrl = $("server").value.trim() || DEFAULT_SERVER;
+  const serverUrl = currentServerUrl();
   const email = $("email").value.trim();
   const password = $("password").value;
   if (!email) { setError("auth-error", "Enter your email."); $("email").focus(); return; }
@@ -535,7 +684,7 @@ async function authenticate(event) {
   setBusy($("btn-auth"), true, isRegister ? "Creating account…" : "Unlocking…");
   try {
     const user = await invoke(isRegister ? "register" : "login", args);
-    remember("server", serverUrl);
+    if (ALLOW_CUSTOM_SERVER) remember("server", serverUrl);
     remember("email", email);
     $("password").value = "";
     $("registration-token").value = "";
@@ -563,7 +712,7 @@ async function authenticate(event) {
 /// tells the user something they must act on: nothing on this screen will work
 /// until the app or the server is updated.
 async function refreshCapabilities() {
-  const serverUrl = $("server").value.trim() || DEFAULT_SERVER;
+  const serverUrl = currentServerUrl();
   const wasIncompatible = state.incompatible;
   try {
     state.capabilities = await invoke("server_capabilities", { serverUrl });
@@ -619,11 +768,11 @@ function showGoogleForm(show) {
 
 async function startGoogleSignIn() {
   setError("auth-error", "");
-  const serverUrl = $("server").value.trim() || DEFAULT_SERVER;
+  const serverUrl = currentServerUrl();
   setBusy($("btn-google"), true, "Waiting for your browser…");
   try {
     const stage = await invoke("google_sign_in", { serverUrl });
-    remember("server", serverUrl);
+    if (ALLOW_CUSTOM_SERVER) remember("server", serverUrl);
     state.google = stage;
     const creating = stage.stage === "create_account";
     $("auth-title").textContent = creating ? "Create your vault" : "Unlock your vault";
@@ -730,7 +879,8 @@ function renderGoogleLinkForm({ afterEviction = false } = {}) {
   showDetailScreen();
   $("detail").innerHTML = `
     <form class="card" id="google-link-form" novalidate aria-labelledby="google-link-title">
-      <h2 id="google-link-title" class="card-title pane-title">${icon("lock")} ${esc(state.editTitle)}</h2>
+      <h2 id="google-link-title" class="card-title pane-title">${icon("lock")} ${esc(state.editTitle)}${linked ? "" : infoButtonHtml("google-link-note", GOOGLE_LINK_NOTE)}</h2>
+      ${linked ? "" : `<p class="hint hidden" id="google-link-note">${esc(GOOGLE_LINK_NOTE)}</p>`}
       ${afterEviction
         ? `<p class="card-lead">
              Your other devices are signed out. If someone else added this sign-in, removing it
@@ -738,13 +888,10 @@ function renderGoogleLinkForm({ afterEviction = false } = {}) {
              get back.
            </p>`
         : ""}
-      <p class="card-lead">
-        ${linked
-          ? `<strong>${esc(linked)}</strong> can sign in to this account without your passphrase.
-             Remove it if you did not add it, or if you no longer want to sign in that way.`
-          : `Sign in to this server with your Google account next time.
-             Your passphrase is still what unlocks the vault &mdash; Google only proves who you are.`}
-      </p>
+      ${linked
+        ? `<p class="card-lead"><strong>${esc(linked)}</strong> can sign in to this account without your
+           passphrase. Remove it if you did not add it, or if you no longer want to sign in that way.</p>`
+        : ""}
       <div class="field">
         <label for="gl-current">Your passphrase</label>
         <input id="gl-current" type="password" autocomplete="current-password" spellcheck="false">
@@ -789,17 +936,12 @@ function renderSignOutOthersForm() {
   showDetailScreen();
   $("detail").innerHTML = `
     <form class="card" id="sign-out-others-form" novalidate aria-labelledby="sign-out-others-title">
-      <h2 id="sign-out-others-title" class="card-title pane-title">${icon("alert")} ${esc(state.editTitle)}</h2>
+      <h2 id="sign-out-others-title" class="card-title pane-title">${icon("alert")} ${esc(state.editTitle)}${infoButtonHtml("sign-out-others-note", SIGN_OUT_OTHERS_NOTE)}</h2>
       <p class="card-lead">
         Every other device signed in to this account is signed out. This one stays
         signed in. Your secrets are untouched and your passphrase does not change.
       </p>
-      <p class="card-lead">
-        This is the thing to do first if you think someone else is signed in as you.
-        Nothing they can do stops it &mdash; and because you stay signed in here, you
-        can go straight on to remove a Google sign-in they added, before they have
-        time to come back.
-      </p>
+      <p class="hint hidden" id="sign-out-others-note">${esc(SIGN_OUT_OTHERS_NOTE)}</p>
       <div class="error" id="soa-error" role="alert"></div>
       <div class="actions">
         <button type="submit" class="btn danger solid" id="btn-soa-save">
@@ -1573,8 +1715,8 @@ async function loadSharing(id) {
     box.innerHTML = `
       <div class="share-head">
         <div class="share-head-text">
-          <h3 id="sharing-title" class="card-title">${icon("users")} Sharing</h3>
-          <p class="card-lead">People you invite get read-only access to this one secret. Revoking re-encrypts it with a new key.</p>
+          <h3 id="sharing-title" class="card-title">${icon("users")} Sharing${infoButtonHtml("sharing-note", SHARING_NOTE)}</h3>
+          <p class="hint hidden" id="sharing-note">${esc(SHARING_NOTE)}</p>
         </div>
         <button type="button" class="btn primary share-invite" id="btn-open-invite">${icon("plus")} <span>Invite Someone<span class="ell">…</span></span></button>
       </div>
@@ -1892,8 +2034,8 @@ function drawProjectsPanel({ focus = null } = {}) {
 
   $("detail").innerHTML = `
     <section class="card" aria-labelledby="projects-title">
-      <h2 id="projects-title" class="card-title pane-title">${icon("folder")} Projects</h2>
-      <p class="card-lead">Headings your secrets are grouped under. Deleting one never deletes the secrets in it \u2014 they simply stop being grouped.</p>
+      <h2 id="projects-title" class="card-title pane-title">${icon("folder")} Projects${infoButtonHtml("projects-note", PROJECTS_NOTE)}</h2>
+      <p class="hint hidden" id="projects-note">${esc(PROJECTS_NOTE)}</p>
       <div class="error" id="projects-error" role="alert"></div>
       <ul class="people" id="project-list">${rows.length ? rows.join("") : empty}</ul>
       <div class="actions">
@@ -2336,23 +2478,18 @@ function renderForm(existing) {
   // uses the detail pane, which on a phone is its own screen.
   const inDialog = PLATFORM === "windows";
   const host = inDialog ? $("form-dialog") : $("detail");
+  // Closed when creating, open when there is already something in it; see
+  // Screens.hasMoreDetails().
+  const moreOpen = Screens.hasMoreDetails(existing);
+  // ⌘↩ on a Mac, Ctrl+↩ elsewhere. Named on the button rather than printed
+  // under it: a caption is read once and then stops being seen.
+  const saveShortcut = Screens.shortcutLabel(PLATFORM, "Enter").replace(/ENTER$/i, "\u21a9");
   host.innerHTML = `
     <form class="card form" id="secret-form" novalidate aria-labelledby="form-title">
       <h2 id="form-title" class="card-title pane-title">${existing ? icon("edit") : icon("plus")} ${esc(state.editTitle)}</h2>
-      <p class="card-lead">${existing ? "Changes are re-encrypted on this device before they are saved." : "Everything except the name is encrypted on this device before it is saved."}</p>
       <div class="field">
         <label for="f-name">Name</label>
         <input id="f-name" value="${esc(s.name)}" placeholder="e.g. Netflix" autocomplete="off">
-      </div>
-      <div class="field">
-        <label for="f-project">Project <span class="label-note">(optional)</span></label>
-        ${projectSelectHtml(s.project ?? null)}
-        <div class="field hidden" id="new-project-field">
-          <label for="f-new-project">New project name</label>
-          <input id="f-new-project" placeholder="e.g. Perspectiv" autocomplete="off"
-            maxlength="${UI.maxProjectNameLength}">
-        </div>
-        <p class="hint">A heading to group this with others. The name is stored unencrypted, like the secret's own name, and is not shared with anyone you share this secret with unless you say so.</p>
       </div>
       <div class="field">
         <label for="f-username">Username</label>
@@ -2365,26 +2502,48 @@ function renderForm(existing) {
           <button type="button" class="icon-btn bordered" id="btn-toggle-pw" aria-label="Show password" aria-pressed="false" title="Show password">${icon("eye")}</button>
           <button type="button" class="btn" id="btn-generate" title="Generate a strong ${UI.generatedPasswordLength}-character password">${icon("wand")} Generate</button>
         </div>
-        <p class="hint">${existing ? "Leave blank to keep the current password." : `Generate makes a random ${UI.generatedPasswordLength}-character password with symbols.`}</p>
+        ${existing ? `<p class="hint">Leave blank to keep the current password.</p>` : ""}
       </div>
-      <div class="field">
-        <label for="f-url">URL <span class="label-note">(optional)</span></label>
-        <input id="f-url" value="${esc(s.url)}" placeholder="https://" autocomplete="off" spellcheck="false" inputmode="url">
-      </div>
-      <div class="field">
-        <label for="f-notes">Notes <span class="label-note">(optional)</span></label>
-        <textarea id="f-notes">${esc(s.notes)}</textarea>
-      </div>
-      <div class="field">
-        <span class="field-label">Extra details <span class="label-note">(optional)</span></span>
-        <p class="hint">Anything else worth keeping here: a PIN, a recovery code, an account number. Tick <strong>Hide</strong> to mask a value and have it cleared from the clipboard, the same as the password.</p>
-        <div id="custom-fields"></div>
-        <button type="button" class="btn" id="btn-add-field">${icon("plus")} Add field</button>
+      <button type="button" class="link-btn" id="btn-more-details"
+        aria-expanded="${moreOpen}" aria-controls="more-details">More details</button>
+      <div class="more-details${moreOpen ? "" : " hidden"}" id="more-details">
+        <div class="field">
+          <div class="label-row">
+            <label for="f-project">Project <span class="label-note">(optional)</span></label>
+            ${infoButtonHtml("project-note", PROJECT_NAME_DISCLOSURE)}
+          </div>
+          ${projectSelectHtml(s.project ?? null)}
+          <div class="field hidden" id="new-project-field">
+            <label for="f-new-project">New project name</label>
+            <input id="f-new-project" placeholder="e.g. Perspectiv" autocomplete="off"
+              maxlength="${UI.maxProjectNameLength}">
+          </div>
+          <p class="hint hidden" id="project-note">${esc(PROJECT_NAME_DISCLOSURE)}</p>
+        </div>
+        <div class="field">
+          <label for="f-url">URL <span class="label-note">(optional)</span></label>
+          <input id="f-url" value="${esc(s.url)}" placeholder="https://" autocomplete="off" spellcheck="false" inputmode="url">
+        </div>
+        <div class="field">
+          <label for="f-notes">Notes <span class="label-note">(optional)</span></label>
+          <textarea id="f-notes">${esc(s.notes)}</textarea>
+        </div>
+        <div class="field">
+          <div class="label-row">
+            <span class="field-label">Extra details <span class="label-note">(optional)</span></span>
+            ${infoButtonHtml("extra-note", EXTRA_FIELDS_DISCLOSURE)}
+          </div>
+          <p class="hint hidden" id="extra-note">${esc(EXTRA_FIELDS_DISCLOSURE)}</p>
+          <div id="custom-fields"></div>
+          <button type="button" class="btn" id="btn-add-field">${icon("plus")} Add field</button>
+        </div>
       </div>
       <div class="error" id="form-error" role="alert"></div>
       <div class="actions form-actions">
-        <button type="submit" class="btn primary" id="btn-save">${existing ? "Save changes" : "Create secret"}</button>
-        <button type="button" class="btn" id="btn-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="btn-save"
+          aria-keyshortcuts="${Screens.shortcutKeys(PLATFORM, "Enter")}"
+          title="${saveShortcut} to save">${existing ? "Save changes" : "Create secret"}</button>
+        <button type="button" class="btn" id="btn-cancel" aria-keyshortcuts="Escape" title="Esc to cancel">Cancel</button>
         <span class="muted small">Esc to cancel</span>
       </div>
     </form>`;
@@ -2407,6 +2566,7 @@ function renderForm(existing) {
   };
   $("btn-cancel").onclick = cancel;
   $("btn-add-field").onclick = addFormField;
+  $("btn-more-details").onclick = () => toggleDisclosure($("btn-more-details"), $("more-details"));
   const projectSelect = $("f-project");
   projectSelect.onchange = () => {
     const naming = projectSelect.value === NEW_PROJECT;
@@ -2414,7 +2574,18 @@ function renderForm(existing) {
     if (naming) $("f-new-project").focus();
   };
   renderFormFields();
-  form.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); cancel(); } });
+  form.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.preventDefault(); cancel(); return; }
+    // Enter alone is a newline inside Notes, so saving from there needs the
+    // modifier; requestSubmit() runs the same path as the button.
+    if (Screens.isSaveShortcut(event)) {
+      event.preventDefault();
+      // requestSubmit() is Safari 16 / WebKitGTK 2.38, above the floor this
+      // app holds itself to; clicking the button runs the same onsubmit.
+      if (typeof form.requestSubmit === "function") form.requestSubmit();
+      else $("btn-save").click();
+    }
+  });
   form.onsubmit = async (event) => {
     event.preventDefault();
     setError("form-error", "");
@@ -2439,7 +2610,7 @@ function renderForm(existing) {
           "To get rid of the field instead, use its Remove button.",
       );
       const rows = $("custom-fields").querySelectorAll(".custom-field");
-      rows[needValues[0].index]?.querySelector(".cf-value")?.focus();
+      focusInForm(rows[needValues[0].index]?.querySelector(".cf-value"));
       return;
     }
 
@@ -2449,7 +2620,7 @@ function renderForm(existing) {
     const unlabelled = state.formFields.findIndex((field) => field.label.trim() === "" && (field.kept || field.value));
     if (unlabelled !== -1) {
       setError("form-error", "Give every extra field a label, or remove it.");
-      $("custom-fields").querySelectorAll(".custom-field")[unlabelled]?.querySelector(".cf-label")?.focus();
+      focusInForm($("custom-fields").querySelectorAll(".custom-field")[unlabelled]?.querySelector(".cf-label"));
       return;
     }
     if (!existing && !entry.password) { setError("form-error", "Enter a password or generate one."); $("f-password").focus(); return; }
@@ -2476,7 +2647,7 @@ function renderForm(existing) {
     } catch (error) {
       setError("form-error", error);
       // A field the error names gets the focus, the way the checks above do.
-      if (error?.field) $(error.field)?.focus();
+      if (error?.field) focusInForm($(error.field));
       setBusy($("btn-save"), false);
     }
   };
@@ -2548,10 +2719,26 @@ document.addEventListener("keydown", (event) => {
 for (const button of document.querySelectorAll("[data-theme-choice]")) {
   button.onclick = () => chooseTheme(button.dataset.themeChoice);
 }
+// Every "i" in the app, wired once. The panels are drawn by half a dozen
+// render functions and redrawn whenever their data changes, so binding at the
+// button would mean remembering to rebind in each of them.
+document.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-info-for]");
+  if (!button) return;
+  const note = $(button.dataset.infoFor);
+  if (note) toggleDisclosure(button, note);
+});
+
+applySafeAreaInsets();
 applyTheme(recall(THEME_KEY) || "system");
 
-$("server").value = recall("server") || DEFAULT_SERVER;
+$("server").value = (ALLOW_CUSTOM_SERVER && recall("server")) || DEFAULT_SERVER;
 $("server").placeholder = DEFAULT_SERVER;
+// An install that was signed in somewhere else keeps the field; everyone
+// else gets the pinned address. See unlockServerFor().
+const strandedServer = ALLOW_CUSTOM_SERVER ? null : Screens.strandedAddress(recall("server"), DEFAULT_SERVER);
+if (!ALLOW_CUSTOM_SERVER) lockServerAddress();
+if (strandedServer) noteStrandedServer(strandedServer);
 syncServerSummary();
 $("email").value = recall("email");
 setAuthMode("login");

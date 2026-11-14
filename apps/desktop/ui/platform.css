@@ -22,6 +22,8 @@
    contrast the eye never needed and leaves every pairing above the floors in
    the paragraph above. */
 
+@layer platform {
+
 /* ===== shared shell ========================================================= */
 
 .slot { display: contents; }
@@ -243,6 +245,14 @@
   [data-platform="macos"] #btn-account .acct-key { display: inline-block; color: var(--text-2); }
   [data-platform="macos"] #btn-account .acct-text { display: flex; }
   [data-platform="macos"] .account-tools { left: 10px; bottom: 76px; }
+
+    /* A Mac puts the default button at the trailing edge with Cancel to its
+     left, and does not print its keyboard shortcuts under the form -- the
+     buttons carry them in their tooltips and in aria-keyshortcuts instead.
+     The source order is primary-first, which is what Windows and the phone
+     want, so this reverses the row rather than reordering the markup. */
+  [data-platform="macos"] .form-actions { flex-direction: row-reverse; justify-content: flex-start; }
+  [data-platform="macos"] .form-actions .muted { display: none; }
 
   [data-platform="macos"] .topbar { min-height: 52px; padding: 0 14px 0 20px; gap: 10px; background: var(--content-bg); border-bottom: 1px solid var(--border); }
   [data-platform="macos"] .toolbar-app-title { display: block; font-size: 0.9375rem; font-weight: 700; }
@@ -580,7 +590,7 @@
 
 /* List: account at the top right, a large title, the search field, then
    inset grouped sections, and a toolbar at the bottom. */
-[data-platform="ios"] .pane-head { display: flex; justify-content: flex-end; align-items: center; min-height: 44px; padding: env(safe-area-inset-top) 8px 0 16px; }
+[data-platform="ios"] .pane-head { display: flex; justify-content: flex-end; align-items: center; min-height: 44px; padding: var(--safe-top) 8px 0 16px; }
 [data-platform="ios"] .pane-head-title { display: none; }
 [data-platform="ios"] #btn-account { width: 44px; height: 44px; color: var(--tint); }
 [data-platform="ios"] #btn-account .acct-person { display: inline-block; width: 26px; height: 26px; }
@@ -598,7 +608,7 @@
 [data-platform="ios"] .list-heading { padding: 0 16px 6px; font-size: 0.8125rem; font-weight: 400; letter-spacing: 0.05em; color: var(--text-2); }
 [data-platform="ios"] .bottombar {
   display: flex; align-items: center; position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
-  min-height: 49px; padding: 0 8px env(safe-area-inset-bottom) 16px;
+  min-height: 49px; padding: 0 8px var(--safe-bottom) 16px;
   background: color-mix(in srgb, var(--bg) 94%, transparent); border-top: 0.5px solid var(--border);
 }
 [data-platform="ios"] .bottombar-spacer { width: 44px; }
@@ -609,10 +619,10 @@
 [data-platform="ios"] #btn-new .new-compose { display: inline-block; }
 [data-platform="ios"] .bottombar #btn-new .ic { width: 24px; height: 24px; }
 [data-platform="ios"] .app[data-screen="detail"] .bottombar { display: none; }
-[data-platform="ios"] .list { padding-bottom: calc(80px + env(safe-area-inset-bottom)); }
+[data-platform="ios"] .list { padding-bottom: calc(80px + var(--safe-bottom)); }
 /* Detail: "‹ Vault" and Edit in the nav bar, inset grouped values, and
    Delete as its own row at the foot. */
-[data-platform="ios"] .topbar { min-height: calc(44px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 8px 0; background: var(--content-bg); border: 0; }
+[data-platform="ios"] .topbar { min-height: calc(44px + var(--safe-top)); padding: var(--safe-top) 8px 0; background: var(--content-bg); border: 0; }
 [data-platform="ios"] #btn-back { display: inline-flex; width: auto; height: 44px; gap: 2px; padding: 0 8px 0 0; color: var(--tint); font-size: 1.0625rem; }
 [data-platform="ios"] #btn-back .ic { width: 24px; height: 24px; }
 [data-platform="ios"] .toolbar-title { align-items: center; }
@@ -642,7 +652,7 @@
 [data-platform="ios"] .people li { min-height: 44px; padding: 8px 16px; }
 [data-platform="ios"] .delete-bottom { display: block; width: 100%; height: 44px; margin-top: 24px; border: 0; border-radius: 10px; background: var(--surface); color: var(--danger); font-weight: 400; }
 [data-platform="ios"] .delete-bottom .ell { display: none; }
-[data-platform="ios"] .toast { top: calc(56px + env(safe-area-inset-top)); bottom: auto; border-radius: 999px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); }
+[data-platform="ios"] .toast { top: calc(56px + var(--safe-top)); bottom: auto; border-radius: 999px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); }
 [data-platform="ios"] .btn.primary, [data-platform="ios"] .btn.block { border: 0; border-radius: 12px; }
 [data-platform="ios"] .auth { background: var(--bg); }
 [data-platform="ios"] .auth .brand-name { display: none; }
@@ -699,7 +709,7 @@
    it: the pill takes the room that is left and the button keeps its own. Both
    are sized from --search-row-h so the circle and the field stay the same
    height -- they sit side by side, and any difference reads as a mistake. */
-[data-platform="android"] .sidebar-search { --search-row-h: 56px; display: flex; align-items: center; gap: 8px; padding: calc(8px + env(safe-area-inset-top)) 16px 8px; }
+[data-platform="android"] .sidebar-search { --search-row-h: 56px; display: flex; align-items: center; gap: 8px; padding: calc(8px + var(--safe-top)) 16px 8px; }
 [data-platform="android"] .sidebar-search .search { display: flex; align-items: center; height: var(--search-row-h); padding: 0 16px; border: 1px solid var(--border-input); border-radius: 28px; background: var(--surface-3); }
 [data-platform="android"] .sidebar-search .search .ic { position: static; transform: none; width: 24px; height: 24px; color: var(--text-2); }
 [data-platform="android"] .sidebar-search .search input { flex: 1; min-height: 48px; margin-left: 16px; padding: 0; border: 0; background: transparent; font-size: 1rem; }
@@ -717,21 +727,21 @@
 [data-platform="android"] .ib-view { display: inline-flex; font-weight: 500; }
 [data-platform="android"] .list-heading { padding: 16px 16px 8px; font-size: 0.875rem; font-weight: 500; letter-spacing: 0.007em; text-transform: none; color: var(--tint); }
 [data-platform="android"] .list-group { margin: 0; border-radius: 0; background: transparent; box-shadow: none; overflow: visible; }
-[data-platform="android"] .list { padding: 0 0 calc(104px + env(safe-area-inset-bottom)); }
+[data-platform="android"] .list { padding: 0 0 calc(104px + var(--safe-bottom)); }
 [data-platform="android"] .item { min-height: 72px; gap: 16px; padding: 8px 24px 8px 16px; border-radius: 0; }
 [data-platform="android"] .item + .item::before { display: none; }
 [data-platform="android"] .item .avatar { width: 40px; height: 40px; border-radius: 50%; font-size: 1rem; font-weight: 500; }
 [data-platform="android"] .item .chev { display: none; }
 [data-platform="android"] .item-name { font-weight: 400; }
 [data-platform="android"] #btn-new {
-  position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 5;
+  position: fixed; right: 16px; bottom: calc(16px + var(--safe-bottom)); z-index: 5;
   height: 56px; padding: 0 20px 0 16px; gap: 12px; border: 0; border-radius: 16px;
   background: var(--primary-container); color: var(--on-primary-container); font-size: 0.875rem; font-weight: 500;
   box-shadow: 0 3px 6px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.12);
 }
 [data-platform="android"] #btn-new .btn-text { display: inline; }
 /* Detail: a top app bar with back, the title, Edit and Delete. */
-[data-platform="android"] .topbar { min-height: calc(64px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 4px 0; gap: 4px; background: var(--content-bg); border: 0; }
+[data-platform="android"] .topbar { min-height: calc(64px + var(--safe-top)); padding: var(--safe-top) 4px 0; gap: 4px; background: var(--content-bg); border: 0; }
 [data-platform="android"] #btn-back { display: inline-flex; width: 48px; height: 48px; border-radius: 50%; color: var(--text); }
 [data-platform="android"] .back-chevron, [data-platform="android"] .back-label { display: none; }
 [data-platform="android"] .back-arrow { display: inline; }
@@ -777,7 +787,7 @@
 [data-platform="android"] .people li { min-height: 56px; border-top: 0; }
 [data-platform="android"] .btn { border-radius: 20px; font-weight: 500; }
 [data-platform="android"] .btn.primary, [data-platform="android"] .btn.block { border: 0; border-radius: 24px; }
-[data-platform="android"] .toast { left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); transform: none; max-width: none; border-radius: 4px; }
+[data-platform="android"] .toast { left: 16px; right: 16px; bottom: calc(16px + var(--safe-bottom)); transform: none; max-width: none; border-radius: 4px; }
 [data-platform="android"] .toast.show { transform: none; }
 [data-platform="android"] .toast .ic { display: none; }
 [data-platform="android"] .toast-text { flex: 1; }
@@ -792,7 +802,7 @@
   .app[data-screen="list"] .content { display: none; }
   .sidebar { border-right: 0; }
   .main { padding: 8px 16px 0; }
-  [data-platform="ios"] .dialog, [data-platform="android"] .dialog { width: 100%; max-width: none; margin: auto 0 0; border-radius: 16px 16px 0 0; padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
+  [data-platform="ios"] .dialog, [data-platform="android"] .dialog { width: 100%; max-width: none; margin: auto 0 0; border-radius: 16px 16px 0 0; padding-bottom: calc(24px + var(--safe-bottom)); }
 }
 
 /* iPad and Android tablets keep the split view with the phone styling. */
@@ -825,4 +835,6 @@
   /* A phone sheet stacks its buttons full width, primary first. */
   .dialog-actions { flex-direction: column; }
   .dialog-actions .btn { width: 100%; }
+}
+
 }

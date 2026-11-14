@@ -37,3 +37,8 @@ dist/
 **/*.jks
 **/*.p12
 **/*.pem
+
+# Not a secret, but gitignored, so the test above requires it here too: the
+# .pyc files apps/desktop/scripts leaves behind have been committed by
+# accident once already.
+**/__pycache__/

@@ -264,6 +264,24 @@ anything in `crates/server/src/analytics.rs`, re-read the claims in that file,
 `docs/privacy.md`, `README.md`, `deploy/README.md` and `deploy/.env.example`
 together, and make the code true rather than the sentence vaguer.
 
+## Styling
+
+The UI is two hand-written stylesheets with no build step, ordered by cascade
+layer rather than by specificity: `@layer tokens, base, components, context,
+platform, invariants`. A later layer wins whatever the selectors say, so a
+rule never needs a padded selector to beat another.
+
+**Read `apps/desktop/ui/STYLING.md` before changing any CSS.** It says which
+layer a change belongs in, what the tests enforce (every rule must be inside a
+layer; no nesting; palettes written twice must agree), and the traps that have
+already caused visible bugs — the label margin that throws row items off
+centre, optical alignment, the CSP's ban on `data:` URLs, and Android
+reporting `env(safe-area-inset-*)` as zero.
+
+A refactor meant to be invisible is proved by diffing `getComputedStyle` for
+every element across every platform, theme and screen, not by looking at one
+window.
+
 ## Mobile development
 
 Building and installing on simulators and devices has its own set of

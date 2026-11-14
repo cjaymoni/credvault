@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" role="img" aria-label="Klavyn">
+  <!-- Klavyn "Portcullis" mark: an evergreen castle whose gate is guarded by a spiked portcullis. -->
+  <rect width="300" height="300" rx="68" fill="#123F3A"/>
+  <path d="M40 235V125h30V98h30v27h30V78h40v47h30V98h30v27h30v110H40Z" fill="#F7F5EF"/>
+  <path d="M103 235v-50a47 47 0 0 1 94 0v50h-94Z" fill="#123F3A"/>
+  <path d="M120 130H131V196L125.5 208L120 196Z M144.5 130H155.5V196L150 208L144.5 196Z M169 130H180V196L174.5 208L169 196Z M100 164H200V174H100Z" fill="#F7F5EF"/>
+</svg>
